@@ -1,0 +1,181 @@
+//! eb-mcp-bridge: lets a client that only starts stdio servers (Claude
+//! Desktop) reach EB MCP's local HTTP server. Each JSON-RPC line on stdin goes
+//! to the server as one POST; each answer comes back as one line on stdout.
+//!
+//!     eb-mcp-bridge --url http://127.0.0.1:47821/mcp    (token in EB_MCP_TOKEN)
+
+use std::process::ExitCode;
+
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+const PROTOCOL_HEADER: &str = "mcp-protocol-version";
+const SESSION_HEADER: &str = "mcp-session-id";
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
+    let mut args = std::env::args().skip(1);
+    let mut url = None;
+    while let Some(arg) = args.next() {
+        if arg == "--url" {
+            url = args.next();
+        }
+    }
+    let Some(url) = url.filter(|u| loopback(u)) else {
+        eprintln!("eb-mcp-bridge: --url moet een adres op 127.0.0.1 of localhost zijn");
+        return ExitCode::from(2);
+    };
+    let Some(token) = std::env::var("EB_MCP_TOKEN").ok().filter(|t| !t.is_empty()) else {
+        eprintln!("eb-mcp-bridge: EB_MCP_TOKEN ontbreekt");
+        return ExitCode::from(2);
+    };
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("HTTP client");
+    let mut session: Option<String> = None;
+    let mut protocol: Option<String> = None;
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdout = tokio::io::stdout();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let message: Option<Value> = serde_json::from_str(line).ok();
+        let id = message.as_ref().and_then(|m| m.get("id")).cloned();
+        let mut request = http
+            .post(&url)
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(line.to_owned());
+        if let Some(s) = &session {
+            request = request.header(SESSION_HEADER, s);
+        }
+        if let Some(p) = &protocol {
+            request = request.header(PROTOCOL_HEADER, p);
+        }
+        let answers = match request.send().await {
+            Err(_) => error_for(
+                id,
+                "EB MCP draait niet. Start EB MCP en probeer het opnieuw.",
+            ),
+            Ok(response) => {
+                if let Some(s) = response
+                    .headers()
+                    .get(SESSION_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                {
+                    session = Some(s.to_owned());
+                }
+                let status = response.status();
+                let stream = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|c| c.starts_with("text/event-stream"));
+                let body = response.text().await.unwrap_or_default();
+                if status == 401 {
+                    error_for(
+                        id,
+                        "Het token klopt niet meer. Koppel EB MCP opnieuw met Claude.",
+                    )
+                } else if !status.is_success() {
+                    error_for(id, &format!("EB MCP gaf {status}"))
+                } else if stream {
+                    events(&body)
+                } else if body.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![body.trim().to_owned()]
+                }
+            }
+        };
+        for answer in answers {
+            if protocol.is_none()
+                && let Ok(value) = serde_json::from_str::<Value>(&answer)
+                && let Some(v) = value
+                    .pointer("/result/protocolVersion")
+                    .and_then(Value::as_str)
+            {
+                protocol = Some(v.to_owned());
+            }
+            if stdout
+                .write_all(format!("{answer}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                return ExitCode::SUCCESS;
+            }
+        }
+        let _ = stdout.flush().await;
+    }
+    ExitCode::SUCCESS
+}
+
+fn loopback(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|u| {
+        u.scheme() == "http"
+            && u.username().is_empty()
+            && u.password().is_none()
+            && matches!(u.host_str(), Some("127.0.0.1" | "localhost"))
+    })
+}
+
+/// A JSON-RPC error for a request (one with an id); notifications get no answer.
+fn error_for(id: Option<Value>, message: &str) -> Vec<String> {
+    match id {
+        Some(id) if !id.is_null() => vec![
+            json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": message}})
+                .to_string(),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// The `data:` payloads of a server-sent event stream, one per event.
+fn events(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut data = String::new();
+    for line in body.lines().chain(std::iter::once("")) {
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.trim_start());
+        } else if line.is_empty() && !data.is_empty() {
+            out.push(std::mem::take(&mut data));
+        }
+    }
+    out.into_iter()
+        .filter(|d| serde_json::from_str::<Value>(d).is_ok())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_event_stream_payloads() {
+        let body = "id: 1\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n: ping\n\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"x\"}\n";
+        assert_eq!(events(body).len(), 2);
+        assert_eq!(events("data: \n\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn answers_requests_only() {
+        assert_eq!(error_for(None, "x"), Vec::<String>::new());
+        assert!(error_for(Some(json!(7)), "x")[0].contains("\"id\":7"));
+    }
+
+    #[test]
+    fn only_loopback() {
+        assert!(loopback("http://127.0.0.1:47821/mcp"));
+        assert!(!loopback("http://evil.example/mcp"));
+        assert!(!loopback("https://127.0.0.1.evil.example/"));
+        assert!(!loopback("http://127.0.0.1:47821@evil.example/mcp"));
+    }
+}

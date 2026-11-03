@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5174",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeDevCommand": "npm run sparkle && npm run bridge:dev && npm run dev",
+    "beforeBuildCommand": "npm run sparkle && npm run bridge && npm run build"
   },
   "app": {
     "macOSPrivateApi": true,
@@ -23,8 +23,17 @@
         "transparent": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "trafficLightPosition": { "x": 22, "y": 26 },
-        "windowEffects": { "effects": ["sidebar", "mica"], "state": "followsWindowActiveState" }
+        "trafficLightPosition": {
+          "x": 22,
+          "y": 26
+        },
+        "windowEffects": {
+          "effects": [
+            "sidebar",
+            "mica"
+          ],
+          "state": "followsWindowActiveState"
+        }
       },
       {
         "label": "panel",
@@ -39,7 +48,14 @@
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "shadow": true,
-        "windowEffects": { "effects": ["popover", "acrylic"], "state": "active", "radius": 18 }
+        "windowEffects": {
+          "effects": [
+            "popover",
+            "acrylic"
+          ],
+          "state": "active",
+          "radius": 18
+        }
       }
     ],
     "security": {
@@ -50,7 +66,18 @@
     "active": true,
     "targets": "all",
     "category": "DeveloperTool",
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
-    "macOS": { "minimumSystemVersion": "13.0" }
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    },
+    "externalBin": [
+      "binaries/eb-mcp-bridge"
+    ]
   }
 }

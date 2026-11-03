@@ -1,0 +1,268 @@
+name: Release
+
+# A tag v1.2.3 builds EB MCP for macOS (universal) and Windows and publishes it as a GitHub release with the update
+# feeds the installed apps read. Ported from Tresso's release workflow. A pull request that changes the release, and a
+# run by hand, build the same files without publishing them.
+#
+# Repository variables: SPARKLE_PUBLIC_KEY, TAURI_UPDATER_PUBKEY (public halves, scripts/release-config.mjs).
+# Repository secrets: SPARKLE_PRIVATE_KEY (EdDSA), TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD.
+# The private keys live in 1Password and are never rotated: installed apps trust only these keys.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - src-tauri/**
+      - scripts/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      # Sparkle compares CFBundleVersion and cannot order 0.3.0-beta.1 before 0.3.0, so macOS builds carry this run's
+      # number there instead: it only ever goes up. The version users see stays the tag's.
+      build: ${{ github.run_number }}
+    steps:
+      - id: version
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Builds that are not published get 0.0.0: Windows Installer only takes numeric versions.
+          if [ "${REF_TYPE}" = "tag" ]; then version="${REF_NAME#v}"; else version="0.0.0"; fi
+          if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "The tag ${REF_NAME} is not v<major>.<minor>.<patch>[-<pre>]." >&2
+            exit 1
+          fi
+          prerelease=false
+          [[ "${version}" == *-* ]] && prerelease=true
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-universal
+            os: macos-latest
+            target: universal-apple-darwin
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            bundles: app,dmg
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rust-targets: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+      - run: npm ci
+      - name: Build and bundle
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          BUILD: ${{ needs.version.outputs.build }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+          TARGET: ${{ matrix.target }}
+          BUNDLES: ${{ matrix.bundles }}
+          SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
+          TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+          TAG: ${{ github.ref_type == 'tag' }}
+          # No Apple Developer ID yet: an ad-hoc signature, so Apple Silicon runs the app once the quarantine is lifted.
+          APPLE_SIGNING_IDENTITY: '-'
+          TAURI_BUNDLER_DMG_IGNORE_CI: 'true'
+        run: |
+          set -euo pipefail
+          if [ -n "${SPARKLE_PUBLIC_KEY}" ] && [ -n "${TAURI_UPDATER_PUBKEY}" ]; then
+            config="$(node scripts/release-config.mjs "${VERSION}" "${BUILD}")"
+          elif [ "${TAG}" = "true" ]; then
+            echo "A release needs the variables SPARKLE_PUBLIC_KEY and TAURI_UPDATER_PUBKEY." >&2
+            exit 1
+          else
+            echo "No update keys here: this build does not update itself."
+            config="{\"version\":\"${VERSION}\",\"bundle\":{\"macOS\":{\"bundleVersion\":\"${BUILD}\"}}}"
+          fi
+          # Windows Installer only takes numeric versions, so a prerelease ships the setup.exe alone.
+          if [ "${PRERELEASE}" = "true" ]; then BUNDLES="${BUNDLES//,msi/}"; fi
+          npx tauri build --target "${TARGET}" --bundles "${BUNDLES}" --config "${config}"
+
+      - name: Collect files
+        shell: bash
+        env:
+          NAME: ${{ matrix.name }}
+          TARGET: ${{ matrix.target }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          TAG: ${{ github.ref_type == 'tag' }}
+        run: |
+          set -euo pipefail
+          bundle="src-tauri/target/${TARGET}/release/bundle"
+          mkdir -p dist
+          shopt -s nullglob
+          one() {
+            local found=("$@")
+            if [ "${#found[@]}" -ne 1 ] || [ ! -e "${found[0]}" ]; then echo "Expected one file, found: ${found[*]}" >&2; exit 1; fi
+            printf '%s' "${found[0]}"
+          }
+          case "${NAME}" in
+            macos-*)
+              cp "$(one "${bundle}"/dmg/*.dmg)" "dist/eb-mcp-${NAME}.dmg"
+              app="${bundle}/macos/EB MCP.app"
+              # Sparkle updates the app and the bridge links Claude Desktop: a bundle without either is broken.
+              test -x "${app}/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate" || { echo "No Sparkle.framework" >&2; exit 1; }
+              test -x "${app}/Contents/MacOS/eb-mcp-bridge" || { echo "No eb-mcp-bridge" >&2; exit 1; }
+              codesign --verify --deep --strict "${app}"
+              export COPYFILE_DISABLE=1
+              tar -czf "dist/eb-mcp-${NAME}.app.tar.gz" -C "${bundle}/macos" "EB MCP.app"
+              # Sparkle's EdDSA signature of the archive, checked right away. The key goes in on stdin, never to disk.
+              if [ -n "${SPARKLE_PRIVATE_KEY}" ]; then
+                archive="dist/eb-mcp-${NAME}.app.tar.gz"
+                printf '%s' "${SPARKLE_PRIVATE_KEY}" | .sparkle/bin/sign_update --ed-key-file - "${archive}" > "${archive}.sparkle"
+                signature="$(sed -nE 's/.*sparkle:edSignature="([^"]+)".*/\1/p' "${archive}.sparkle")"
+                printf '%s' "${SPARKLE_PRIVATE_KEY}" | .sparkle/bin/sign_update --verify --ed-key-file - "${archive}" "${signature}"
+              elif [ "${TAG}" = "true" ]; then
+                echo "A release needs SPARKLE_PRIVATE_KEY to sign its update." >&2
+                exit 1
+              fi
+              ;;
+            windows-*)
+              cp "$(one "${bundle}"/nsis/*-setup.exe)" "dist/eb-mcp-${NAME}-setup.exe"
+              msi=("${bundle}"/msi/*.msi)
+              if [ "${#msi[@]}" -gt 0 ]; then cp "$(one "${msi[@]}")" "dist/eb-mcp-${NAME}.msi"; fi
+              ;;
+          esac
+          ls -la dist
+
+      # Tauri's updater (Windows) installs only files signed with this key, bound to the version.
+      - name: Sign the update (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          NAME: ${{ matrix.name }}
+          VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ github.ref_type == 'tag' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
+            if [ "${TAG}" = "true" ]; then echo "A release needs TAURI_SIGNING_PRIVATE_KEY." >&2; exit 1; fi
+            echo "No signing key here: the update stays unsigned."
+            exit 0
+          fi
+          file="dist/eb-mcp-${NAME}-setup.exe"
+          npx tauri signer sign --app-version "${VERSION}" "${file}" > /dev/null
+          test -s "${file}.sig"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eb-mcp-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [version, build]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: eb-mcp-*
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        shell: bash
+        env:
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          cd artifacts
+          expected=(eb-mcp-macos-universal.dmg eb-mcp-macos-universal.app.tar.gz eb-mcp-windows-x64-setup.exe)
+          [ "${PRERELEASE}" != "true" ] && expected+=(eb-mcp-windows-x64.msi)
+          for name in "${expected[@]}"; do [ -f "${name}" ] || { echo "Missing ${name}" >&2; exit 1; }; done
+          sha256sum "${expected[@]}" | LC_ALL=C sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      # A draft first, with every file but the update feeds: installed apps see the release only once it is
+      # published with its feeds, below.
+      - name: Create the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          previous="$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)"
+          { echo "## Nieuw"; echo; git log --format='- %s' "${previous:+${previous}..}${TAG}"; } > notes.md
+          files=(artifacts/SHA256SUMS)
+          while read -r _ name; do
+            files+=("artifacts/${name#\*}")
+            [ -f "artifacts/${name#\*}.sig" ] && files+=("artifacts/${name#\*}.sig")
+          done < artifacts/SHA256SUMS
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            [ "$(gh release view "${TAG}" --json isDraft --jq .isDraft)" = "true" ] || { echo "${TAG} is already published." >&2; exit 1; }
+            gh release upload "${TAG}" "${files[@]}" --clobber
+          else
+            flags=(--draft --verify-tag --title "EB MCP ${TAG}" --notes-file notes.md)
+            [ "${PRERELEASE}" = "true" ] && flags+=(--prerelease)
+            gh release create "${TAG}" "${files[@]}" "${flags[@]}"
+          fi
+
+      - name: Publish the update feeds and the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          BUILD: ${{ needs.version.outputs.build }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          gh release view "${TAG}" --json body --jq .body > update-notes.md
+          gh api markdown -f text="$(cat update-notes.md)" -f mode=gfm -f context="${GITHUB_REPOSITORY}" > update-notes.html
+          node scripts/update-feeds.mjs artifacts "${TAG}" "${BUILD}" update-notes.md update-notes.html
+          gh release upload "${TAG}" artifacts/latest.json artifacts/appcast.xml --clobber
+          if [ "${PRERELEASE}" = "true" ]; then
+            gh release edit "${TAG}" --draft=false --prerelease --latest=false
+          else
+            gh release edit "${TAG}" --draft=false --latest
+          fi

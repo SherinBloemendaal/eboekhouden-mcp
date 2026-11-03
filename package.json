@@ -8,10 +8,15 @@
     "build": "vue-tsc --noEmit && vite build",
     "typecheck": "vue-tsc --noEmit",
     "test": "vitest run",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "bridge:dev": "node scripts/build-bridge.mjs --debug",
+    "bridge": "node scripts/build-bridge.mjs",
+    "sparkle": "node scripts/fetch-sparkle.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/plugin-process": "^2.4.0",
+    "@tauri-apps/plugin-updater": "^2.14.1",
     "vue": "^3.5.44",
     "vue-router": "^5.3.1"
   },

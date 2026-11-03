@@ -3,3 +3,8 @@ dist
 src-tauri/target
 src-tauri/gen/schemas
 .DS_Store
+src-tauri/binaries
+src-tauri/target-agent
+.sparkle
+src-tauri/Info.plist
+src-tauri/target-win

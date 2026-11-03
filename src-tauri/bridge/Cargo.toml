@@ -1,0 +1,17 @@
+[package]
+name = "eb-mcp-bridge"
+version = "0.1.0"
+description = "Lets stdio-only MCP clients (Claude Desktop) reach EB MCP's local HTTP server"
+edition = "2024"
+rust-version = "1.90"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "macros", "io-std", "io-util"] }
+reqwest = { version = "0.13.5", default-features = false }
+serde_json = "1.0"
+url = "2"
+
+[dev-dependencies]
+axum = "0.8.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "io-std"] }

@@ -2,7 +2,7 @@
 //! installation, loopback Host only and no browser Origin, so no website can
 //! reach it. Every tool is read-only.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::{
     Router,
@@ -11,18 +11,12 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
-use rmcp::{
-    ErrorData as McpError, ServerHandler,
-    handler::server::router::tool::ToolRouter,
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
-    tool, tool_handler, tool_router,
-    transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-    },
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
-use serde::Serialize;
 
 use crate::state::AppState;
+use crate::tools::EbMcp;
 
 pub const PORT: u16 = 47821;
 pub const PATH: &str = "/mcp";
@@ -31,64 +25,8 @@ pub fn url() -> String {
     format!("http://127.0.0.1:{PORT}{PATH}")
 }
 
-#[derive(Clone)]
-pub struct EbMcp {
-    state: Arc<AppState>,
-    #[expect(dead_code, reason = "read by the tool_handler macro")]
-    tool_router: ToolRouter<Self>,
-}
-
-#[derive(Serialize)]
-struct Status {
-    app: &'static str,
-    version: &'static str,
-    signed_in: Vec<String>,
-    note: &'static str,
-}
-
-#[tool_router]
-impl EbMcp {
-    pub fn new(state: Arc<AppState>) -> Self {
-        Self {
-            state,
-            tool_router: Self::tool_router(),
-        }
-    }
-
-    #[tool(
-        description = "Toont welke e-Boekhouden-accounts nu in EB MCP zijn ingelogd. Gebruik dit eerst als een andere tool zegt dat er niemand is ingelogd.",
-        annotations(title = "Status", read_only_hint = true, open_world_hint = false)
-    )]
-    async fn status(&self) -> Result<CallToolResult, McpError> {
-        let signed_in = self.state.signed_in_labels();
-        let note = if signed_in.is_empty() {
-            "Nog niemand ingelogd. Log in via EB MCP in de menubalk."
-        } else {
-            "Alleen lezen: EB MCP kan niets boeken, opslaan of verwijderen."
-        };
-        let status = Status {
-            app: "EB MCP",
-            version: env!("CARGO_PKG_VERSION"),
-            signed_in,
-            note,
-        };
-        Ok(CallToolResult::success(vec![ContentBlock::json(status)?]))
-    }
-}
-
-#[tool_handler]
-impl ServerHandler for EbMcp {
-    fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("eb-mcp", env!("CARGO_PKG_VERSION")).with_title("EB MCP"))
-            .with_instructions(
-                "Leest de boekhouding in e-Boekhouden van de accounts die in EB MCP zijn ingelogd. Alleen lezen.",
-            )
-    }
-}
-
 /// The HTTP app: the MCP service behind the token check.
-pub fn router(state: Arc<AppState>, token: Arc<str>) -> Router {
+pub fn router(state: Arc<AppState>, token: Arc<RwLock<String>>) -> Router {
     let mut config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(["127.0.0.1", "localhost"])
         // An empty allow list plus enforcement: any request with an Origin header is refused.
@@ -104,8 +42,13 @@ pub fn router(state: Arc<AppState>, token: Arc<str>) -> Router {
         .layer(middleware::from_fn_with_state(token, require_token))
 }
 
-async fn require_token(State(token): State<Arc<str>>, request: Request, next: Next) -> Response {
-    if bearer_matches(request.headers(), &token) {
+async fn require_token(
+    State(token): State<Arc<RwLock<String>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let ok = bearer_matches(request.headers(), &token.read().unwrap());
+    if ok {
         next.run(request).await
     } else {
         (
@@ -138,7 +81,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Binds 127.0.0.1:PORT and serves until the app quits.
-pub async fn serve(state: Arc<AppState>, token: Arc<str>) -> std::io::Result<()> {
+pub async fn serve(state: Arc<AppState>, token: Arc<RwLock<String>>) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", PORT)).await?;
     axum::serve(listener, router(state, token)).await
 }
@@ -153,7 +96,9 @@ mod tests {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn app() -> Router {
-        router(Arc::new(AppState::default()), Arc::from(TOKEN))
+        let state =
+            crate::state::testing::state_with(Default::default(), "http://127.0.0.1:9/v1/api/");
+        router(Arc::new(state), Arc::new(RwLock::new(TOKEN.to_owned())))
     }
 
     fn initialize(auth: Option<&str>, host: &str, origin: Option<&str>) -> Request<Body> {
@@ -239,6 +184,121 @@ mod tests {
             .await
             .unwrap();
         assert!(response.status().is_client_error(), "{}", response.status());
+    }
+
+    /// Initialize, list the tools and call `status` over real HTTP, the way a client does.
+    #[tokio::test]
+    async fn serves_the_read_only_tools_end_to_end() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app()).await.unwrap() });
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{PATH}");
+        let post = |body: serde_json::Value, session: Option<String>| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&body);
+            if let Some(s) = session {
+                request = request.header("mcp-session-id", s);
+            }
+            request.send()
+        };
+        let init = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(init.status(), 200);
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Answers come as JSON or, in session mode, as server-sent events: take the JSON-RPC message either way.
+        let message = |body: String| -> serde_json::Value {
+            if let Ok(value) = serde_json::from_str(&body) {
+                return value;
+            }
+            body.lines()
+                .filter_map(|l| l.strip_prefix("data:"))
+                .filter_map(|d| serde_json::from_str::<serde_json::Value>(d.trim()).ok())
+                .find(|v| v.get("id").is_some())
+                .unwrap_or_else(|| panic!("no JSON-RPC answer in {body}"))
+        };
+        let list = message(
+            post(
+                serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+                session.clone(),
+            )
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        );
+        let tools = list["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for want in [
+            "status",
+            "relaties",
+            "relatie",
+            "mutaties",
+            "open_posten",
+            "grootboek",
+            "balans",
+            "winst_en_verlies",
+            "btw",
+            "uren",
+            "digitaal_archief",
+            "get",
+        ] {
+            assert!(names.contains(&want), "{want} missing from {names:?}");
+        }
+        assert_eq!(names.len(), 12);
+        assert!(
+            tools
+                .iter()
+                .all(|t| t["annotations"]["readOnlyHint"] == true),
+            "every tool is read-only"
+        );
+
+        let call = message(
+            post(serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "status", "arguments": {}}}), session.clone())
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        );
+        let text = call["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"alleen_lezen\":true"), "{text}");
+
+        // A tool without any account explains how to add one, and goes nowhere near e-Boekhouden.
+        let call = message(
+            post(serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "relaties", "arguments": {"zoek": "bakker"}}}), session)
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        );
+        assert_eq!(call["result"]["isError"], true);
+        assert!(
+            call["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("nog geen account")
+        );
     }
 
     #[test]

@@ -1,35 +1,20 @@
 # Roadmap
 
-Milestones follow `SPEC.md` in `~/projects/eb-mcp-design`. Each one ends with the checks green and Sherin trying it.
+Milestones follow `SPEC.md` in `~/projects/eb-mcp-design`.
 
-## M0: skeleton (done, 2026-11-03)
+## Done (2026-11-03)
 
-- Tauri 2 app with the menu-bar icon (template image), a borderless panel under it and the main window with its sidebar: Dashboard, Accounts, Verzoeken, Koppelen. Native material behind both (vibrancy on macOS, Mica or Acrylic on Windows).
-- Rust MCP server on `127.0.0.1:47821/mcp`: token per installation in the credential store, bearer check, loopback Host only, any `Origin` refused. One read-only tool, `status`.
-- Koppelen shows the address and the masked token. Pages without data show their empty state.
+- **M0 skeleton:** tray panel, main window, local MCP server with token, Host and Origin checks.
+- **M1 accounts and sign-in:** account list, 1Password and system stores (Touch ID, Windows Hello), hidden sign-in with e-Boekhouden's own page, two-step code, alert and confirm capture, unknown-step stop, sessions per account, idle sign-out, sign-out on quit.
+- **M2 tools and request log:** twelve read-only tools with query parameters from e-Boekhouden's Angular app, the `get` allow-list, rate limit, request log with linked calls and masked secrets, Verzoeken screen.
+- **M3 Dashboard, Koppelen, updates:** Dashboard per run, Koppelen for Claude (bridge) and Cursor with preview, backup and read-back, token renewal, Sparkle and the Tauri updater, release and CI workflows.
+- **M4 Windows (code):** Windows paths, Credential Manager with Windows Hello, tray above the taskbar, Mica and Acrylic, a Fluent skin (`src/styles/windows.css`).
 
-## M1: accounts and sign-in out of sight
+## Waiting on Sherin
 
-- Account list on disk (label, username or `op://` reference, administration, store), never a password.
-- Credential stores: Keychain with Touch ID, Windows Credential Manager with Windows Hello, 1Password CLI.
-- Hidden webview that fills e-Boekhouden's own login page, the progress sheet, our own two-step code field, the unknown-step stop, `auth-token` capture, `refreshjwt` renewal, sign-out on quit and idle.
-- Tested against mocked login pages only.
-
-## M2: tools and the request log
-
-- Read-only tools from the API map: relaties, mutaties, open posten, grootboek, balans, winst en verlies, btw, uren, digitaal archief and a `get` limited to GET paths on the map; an `account` parameter.
-- Request log in memory (last 1000), MCP calls linked to the e-Boekhouden calls they caused, secrets masked. Rate limit.
-
-## M3: Dashboard, Koppelen, updates
-
-- Dashboard figures per run.
-- Koppelen with the confirm sheet for Claude (through `eb-mcp-bridge`) and Cursor; token renewal.
-- Sparkle on macOS and the Tauri updater on Windows, signed releases, the update states from the boards.
-
-## M4: Windows
-
-- Fluent boards first, then the Windows skin, tray position, credential store and installer signing.
-
-## Open questions
-
-See `BOARDS.md` in the design folder (accent colour, appearance control, Claude Desktop route, token in client files, idle sign-out, rate limit, tool names, restart for updates, Windows and Linux timing).
+1. **Real sign-in.** Agents never sign in. Try an account with 1Password and one with the Keychain, with and without two-step verification. Things to look at: whether `auth-token` appears for `secure20.e-boekhouden.nl`, whether the API accepts the cookies plus `Authorization: Bearer`, and what `administratie/uwgegevens` returns (the administration name).
+2. **Tool parameters against the real API.** Taken from the public Angular bundle; unsure are the date format of `mutaties` (`datumVan`), the btw `periodType` letters (M, K, J) and `periodType=F` for winst en verlies.
+3. **GitHub repository and update keys.** Create the repository, generate the Sparkle EdDSA key and the Tauri updater key, put the private halves in 1Password and in the repository secrets, the public halves in the variables (README, Releases).
+4. **Windows.** The Windows code compiles and passes clippy with `-D warnings` for `x86_64-pc-windows-gnu` (MinGW on this Mac); the MSVC build and running it on Windows happen in CI and on a Windows machine. The Fluent boards are drawn (EB MCP canvas, page Windows) and wait for approval.
+5. **Signing.** Apple Developer ID and notarization, and a Windows code-signing certificate, once they exist.
+6. **Open design questions** in `BOARDS.md` (accent colour, appearance control, Claude Code, idle default, rate limit, tool names, Linux).

@@ -1,0 +1,58 @@
+name: CI
+
+# Every push and pull request: the UI's typecheck and tests, and the Rust tests and lints on macOS and Windows.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ui:
+    name: UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      # tauri-build wants the bundled sidecar and the UI to exist.
+      - run: npm run sparkle && npm run bridge:dev && npm run build
+      - run: cargo fmt --check
+        working-directory: src-tauri
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: src-tauri
+      - run: cargo test --workspace
+        working-directory: src-tauri

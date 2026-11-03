@@ -1,0 +1,29 @@
+/* Windows 11 (Fluent) skin over the same components: Segoe UI Variable, 4 px controls, 8 px surfaces, the accent
+   bar on the selected sidebar item, dialogs in the middle. The window's own Mica shows through (tauri.conf.json).
+   Applied when main.ts sets data-platform="windows" on <html>. */
+:root[data-platform='windows'] {
+  --font: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  --mono: 'Cascadia Mono', Consolas, monospace;
+  --accent: #005fb8;
+  --accent-hover: #0a6cc4;
+  --ease: cubic-bezier(0, 0, 0, 1);
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-platform='windows'] { --accent: #4cc2ff; --accent-hover: #47b1e8; }
+  :root[data-platform='windows'] .btn.primary { color: #000; }
+}
+:root[data-platform='windows'] body { font-size: 14px; }
+:root[data-platform='windows'] .btn { border-radius: 4px; height: 32px; padding: 0 12px; font-size: 14px; }
+:root[data-platform='windows'] .btn.small { height: 26px; font-size: 12px; }
+:root[data-platform='windows'] .group { border-radius: 8px; }
+:root[data-platform='windows'] input:not([type='checkbox']),
+:root[data-platform='windows'] select { border-radius: 4px !important; }
+:root[data-platform='windows'] input:not([type='checkbox']):focus {
+  box-shadow: inset 0 -2px 0 var(--accent), inset 0 0 0 1px var(--field) !important;
+}
+:root[data-platform='windows'] .nav { position: relative; border-radius: 4px; height: 36px; }
+:root[data-platform='windows'] .nav.active::before {
+  content: ''; position: absolute; left: 0; top: 10px; bottom: 10px; width: 3px; border-radius: 2px; background: var(--accent);
+}
+:root[data-platform='windows'] .traffic-space { height: 32px; }
+:root[data-platform='windows'] [role='dialog'], :root[data-platform='windows'] [role='alertdialog'] { border-radius: 8px !important; }

@@ -1,16 +1,31 @@
+mod accounts;
+mod connect;
+mod creds;
+mod ebapi;
 mod mcp;
+mod reqlog;
 mod secrets;
+mod settings;
+mod signin;
 mod state;
+mod tools;
+mod updates;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{
-    AppHandle, Manager, PhysicalPosition, WindowEvent,
+    AppHandle, Emitter, Manager, PhysicalPosition, State, WindowEvent,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
+use uuid::Uuid;
 
-use crate::state::AppState;
+use crate::accounts::{Account, AccountInput, AccountStore, Store};
+use crate::ebapi::EbClient;
+use crate::settings::{Settings, SettingsStore};
+use crate::signin::{Signins, WebviewJar};
+use crate::state::{AppState, SessionView};
 
 const PANEL: &str = "panel";
 const MAIN: &str = "main";
@@ -25,26 +40,320 @@ struct ServerInfo {
     running: bool,
     error: Option<String>,
     sessions: usize,
+    log_count: usize,
 }
 
 struct Server {
-    token_tail: String,
+    token: Arc<RwLock<String>>,
+    store: Box<dyn secrets::SecretStore>,
     error: Mutex<Option<String>>,
 }
 
+impl Server {
+    fn token(&self) -> String {
+        self.token.read().unwrap().clone()
+    }
+}
+
+/// An account with what is happening to it right now.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountView {
+    #[serde(flatten)]
+    account: Account,
+    session: Option<SessionView>,
+    signing_in: bool,
+}
+
+type Shared<'a, T> = State<'a, Arc<T>>;
+
+/// Events go to EB MCP's own windows only, never to the hidden e-Boekhouden webviews.
+pub(crate) fn to_our_windows<S: Serialize + Clone>(app: &AppHandle, event: &str, payload: S) {
+    for label in [MAIN, PANEL] {
+        let _ = app.emit_to(label, event, payload.clone());
+    }
+}
+
 #[tauri::command]
-fn server_info(
-    server: tauri::State<'_, Arc<Server>>,
-    app_state: tauri::State<'_, Arc<AppState>>,
-) -> ServerInfo {
+fn server_info(server: Shared<'_, Server>, app_state: Shared<'_, AppState>) -> ServerInfo {
     let error = server.error.lock().unwrap().clone();
     ServerInfo {
         url: mcp::url(),
-        token_tail: server.token_tail.clone(),
+        token_tail: secrets::token_tail(&server.token()).to_owned(),
         running: error.is_none(),
         error,
         sessions: app_state.session_count(),
+        log_count: app_state.log.len(),
     }
+}
+
+#[tauri::command]
+fn accounts_list(
+    app_state: Shared<'_, AppState>,
+    signins: Shared<'_, Signins>,
+) -> Vec<AccountView> {
+    let sessions = app_state.sessions();
+    app_state
+        .accounts
+        .list()
+        .into_iter()
+        .map(|account| AccountView {
+            session: sessions
+                .iter()
+                .find(|s| s.account_id == account.id)
+                .cloned(),
+            signing_in: signins.is_running(account.id),
+            account,
+        })
+        .collect()
+}
+
+fn start_sign_in(app: &AppHandle, id: Uuid) {
+    let (state, signins) = (
+        app.state::<Arc<AppState>>().inner().clone(),
+        app.state::<Arc<Signins>>().inner().clone(),
+    );
+    tauri::async_runtime::spawn(signin::sign_in(app.clone(), state, signins, id));
+}
+
+/// Saving checks the account right away by signing in once, out of sight.
+#[tauri::command]
+fn account_add(
+    app: AppHandle,
+    app_state: Shared<'_, AppState>,
+    input: AccountInput,
+    password: Option<String>,
+) -> Result<Account, String> {
+    if input.store == Store::System && password.as_deref().unwrap_or_default().is_empty() {
+        return Err("Vul het wachtwoord in".into());
+    }
+    let account = app_state.accounts.add(input)?;
+    if account.store == Store::System
+        && let Err(e) = creds::save_password(account.id, password.as_deref().unwrap_or_default())
+    {
+        let _ = app_state.accounts.remove(account.id);
+        return Err(format!("Het wachtwoord kon niet in de sleutelhanger: {e}"));
+    }
+    start_sign_in(&app, account.id);
+    Ok(account)
+}
+
+/// A new password is optional: empty keeps the one in the store.
+#[tauri::command]
+fn account_update(
+    app_state: Shared<'_, AppState>,
+    id: Uuid,
+    input: AccountInput,
+    password: Option<String>,
+) -> Result<Account, String> {
+    let before = app_state
+        .accounts
+        .get(id)
+        .ok_or("Dit account bestaat niet meer")?;
+    if input.store == Store::System
+        && before.store != Store::System
+        && password.as_deref().unwrap_or_default().is_empty()
+    {
+        return Err("Vul het wachtwoord in voor de sleutelhanger".into());
+    }
+    let account = app_state.accounts.update(id, input)?;
+    match account.store {
+        Store::System => {
+            if let Some(password) = password.filter(|p| !p.is_empty()) {
+                creds::save_password(id, &password)?;
+            }
+        }
+        // Switching to 1Password takes the old password out of the system store.
+        Store::OnePassword => creds::delete_password(id)?,
+    }
+    Ok(account)
+}
+
+#[tauri::command]
+fn account_remove(
+    app_state: Shared<'_, AppState>,
+    signins: Shared<'_, Signins>,
+    id: Uuid,
+) -> Result<(), String> {
+    signins.cancel(id);
+    app_state.sign_out(id);
+    creds::delete_password(id)?;
+    app_state.accounts.remove(id)?;
+    let _ = app_state.events.send(state::AppEvent::SessionsChanged);
+    Ok(())
+}
+
+#[tauri::command]
+fn account_set_default(app_state: Shared<'_, AppState>, id: Uuid) -> Result<(), String> {
+    app_state.accounts.set_default(id)?;
+    let _ = app_state.events.send(state::AppEvent::SessionsChanged);
+    Ok(())
+}
+
+#[tauri::command]
+fn signin_start(app: AppHandle, id: Uuid) {
+    start_sign_in(&app, id);
+}
+
+#[tauri::command]
+fn signin_cancel(signins: Shared<'_, Signins>, id: Uuid) {
+    signins.cancel(id);
+}
+
+#[tauri::command]
+fn signin_code(signins: Shared<'_, Signins>, id: Uuid, code: String) -> Result<(), String> {
+    signins.give_code(id, code)
+}
+
+#[tauri::command]
+fn sign_out(app_state: Shared<'_, AppState>, id: Uuid) {
+    app_state.sign_out(id);
+}
+
+#[tauri::command]
+fn sign_out_all(app_state: Shared<'_, AppState>) {
+    app_state.sign_out_all();
+}
+
+/// The request log, newest first and without bodies.
+#[tauri::command]
+fn log_list(app_state: Shared<'_, AppState>) -> Vec<reqlog::Entry> {
+    app_state.log.list()
+}
+
+/// One entry with its request and response, already masked.
+#[tauri::command]
+fn log_get(app_state: Shared<'_, AppState>, id: u64) -> Option<reqlog::Entry> {
+    app_state.log.get(id)
+}
+
+#[tauri::command]
+fn log_clear(app_state: Shared<'_, AppState>) {
+    app_state.log.clear();
+    let _ = app_state.events.send(state::AppEvent::LogChanged);
+}
+
+#[tauri::command]
+fn stats(app_state: Shared<'_, AppState>) -> reqlog::StatsView {
+    app_state.log.stats()
+}
+
+/// The full token, only when the user asks to see or copy it.
+#[tauri::command]
+fn token_reveal(server: Shared<'_, Server>) -> String {
+    server.token()
+}
+
+/// A new token; linked clients then need their file written again.
+#[tauri::command]
+fn token_renew(server: Shared<'_, Server>) -> Result<String, String> {
+    let token = secrets::renew_token(server.store.as_ref())?;
+    *server.token.write().unwrap() = token.clone();
+    Ok(secrets::token_tail(&token).to_owned())
+}
+
+/// Next to the app's own executable: inside the .app bundle, or target/<profile> in development.
+fn bridge_path() -> std::path::PathBuf {
+    let name = if cfg!(windows) {
+        "eb-mcp-bridge.exe"
+    } else {
+        "eb-mcp-bridge"
+    };
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(name)))
+        .unwrap_or_else(|| name.into())
+}
+
+#[tauri::command]
+fn clients_status(server: Shared<'_, Server>) -> Vec<connect::ClientStatus> {
+    let paths = connect::Paths::system();
+    let token = server.token();
+    [connect::Client::Claude, connect::Client::Cursor]
+        .into_iter()
+        .map(|c| connect::status(&paths, c, &token))
+        .collect()
+}
+
+#[tauri::command]
+fn connect_preview(
+    server: Shared<'_, Server>,
+    client: connect::Client,
+) -> Result<connect::Preview, String> {
+    connect::preview(
+        &connect::Paths::system(),
+        client,
+        &mcp::url(),
+        &server.token(),
+        &bridge_path(),
+    )
+}
+
+#[tauri::command]
+fn connect_link(server: Shared<'_, Server>, client: connect::Client) -> Result<(), String> {
+    if client == connect::Client::Claude && !bridge_path().is_file() {
+        return Err("De brug voor Claude (eb-mcp-bridge) ontbreekt naast de app. Installeer EB MCP opnieuw.".into());
+    }
+    connect::link(
+        &connect::Paths::system(),
+        client,
+        &mcp::url(),
+        &server.token(),
+        &bridge_path(),
+    )
+}
+
+#[tauri::command]
+fn connect_unlink(client: connect::Client) -> Result<(), String> {
+    connect::unlink(&connect::Paths::system(), client)
+}
+
+/// Settings to paste into any other MCP client that speaks HTTP. Contains the token: only on request.
+#[tauri::command]
+fn other_client_settings(server: Shared<'_, Server>) -> String {
+    let value = serde_json::json!({ "eb-mcp": { "url": mcp::url(), "headers": { "Authorization": format!("Bearer {}", server.token()) } } });
+    serde_json::to_string_pretty(&value).unwrap_or_default()
+}
+
+/// Before restarting into an update: refuse new tool calls, wait (at most 30 s) for the running ones, then sign
+/// every session out at e-Boekhouden. `false` puts things back when the user chose to wait.
+#[tauri::command]
+async fn prepare_update_restart(
+    app_state: Shared<'_, AppState>,
+    ready: bool,
+) -> Result<(), String> {
+    if !ready {
+        app_state.set_updating(false);
+        return Ok(());
+    }
+    app_state.set_updating(true);
+    for _ in 0..60 {
+        if app_state.log.running() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let had_sessions = app_state.session_count() > 0;
+    app_state.sign_out_all();
+    if had_sessions {
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn running_calls(app_state: Shared<'_, AppState>) -> usize {
+    app_state.log.running()
+}
+
+#[tauri::command]
+fn settings_get(settings: Shared<'_, SettingsStore>) -> Settings {
+    settings.get()
+}
+
+#[tauri::command]
+fn settings_set(settings: Shared<'_, SettingsStore>, value: Settings) -> Result<(), String> {
+    settings.set(value)
 }
 
 #[tauri::command]
@@ -64,10 +373,16 @@ fn open_main(app: AppHandle, route: Option<String>) {
     }
 }
 
+/// Quitting signs every session out at e-Boekhouden first.
 #[tauri::command]
-fn quit(app: AppHandle) {
-    // Signing out at e-Boekhouden happens here once sessions exist (M1).
+async fn quit(app: AppHandle, app_state: Shared<'_, AppState>) -> Result<(), String> {
+    let had_sessions = app_state.session_count() > 0;
+    app_state.sign_out_all();
+    if had_sessions {
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+    }
     app.exit(0);
+    Ok(())
 }
 
 fn toggle_panel(app: &AppHandle, rect: tauri::Rect) {
@@ -93,7 +408,7 @@ fn toggle_panel(app: &AppHandle, rect: tauri::Rect) {
         let height = panel
             .outer_size()
             .map(|s| s.height as f64)
-            .unwrap_or(520.0 * scale);
+            .unwrap_or(540.0 * scale);
         pos.y - height - 8.0 * scale
     } else {
         pos.y + size.height + 6.0 * scale
@@ -105,28 +420,115 @@ fn toggle_panel(app: &AppHandle, rect: tauri::Rect) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app_state = Arc::new(AppState::default());
-
     tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
                 .build(),
         )
-        .manage(app_state.clone())
-        .invoke_handler(tauri::generate_handler![server_info, open_main, quit])
-        .setup(move |app| {
+        .plugin(tauri_plugin_process::init())
+        .manage(updates::UpdateListener::default())
+        // A new page in the main window does not listen for Sparkle's relaunch question until it says so (updates.rs).
+        .on_page_load(|webview, payload| {
+            if webview.label() == MAIN && payload.event() == tauri::webview::PageLoadEvent::Started
+            {
+                webview.state::<updates::UpdateListener>().page_loading();
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            server_info,
+            accounts_list,
+            account_add,
+            account_update,
+            account_remove,
+            account_set_default,
+            signin_start,
+            signin_cancel,
+            signin_code,
+            sign_out,
+            sign_out_all,
+            settings_get,
+            settings_set,
+            log_list,
+            log_get,
+            log_clear,
+            stats,
+            token_reveal,
+            token_renew,
+            clients_status,
+            connect_preview,
+            connect_link,
+            connect_unlink,
+            other_client_settings,
+            prepare_update_restart,
+            running_calls,
+            updates::update_channel,
+            updates::check_for_updates_natively,
+            updates::update_listening,
+            updates::update_relaunch,
+            open_main,
+            quit
+        ])
+        .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            let server = match secrets::load_or_create_token(&secrets::SystemStore) {
+            // macOS updates through Sparkle; Windows through Tauri's updater, only in builds that carry its
+            // configuration (release builds, scripts/release-config.mjs).
+            #[cfg(target_os = "macos")]
+            updates::setup(app);
+            #[cfg(not(target_os = "macos"))]
+            if app.config().plugins.0.contains_key("updater") {
+                app.handle()
+                    .plugin(tauri_plugin_updater::Builder::new().build())?;
+            }
+
+            let dir = app.path().app_config_dir()?;
+            let accounts = AccountStore::open(&dir).map_err(std::io::Error::other)?;
+            let settings = Arc::new(SettingsStore::open(&dir));
+            let app_state = Arc::new(AppState::new(
+                accounts,
+                EbClient::production(),
+                Arc::new(WebviewJar(app.handle().clone())),
+            ));
+            app.manage(app_state.clone());
+            app.manage(settings.clone());
+            app.manage(Arc::new(Signins::default()));
+
+            // Forward state changes to every window.
+            let mut events = app_state.events.subscribe();
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while let Ok(event) = events.recv().await {
+                    to_our_windows(&handle, "state", event);
+                }
+            });
+
+            // Idle sign-out, checked every minute.
+            let idle_state = app_state.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    let minutes = settings.get().idle_minutes;
+                    idle_state.sign_out_idle(Duration::from_secs(u64::from(minutes) * 60));
+                }
+            });
+
+            // See secrets::DevFileStore: dev builds would ask for Keychain access at every rebuild.
+            #[cfg(debug_assertions)]
+            let token_store: Box<dyn secrets::SecretStore> =
+                Box::new(secrets::DevFileStore(dir.join("dev-token.json")));
+            #[cfg(not(debug_assertions))]
+            let token_store: Box<dyn secrets::SecretStore> = Box::new(secrets::SystemStore);
+            let server = match secrets::load_or_create_token(token_store.as_ref()) {
                 Ok(token) => {
+                    let token = Arc::new(RwLock::new(token));
                     let server = Arc::new(Server {
-                        token_tail: secrets::token_tail(&token).to_owned(),
+                        token: token.clone(),
+                        store: token_store,
                         error: Mutex::new(None),
                     });
-                    let (state, token, report) =
-                        (app_state.clone(), Arc::<str>::from(token), server.clone());
+                    let (state, report) = (app_state.clone(), server.clone());
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = mcp::serve(state, token).await {
                             log::error!("MCP server stopped: {e}");
@@ -137,16 +539,22 @@ pub fn run() {
                     server
                 }
                 Err(e) => Arc::new(Server {
-                    token_tail: String::new(),
+                    token: Arc::new(RwLock::new(String::new())),
+                    store: token_store,
                     error: Mutex::new(Some(format!("Geen token in de sleutelhanger: {e}"))),
                 }),
             };
             app.manage(server);
 
+            // macOS: a template image the menu bar colours itself. Windows has no template icons and the taskbar can be
+            // light or dark, so it gets the coloured app icon.
+            #[cfg(target_os = "macos")]
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray@2x.png"))?;
+            #[cfg(not(target_os = "macos"))]
+            let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
             TrayIconBuilder::with_id("eb-mcp")
                 .icon(icon)
-                .icon_as_template(true)
+                .icon_as_template(cfg!(target_os = "macos"))
                 .tooltip("EB MCP")
                 .show_menu_on_left_click(false)
                 .on_tray_icon_event(|tray, event| {

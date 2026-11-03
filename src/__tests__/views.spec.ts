@@ -33,3 +33,11 @@ describe('views', () => {
     expect(wrapper.text()).toContain('••••')
   })
 })
+
+describe('accounts page', () => {
+  it('shows the empty state with a way to add an account', async () => {
+    const wrapper = await mountAt('/accounts')
+    expect(wrapper.text()).toContain('Nog geen accounts')
+    expect(wrapper.find('button.primary').text()).toContain('Account toevoegen')
+  })
+})
