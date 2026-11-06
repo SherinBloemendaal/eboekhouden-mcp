@@ -35,9 +35,13 @@ if (debug) {
   mkdirSync(join(root, 'binaries'), { recursive: true })
   copyFileSync(built, join(root, 'binaries', `eb-mcp-bridge-${host}${ext}`))
 } else if (target === 'universal-apple-darwin') {
+  // tauri build --target universal-apple-darwin compiles the app once per architecture and looks for the sidecar
+  // under each of those triples, then bundles the universal one: all three files must exist.
   const arm = build('aarch64-apple-darwin')
   const intel = build('x86_64-apple-darwin')
   mkdirSync(join(root, 'binaries'), { recursive: true })
+  copyFileSync(arm, join(root, 'binaries', 'eb-mcp-bridge-aarch64-apple-darwin'))
+  copyFileSync(intel, join(root, 'binaries', 'eb-mcp-bridge-x86_64-apple-darwin'))
   execFileSync('lipo', ['-create', '-output', join(root, 'binaries', 'eb-mcp-bridge-universal-apple-darwin'), arm, intel], { stdio: 'inherit' })
 } else {
   const built = build(target)
