@@ -23,6 +23,14 @@ export async function openMain(route?: string): Promise<void> {
   if (inApp()) await invoke('open_main', { route })
 }
 
+/** How many MCP calls are still running; quitting asks first when this is above zero. */
+export const runningCalls = (): Promise<number> => (inApp() ? invoke<number>('running_calls') : Promise.resolve(0))
+
+/** Opens e-Boekhouden's sign-in page in the default browser, for a step EB MCP does not know. */
+export async function openEboekhouden(): Promise<void> {
+  if (inApp()) await invoke('open_eboekhouden')
+}
+
 export async function quitApp(): Promise<void> {
   if (inApp()) await invoke('quit')
 }

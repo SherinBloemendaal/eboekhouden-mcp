@@ -12,11 +12,22 @@ async function mountAt(path: string) {
 }
 
 describe('views', () => {
-  it('shows the four pages in the sidebar, Dashboard first', async () => {
+  it('shows the four pages in the sidebar, Dashboard first, and Instellingen at the foot', async () => {
     const wrapper = await mountAt('/dashboard')
     const labels = wrapper.findAll('nav a').map((a) => a.text())
-    expect(labels).toEqual(['Dashboard', 'Accounts', 'Verzoeken', 'Koppelen'])
+    expect(labels).toEqual(['Dashboard', 'Accounts', 'Verzoeken', 'Koppelen', 'Instellingen⌘,'])
     expect(wrapper.find('header h1').text()).toBe('Dashboard')
+  })
+
+  it('opens Instellingen with Cmd+, and offers Systeem, Licht and Donker', async () => {
+    const wrapper = await mountAt('/dashboard')
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: ',', metaKey: true }))
+    await flushPromises()
+    expect(router.currentRoute.value.path).toBe('/instellingen')
+    expect(wrapper.find('header h1').text()).toBe('Instellingen')
+    expect(wrapper.findAll('[role="radio"]').map((b) => b.text())).toEqual(['Systeem', 'Licht', 'Donker'])
+    expect(wrapper.find('[role="radio"][aria-checked="true"]').text()).toBe('Systeem')
+    wrapper.unmount()
   })
 
   it('opens the menu-bar panel with its items and Afsluiten', async () => {

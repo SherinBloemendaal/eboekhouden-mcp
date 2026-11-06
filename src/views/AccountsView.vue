@@ -8,7 +8,7 @@ import Icon from '../components/Icon.vue'
 import Sheet from '../components/Sheet.vue'
 import SigninSteps from '../components/SigninSteps.vue'
 import {
-  cancelSignIn, connect, dismissSignin, getSettings, isRunning, removeAccount, saveSettings, setDefault, signIn, signOut, since, store,
+  cancelSignIn, connect, dismissSignin, getSettings, isRunning, removeAccount, setDefault, signIn, signOut, since, store,
   type AccountView,
 } from '../lib/accounts'
 
@@ -67,9 +67,6 @@ function sessionText(account: AccountView): { tone: string; text: string } {
   return { tone: 'off', text: account.administration ? 'Niet ingelogd' : 'Nog nooit ingelogd' }
 }
 
-async function changeIdle() {
-  await saveSettings({ idleMinutes: idleMinutes.value })
-}
 </script>
 
 <template>
@@ -127,16 +124,8 @@ async function changeIdle() {
       </section>
       <section class="group card">
         <h2>Sessies</h2>
-        <label class="idle">
-          <span>Uitloggen na stilte</span>
-          <select v-model.number="idleMinutes" class="select" @change="changeIdle">
-            <option :value="15">15 minuten</option>
-            <option :value="30">30 minuten</option>
-            <option :value="60">1 uur</option>
-            <option :value="240">4 uur</option>
-          </select>
-        </label>
-        <p>Stilte: geen aanroep van een AI-client voor dat account. Afsluiten logt altijd alle sessies uit bij e-Boekhouden.</p>
+        <p>Een account wordt uitgelogd na {{ idleMinutes === 60 ? '1 uur' : idleMinutes === 240 ? '4 uur' : `${idleMinutes} minuten` }} zonder aanroep van een AI-client. Afsluiten logt altijd alle sessies uit bij e-Boekhouden.</p>
+        <RouterLink class="btn small" to="/instellingen">Wijzigen in Instellingen</RouterLink>
       </section>
     </div>
   </div>

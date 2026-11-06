@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { serverInfo, type ServerInfo } from '../lib/server'
 import Icon from './Icon.vue'
 import UpdateUi from './UpdateUi.vue'
@@ -13,6 +13,17 @@ const nav = [
 ]
 
 const route = useRoute()
+const router = useRouter()
+
+// Cmd+, (Ctrl+, on Windows) opens Instellingen, as in every Mac app.
+function onKey(event: KeyboardEvent) {
+  if (event.key === ',' && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault()
+    void router.push('/instellingen')
+  }
+}
+onMounted(() => window.addEventListener('keydown', onKey))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 const title = computed(() => String(route.meta.title ?? ''))
 const info = ref<ServerInfo | null>(null)
 onMounted(async () => {
@@ -31,6 +42,11 @@ onMounted(async () => {
       </RouterLink>
       <div class="side-foot">
         <UpdateUi />
+        <RouterLink to="/instellingen" class="nav settings" active-class="active">
+          <Icon name="settings" class="nav-icon" />
+          <span>Instellingen</span>
+          <span class="shortcut">⌘,</span>
+        </RouterLink>
         <span class="server-line">
           <span class="dot" :class="info?.running ? 'on' : 'bad'" />
           {{ info?.running ? 'MCP actief' : 'MCP staat uit' }}
@@ -65,6 +81,8 @@ onMounted(async () => {
 .nav:hover { background: var(--hover); }
 .nav.active { background: var(--selected); }
 .nav-icon { color: var(--accent); }
+.settings { margin: 0 -4px 4px; }
+.shortcut { margin-left: auto; font-size: 11px; color: var(--muted); }
 .side-foot { margin-top: auto; display: flex; flex-direction: column; gap: 6px; padding: 0 4px; }
 .server-line { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 500; }
 .server-addr { font-size: 11px; color: var(--muted); padding-left: 14px; }

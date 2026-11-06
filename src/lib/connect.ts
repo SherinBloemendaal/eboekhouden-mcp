@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { inApp } from './server'
 
-export type Client = 'claude' | 'cursor'
+export type Client = 'claude' | 'claudeCode' | 'cursor'
 export type LinkState = 'none' | 'linked' | 'stale' | 'broken'
 
 export interface ClientStatus {
@@ -21,7 +21,7 @@ export interface Preview {
   backup: string
 }
 
-export const CLIENT_NAMES: Record<Client, string> = { claude: 'Claude', cursor: 'Cursor' }
+export const CLIENT_NAMES: Record<Client, string> = { claude: 'Claude', claudeCode: 'Claude Code', cursor: 'Cursor' }
 
 export const clientsStatus = () => (inApp() ? invoke<ClientStatus[]>('clients_status') : Promise.resolve<ClientStatus[]>([]))
 export const preview = (client: Client) => invoke<Preview>('connect_preview', { client })

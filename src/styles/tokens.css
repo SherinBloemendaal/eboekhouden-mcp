@@ -96,3 +96,12 @@
 @media (prefers-reduced-transparency: reduce) and (prefers-color-scheme: dark) {
   :root { --glass-pop: #2c2c30; }
 }
+
+/* The Mac's own accent color (System Settings > Appearance), with the blue above as fallback.
+   Windows sets its own accent in windows.css, which wins on [data-platform]. */
+@supports (color: -apple-system-control-accent) {
+  :root:not([data-platform]) {
+    --accent: -apple-system-control-accent;
+    --accent-hover: color-mix(in srgb, -apple-system-control-accent 88%, black);
+  }
+}

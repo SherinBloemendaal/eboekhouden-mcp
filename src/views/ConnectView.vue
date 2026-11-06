@@ -141,7 +141,7 @@ function stateText(c: ClientStatus): string {
     <div class="clients">
       <section v-for="c in clients" :key="c.client" class="group card client">
         <div class="client-head">
-          <span class="client-icon">{{ c.client === 'claude' ? 'Cl' : 'Cu' }}</span>
+          <span class="client-icon">{{ ({ claude: 'Cl', claudeCode: 'CC', cursor: 'Cu' } as const)[c.client] }}</span>
           <span class="stack">
             <strong>{{ CLIENT_NAMES[c.client] }}</strong>
             <span class="client-state" :class="c.state"><span class="dot" :class="{ on: c.state === 'linked', off: c.state === 'none', bad: c.state === 'broken' || c.state === 'stale' }" />{{ stateText(c) }}</span>
@@ -182,14 +182,15 @@ function stateText(c: ClientStatus): string {
         <span class="add">+ "eb-mcp":</span>
       </div>
       <JsonView :value="previewEntry" />
-      <div class="row-line">
+      <div v-if="confirming.client !== 'claude'" class="row-line">
         <button type="button" class="btn small" :aria-pressed="revealInPreview" @click="togglePreviewToken">{{ revealInPreview ? 'Token verbergen' : 'Token tonen' }}</button>
         <span class="muted small">Het token staat straks leesbaar in dit bestand, net als bij elke andere server.</span>
       </div>
       <ul class="bullets">
         <li v-if="confirming.exists">Eerst een reservekopie: {{ confirming.backup }}</li>
         <li v-if="confirming.client === 'claude'">Claude Desktop start EB MCP via een kleine brug in de app, omdat Claude alleen lokale stdio-servers start.</li>
-        <li>{{ confirming.client === 'claude' ? 'Start Claude daarna opnieuw; Claude leest het bestand alleen bij de start.' : 'Cursor pakt de wijziging meestal zelf op.' }}</li>
+        <li v-if="confirming.client === 'claude'">Het token staat niet in dit bestand: de brug leest het uit je sleutelhanger.</li>
+        <li>{{ ({ claude: 'Start Claude daarna opnieuw; Claude leest het bestand alleen bij de start.', claudeCode: 'Start een nieuwe Claude Code-sessie; lopende sessies zien de server pas na een herstart.', cursor: 'Cursor pakt de wijziging meestal zelf op.' } as const)[confirming.client] }}</li>
       </ul>
       <template #footer>
         <button type="button" class="btn" :disabled="busy" @click="confirming = null">Annuleren</button>
@@ -244,7 +245,7 @@ function stateText(c: ClientStatus): string {
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .chip { height: 18px; display: inline-flex; align-items: center; padding: 0 7px; border-radius: 999px; background: var(--subtle); color: var(--label); font-size: 11px; font-weight: 500; white-space: nowrap; }
 .chip.mcp { background: rgba(175, 82, 222, 0.13); color: #7a3fc7; }
-.clients { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.clients { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .client-head { display: flex; align-items: center; gap: 12px; }
 .client-icon { width: 40px; height: 40px; flex: none; border-radius: 10px; background: var(--subtle); color: var(--label); font-weight: 700; display: flex; align-items: center; justify-content: center; }
 .client-icon.dashed { background: transparent; border: 1.5px dashed var(--field); box-sizing: border-box; }

@@ -2,6 +2,7 @@
 // The steps of a sign-in out of sight, and the code field when e-Boekhouden asks for one.
 import { computed, ref, watch } from 'vue'
 import { sendCode, type AccountView, type SigninEvent } from '../lib/accounts'
+import { openEboekhouden } from '../lib/server'
 import Icon from './Icon.vue'
 
 const props = defineProps<{ account: AccountView; event: SigninEvent | undefined; compact?: boolean }>()
@@ -102,7 +103,10 @@ function onInput() {
     </Transition>
     <Transition name="accordion">
       <div v-if="event?.message && (event.step === 'failed' || event.step === 'unknown')" class="accordion">
-        <div><p class="note bad" role="alert">{{ event.message }}</p></div>
+        <div>
+          <p class="note bad" role="alert">{{ event.message }}</p>
+          <button v-if="event.step === 'unknown'" type="button" class="btn small open-eb" @click="openEboekhouden"><Icon name="external" :size="14" />Open e-Boekhouden in je browser</button>
+        </div>
       </div>
     </Transition>
     <Transition name="accordion">
@@ -154,6 +158,7 @@ li:not(.wait) .mark::before { opacity: 0; }
 .error { font-size: 12px; color: var(--danger); }
 .note { padding: 9px 11px; border-radius: 10px; font-size: 12px; line-height: 16px; }
 .note.bad { background: var(--danger-soft); color: var(--danger); }
+.open-eb { margin-top: 8px; }
 .note.ok { background: var(--success-soft); color: var(--success); }
 @media (prefers-reduced-motion: reduce) {
   .spin { animation-duration: 2400ms; }

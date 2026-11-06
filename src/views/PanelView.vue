@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import Alert from '../components/Alert.vue'
 import Avatar from '../components/Avatar.vue'
 import Icon from '../components/Icon.vue'
 import SigninSteps from '../components/SigninSteps.vue'
 import { cancelSignIn, clock, connect, dismissSignin, isRunning, signIn, signOut, signOutAll, since, store, type AccountView } from '../lib/accounts'
-import { openMain, quitApp, serverInfo, type ServerInfo } from '../lib/server'
+import { openMain, quitApp, runningCalls, serverInfo, type ServerInfo } from '../lib/server'
 import { checkNow } from '../lib/updates'
 
 const info = ref<ServerInfo | null>(null)
@@ -49,10 +50,28 @@ async function checkForUpdates() {
   if (!navigator.userAgent.includes('Mac')) await openMain('/dashboard')
 }
 
+/** Asks first only while an AI client is waiting on a call; otherwise quits at once. */
+const confirmQuit = ref(0)
 async function quit() {
+  if (quitting.value) return
+  const running = await runningCalls()
+  if (running > 0 && !confirmQuit.value) {
+    confirmQuit.value = running
+    return
+  }
+  confirmQuit.value = 0
   quitting.value = true
   await quitApp()
 }
+
+function onKey(event: KeyboardEvent) {
+  if (event.key.toLowerCase() === 'q' && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault()
+    void quit()
+  }
+}
+onMounted(() => window.addEventListener('keydown', onKey))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 </script>
 
 <template>
@@ -126,6 +145,15 @@ async function quit() {
       </span>
       <span class="kbd">⌘Q</span>
     </button>
+    <Transition name="modal">
+      <Alert v-if="confirmQuit" title="Toch afsluiten?" tone="warn" @close="confirmQuit = 0">
+        <p>{{ confirmQuit === 1 ? 'Er loopt nog 1 aanroep' : `Er lopen nog ${confirmQuit} aanroepen` }} van een AI-client. Die krijgt dan een fout, en alle sessies worden uitgelogd.</p>
+        <template #buttons>
+          <button type="button" class="btn" @click="confirmQuit = 0">Annuleren</button>
+          <button type="button" class="btn danger-fill" @click="quit">Afsluiten</button>
+        </template>
+      </Alert>
+    </Transition>
   </div>
 </template>
 
