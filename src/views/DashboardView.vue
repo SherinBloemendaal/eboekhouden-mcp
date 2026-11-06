@@ -238,7 +238,7 @@ function bar(part: number, of: number): string {
 .bar-label { display: flex; flex-direction: column; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bar-label small { font-size: 10px; color: var(--muted); }
 .track { position: relative; height: 6px; border-radius: 3px; background: var(--sunken); }
-.fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; transition: width 300ms var(--ease); }
+.fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; }
 .fill.mcp { background: #af52de; }
 .fill.eb { background: #0a84ff; }
 .num { text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; }
@@ -263,5 +263,5 @@ function bar(part: number, of: number): string {
 .status-bar .bad { background: #d93025; }
 .status-bar .off { background: var(--off); }
 .status-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--label); }
-@media (prefers-reduced-motion: reduce) { .tip { animation: none; } .fill { transition: none; } }
+@media (prefers-reduced-motion: reduce) { .tip { animation: fade-in 150ms ease 300ms both; } }
 </style>

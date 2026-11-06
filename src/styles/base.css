@@ -17,8 +17,8 @@ button, input, select { font: inherit; color: inherit; }
 .btn {
   box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   height: 28px; padding: 0 14px; border: 0; border-radius: 999px; font-size: 13px; white-space: nowrap;
-  background: var(--glass-bar); box-shadow: var(--glass-bar-edge);
-  transition: background-color 150ms ease, box-shadow 150ms ease, transform 160ms var(--ease);
+  position: relative; background: var(--glass-bar); box-shadow: var(--glass-bar-edge);
+  transition: background-color 150ms ease, box-shadow 150ms ease, opacity 150ms ease, transform 160ms var(--ease);
 }
 .btn:active { transform: scale(0.97); transition-duration: 80ms; }
 .btn:focus-visible { outline: none; box-shadow: 0 0 0 3.5px rgba(10, 132, 255, 0.42); }
@@ -31,6 +31,30 @@ button, input, select { font: inherit; color: inherit; }
 .btn.danger-text { color: var(--danger); }
 .btn:disabled { opacity: 0.5; cursor: default; }
 .btn.ghost:hover { background: var(--hover); }
+/* Busy: the label keeps its room at opacity 0 and a spinner fades in over it, so the width never changes. */
+.btn-label { display: inline-flex; align-items: center; gap: inherit; transition: opacity 150ms ease; }
+.btn::after {
+  content: ''; position: absolute; inset: 0; width: 12px; height: 12px; margin: auto; box-sizing: border-box; border-radius: 50%;
+  border: 2px solid currentColor; border-top-color: transparent; opacity: 0; pointer-events: none; transition: opacity 150ms ease;
+}
+.btn[aria-busy='true'] { opacity: 1; }
+.btn[aria-busy='true'] > .btn-label { opacity: 0; }
+.btn[aria-busy='true']::after { opacity: 1; animation: spin 800ms linear infinite; }
+
+/* Two labels in one grid cell: the box keeps the width of the longer one and they crossfade. */
+.swap { display: inline-grid; }
+.swap > * { grid-area: 1 / 1; transition: opacity 150ms ease; }
+.swap > .off { opacity: 0; }
+
+/* <Transition name="accordion"> around an element with this class. Its one child clips and must carry no padding. */
+.accordion { display: grid; grid-template-rows: 1fr; }
+.accordion > * { min-height: 0; }
+.accordion-enter-active { transition: grid-template-rows 220ms var(--ease); }
+.accordion-enter-active > * { overflow: hidden; transition: opacity 150ms var(--ease); }
+.accordion-leave-active { transition: grid-template-rows 150ms cubic-bezier(0.4, 0, 1, 1); }
+.accordion-leave-active > * { overflow: hidden; transition: opacity 150ms cubic-bezier(0.4, 0, 1, 1); }
+.accordion-enter-from, .accordion-leave-to { grid-template-rows: 0fr; }
+.accordion-enter-from > *, .accordion-leave-to > * { opacity: 0; }
 
 .group { border-radius: 12px; background: var(--group); box-shadow: var(--group-edge); }
 .section-label { font-size: 11px; font-weight: 600; color: var(--muted); }
@@ -39,16 +63,22 @@ button, input, select { font: inherit; color: inherit; }
 .dot.on { background: var(--success-solid); }
 .dot.off { background: var(--off); }
 .dot.bad { background: var(--danger); }
-.dot.on::after {
+/* Only for something live that keeps changing, like the Live button of Verzoeken. */
+.dot.pulse::after {
   content: ''; position: absolute; inset: 0; border-radius: 50%; background: inherit;
   animation: pulse 1600ms var(--ease) infinite;
 }
 @keyframes pulse { from { transform: scale(1); opacity: 0.55; } to { transform: scale(2.6); opacity: 0; } }
 @keyframes rise { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes spin { to { transform: rotate(360deg); } }
 .rise { animation: rise 180ms var(--ease) both; }
 
 @media (prefers-reduced-motion: reduce) {
-  .dot.on::after { animation: none; }
-  .rise { animation: none; }
+  .dot.pulse::after { animation: none; }
+  .rise { animation: fade-in 150ms ease both; }
   .btn:active { transform: none; }
+  .btn[aria-busy='true']::after { animation-duration: 2400ms; }
+  .accordion-enter-active, .accordion-leave-active { transition: opacity 150ms ease; }
+  .accordion-enter-from, .accordion-leave-to { grid-template-rows: 1fr; opacity: 0; }
 }

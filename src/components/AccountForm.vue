@@ -71,27 +71,33 @@ async function save() {
           </button>
         </div>
       </div>
-      <template v-if="form.store === 'onePassword'">
-        <label class="field-block">
-          <span class="label">1Password-item</span>
-          <input v-model="form.opRef" class="field mono" placeholder="op://Werk/e-Boekhouden Studio Noord" spellcheck="false" />
-          <span class="hint">EB MCP leest de velden username en password van dit item via de 1Password-CLI, alleen op het moment van inloggen.</span>
-        </label>
-      </template>
-      <template v-else>
-        <label class="field-block">
-          <span class="label">Gebruikersnaam of e-mailadres</span>
-          <input v-model="form.username" class="field" autocomplete="off" spellcheck="false" />
-        </label>
-        <label class="field-block">
-          <span class="label">Wachtwoord</span>
-          <span class="with-button">
-            <input v-model="form.password" class="field" :type="showPassword ? 'text' : 'password'" autocomplete="new-password" :placeholder="editing && account!.store === 'system' ? 'Leeg laten om het huidige te houden' : ''" />
-            <button type="button" class="btn small ghost" :aria-pressed="showPassword" @click="showPassword = !showPassword">{{ showPassword ? 'Verbergen' : 'Tonen' }}</button>
-          </span>
-          <span class="hint">Gaat direct de sleutelhanger in. EB MCP schrijft het nergens anders weg.</span>
-        </label>
-      </template>
+      <Transition name="accordion" mode="out-in">
+        <div v-if="form.store === 'onePassword'" key="onePassword" class="accordion fields">
+          <div class="fields-inner">
+            <label class="field-block">
+              <span class="label">1Password-item</span>
+              <input v-model="form.opRef" class="field mono" placeholder="op://Werk/e-Boekhouden Studio Noord" spellcheck="false" />
+              <span class="hint">EB MCP leest de velden username en password van dit item via de 1Password-CLI, alleen op het moment van inloggen.</span>
+            </label>
+          </div>
+        </div>
+        <div v-else key="system" class="accordion fields">
+          <div class="fields-inner">
+            <label class="field-block">
+              <span class="label">Gebruikersnaam of e-mailadres</span>
+              <input v-model="form.username" class="field" autocomplete="off" spellcheck="false" />
+            </label>
+            <label class="field-block">
+              <span class="label">Wachtwoord</span>
+              <span class="with-button">
+                <input v-model="form.password" class="field" :type="showPassword ? 'text' : 'password'" autocomplete="new-password" :placeholder="editing && account!.store === 'system' ? 'Leeg laten om het huidige te houden' : ''" />
+                <button type="button" class="btn small ghost" :aria-pressed="showPassword" @click="showPassword = !showPassword">{{ showPassword ? 'Verbergen' : 'Tonen' }}</button>
+              </span>
+              <span class="hint">Gaat direct de sleutelhanger in. EB MCP schrijft het nergens anders weg.</span>
+            </label>
+          </div>
+        </div>
+      </Transition>
       <label class="check">
         <input v-model="form.isDefault" type="checkbox" />
         <span>Standaardaccount voor AI-clients</span>
@@ -101,7 +107,7 @@ async function save() {
     </form>
     <template #footer>
       <button type="button" class="btn" @click="emit('close')">Annuleren</button>
-      <button type="submit" form="account-form" class="btn primary" :disabled="busy">{{ busy ? 'Bezig…' : 'Opslaan' }}</button>
+      <button type="submit" form="account-form" class="btn primary" :disabled="busy" :aria-busy="busy"><span class="btn-label">Opslaan</span></button>
     </template>
   </Sheet>
 </template>
@@ -126,12 +132,19 @@ async function save() {
 .option.on { background: var(--info-soft); box-shadow: inset 0 0 0 1.5px var(--accent); }
 .option span { display: flex; flex-direction: column; gap: 4px; }
 .option small { font-size: 11px; line-height: 15px; color: var(--muted); }
-.ring { width: 16px; height: 16px; flex: none; box-sizing: border-box; border-radius: 50%; border: 1.5px solid var(--field); background: var(--field-bg); transition: border 150ms ease; margin-top: 1px; }
-.option.on .ring { border: 5px solid var(--accent); }
+.ring { position: relative; width: 16px; height: 16px; flex: none; box-sizing: border-box; border-radius: 50%; border: 1.5px solid var(--field); background: var(--field-bg); margin-top: 1px; }
+.ring::before, .ring::after { content: ''; position: absolute; border-radius: 50%; opacity: 0; transition: opacity 150ms ease, transform 150ms var(--ease); }
+.ring::before { inset: -1.5px; background: var(--accent); }
+.ring::after { inset: 3.5px; background: #fff; transform: scale(0.4); }
+.option.on .ring::before { opacity: 1; }
+.option.on .ring::after { opacity: 1; transform: none; }
+.fields-inner { display: flex; flex-direction: column; gap: 14px; }
+.fields.accordion-leave-active, .fields.accordion-leave-active > * { transition-duration: 120ms; }
 .with-button { display: flex; gap: 6px; align-items: center; }
 .check { display: flex; align-items: center; gap: 8px; }
 .check input { accent-color: var(--accent); width: 14px; height: 14px; margin: 0; }
 .note { padding: 9px 11px; border-radius: 10px; font-size: 12px; line-height: 16px; }
 .note.warn { background: var(--warn-soft); color: var(--warn); }
 .note.bad { background: var(--danger-soft); color: var(--danger); }
+@media (prefers-reduced-motion: reduce) { .ring::after { transform: none; } }
 </style>

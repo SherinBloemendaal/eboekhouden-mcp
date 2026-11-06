@@ -1,5 +1,6 @@
 <script setup lang="ts">
-// A macOS alert: app icon, short title, text and equal buttons. Esc cancels.
+// A macOS alert: app icon, short title, text and equal buttons. Esc cancels. Mount it inside
+// <Transition name="modal"> so it can leave: a v-if alone takes it out in one frame.
 import { onBeforeUnmount, onMounted } from 'vue'
 
 const props = defineProps<{ title: string; tone?: 'danger' | 'warn' }>()
@@ -24,7 +25,9 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKey))
 </template>
 
 <style scoped>
-.scrim { position: fixed; inset: 0; z-index: 30; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.1); animation: fade 180ms ease both; }
+.scrim { position: fixed; inset: 0; z-index: 30; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.1); animation: fade 150ms ease both; }
+.scrim.modal-leave-active { animation: fade-out 140ms cubic-bezier(0.4, 0, 1, 1) both; pointer-events: none; }
+.modal-leave-active .alert { animation: shrink 120ms cubic-bezier(0.4, 0, 1, 1) both; }
 .alert {
   width: 300px; box-sizing: border-box; padding: 20px 16px 16px; border-radius: 22px; display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center;
   background: var(--glass-pop); -webkit-backdrop-filter: blur(40px) saturate(190%); backdrop-filter: blur(40px) saturate(190%); box-shadow: var(--pop-shadow);
@@ -39,7 +42,12 @@ h2 { font-size: 13px; font-weight: 700; }
 .text { font-size: 11px; line-height: 15px; display: flex; flex-direction: column; gap: 8px; width: 100%; }
 .buttons { width: 100%; margin-top: 6px; display: flex; gap: 8px; }
 .buttons :deep(.btn) { flex: 1; }
-@keyframes show { from { opacity: 0; transform: scale(0.96); filter: blur(6px); } to { opacity: 1; transform: none; filter: none; } }
+@keyframes show { from { opacity: 0; transform: scale(0.96); } to { opacity: 1; transform: none; } }
+@keyframes shrink { to { opacity: 0; transform: scale(0.97); } }
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
-@media (prefers-reduced-motion: reduce) { .alert { animation: fade 150ms ease both; } }
+@keyframes fade-out { to { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .alert { animation: fade 150ms ease both; }
+  .modal-leave-active .alert { animation: fade-out 120ms cubic-bezier(0.4, 0, 1, 1) both; }
+}
 </style>

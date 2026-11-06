@@ -87,10 +87,16 @@ async function quit() {
             {{ account.session?.expired ? 'Opnieuw inloggen' : 'Inloggen' }}
           </button>
         </div>
-        <div v-if="store.signins[account.id]" class="inline">
-          <SigninSteps :account="account" :event="store.signins[account.id]" compact />
-          <button v-if="!isRunning(store.signins[account.id]?.step)" type="button" class="btn small ghost close" @click="dismissSignin(account.id)">Sluiten</button>
-        </div>
+        <Transition name="accordion">
+          <div v-if="store.signins[account.id]" class="accordion">
+            <div>
+              <div class="inline">
+                <SigninSteps :account="account" :event="store.signins[account.id]" compact />
+                <button v-if="!isRunning(store.signins[account.id]?.step)" type="button" class="btn small ghost close" @click="dismissSignin(account.id)">Sluiten</button>
+              </div>
+            </div>
+          </div>
+        </Transition>
       </div>
     </div>
     <p v-if="!active.length && store.accounts.length" class="hint">AI-clients horen nu dat ze eerst moeten wachten tot je inlogt.</p>
@@ -109,17 +115,22 @@ async function quit() {
       <Icon name="log-out" :size="15" class="item-icon" />
       <span>Alles uitloggen</span>
     </button>
-    <button type="button" class="item" :disabled="quitting" @click="quit">
-      <Icon name="power" :size="15" class="item-icon" />
-      <span>{{ quitting ? 'Uitloggen en afsluiten…' : 'Afsluiten' }}</span>
+    <button type="button" class="item" :disabled="quitting" :aria-busy="quitting" @click="quit">
+      <span class="swap item-icon">
+        <Icon name="power" :size="15" :class="{ off: quitting }" />
+        <span class="spinner" :class="{ off: !quitting }" />
+      </span>
+      <span class="swap">
+        <span :class="{ off: quitting }" :aria-hidden="quitting">Afsluiten</span>
+        <span :class="{ off: !quitting }" :aria-hidden="!quitting">Uitloggen en afsluiten…</span>
+      </span>
       <span class="kbd">⌘Q</span>
     </button>
   </div>
 </template>
 
 <style scoped>
-.panel { height: 100%; box-sizing: border-box; padding: 0 6px 6px; display: flex; flex-direction: column; overflow-y: auto; animation: show 200ms var(--ease) both; }
-@keyframes show { from { opacity: 0; transform: scale(0.96); filter: blur(6px); } to { opacity: 1; transform: none; filter: none; } }
+.panel { height: 100%; box-sizing: border-box; padding: 0 6px 6px; display: flex; flex-direction: column; overflow-y: auto; }
 .head { display: flex; align-items: center; gap: 10px; padding: 12px 8px 8px; }
 .head img { border-radius: 7px; }
 .name { display: flex; flex-direction: column; flex: 1; min-width: 0; }
@@ -139,7 +150,7 @@ async function quit() {
 .chip { height: 16px; display: inline-flex; align-items: center; padding: 0 6px; border-radius: 999px; background: var(--info-soft); color: var(--info); font-size: 10px; font-weight: 500; }
 .sub { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sub.bad { color: var(--danger); }
-.inline { padding: 0 10px 10px 48px; display: flex; flex-direction: column; gap: 6px; animation: rise 180ms var(--ease) both; }
+.inline { padding: 0 10px 10px 48px; display: flex; flex-direction: column; gap: 6px; }
 .close { align-self: flex-end; }
 .sep { height: 1px; background: var(--line-soft); margin: 5px 10px; flex: none; }
 .item {
@@ -148,9 +159,11 @@ async function quit() {
 }
 .item:hover { background: var(--hover); }
 .item:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.42); }
-.item span:first-of-type { flex: 1; }
+.item > .item-icon + span { flex: 1; }
 .item-icon { color: var(--label); }
+.swap.item-icon > * { align-self: center; justify-self: center; }
+.spinner { box-sizing: border-box; width: 12px; height: 12px; border-radius: 50%; border: 1.5px solid var(--line); border-top-color: var(--label); }
+.item[aria-busy='true'] .spinner { animation: spin 800ms linear infinite; }
 .kbd { font-size: 12px; color: var(--muted); }
-@media (prefers-reduced-motion: reduce) { .panel { animation: fade 150ms ease both; } }
-@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .item[aria-busy='true'] .spinner { animation-duration: 2400ms; } }
 </style>

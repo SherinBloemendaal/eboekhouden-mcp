@@ -19,6 +19,7 @@ const done = ref<Client | null>(null)
 const renewing = ref(false)
 const unlinking = ref<Client | null>(null)
 let hideTimer: ReturnType<typeof setTimeout> | null = null
+let doneTimer: ReturnType<typeof setTimeout> | null = null
 
 async function load() {
   info.value = await serverInfo()
@@ -76,7 +77,8 @@ async function confirmLink() {
     await link(client)
     confirming.value = null
     done.value = client
-    setTimeout(() => (done.value = null), 6000)
+    if (doneTimer) clearTimeout(doneTimer)
+    doneTimer = setTimeout(() => (done.value = null), 6000)
   } catch (e) {
     failure.value = String(e)
     confirming.value = null
@@ -122,12 +124,12 @@ function stateText(c: ClientStatus): string {
       <dl v-if="info" class="facts">
         <dt>Adres</dt>
         <dd class="mono selectable">{{ info.url }}</dd>
-        <dd class="actions"><button type="button" class="btn small ghost" @click="copy(info.url, 'url')"><Icon name="copy" :size="14" />{{ copied === 'url' ? 'Gekopieerd' : 'Kopiëren' }}</button></dd>
+        <dd class="actions"><button type="button" class="btn small ghost" @click="copy(info.url, 'url')"><Icon name="copy" :size="14" /><span class="swap"><span :class="{ off: copied === 'url' }" :aria-hidden="copied === 'url'">Kopiëren</span><span :class="{ off: copied !== 'url' }" :aria-hidden="copied !== 'url'">Gekopieerd</span></span></button></dd>
         <dt>Token</dt>
         <dd class="mono selectable">{{ shownToken ?? masked(info.tokenTail) }}</dd>
         <dd class="actions">
           <button type="button" class="btn small ghost" :aria-pressed="!!shownToken" @click="toggleToken">{{ shownToken ? 'Verbergen' : 'Tonen' }}</button>
-          <button type="button" class="btn small ghost" @click="revealToken().then((t) => copy(t, 'token'))"><Icon name="copy" :size="14" />{{ copied === 'token' ? 'Gekopieerd' : 'Kopiëren' }}</button>
+          <button type="button" class="btn small ghost" @click="revealToken().then((t) => copy(t, 'token'))"><Icon name="copy" :size="14" /><span class="swap"><span :class="{ off: copied === 'token' }" :aria-hidden="copied === 'token'">Kopiëren</span><span :class="{ off: copied !== 'token' }" :aria-hidden="copied !== 'token'">Gekopieerd</span></span></button>
           <button type="button" class="btn small ghost" @click="renewing = true"><Icon name="refresh" :size="14" />Vernieuwen</button>
         </dd>
       </dl>
@@ -159,60 +161,70 @@ function stateText(c: ClientStatus): string {
           <span class="stack"><strong>Andere client</strong><span class="client-state">Zelf instellen</span></span>
         </div>
         <p class="muted">Elke client die MCP over HTTP spreekt: gebruik het adres hierboven en stuur het token mee als <span class="mono">Authorization: Bearer</span>.</p>
-        <div class="buttons"><button type="button" class="btn" @click="otherClientSettings().then((t) => copy(t, 'other'))"><Icon name="copy" :size="15" />{{ copied === 'other' ? 'Gekopieerd' : 'Kopieer instellingen' }}</button></div>
+        <div class="buttons"><button type="button" class="btn" @click="otherClientSettings().then((t) => copy(t, 'other'))"><Icon name="copy" :size="15" /><span class="swap"><span :class="{ off: copied === 'other' }" :aria-hidden="copied === 'other'">Kopieer instellingen</span><span :class="{ off: copied !== 'other' }" :aria-hidden="copied !== 'other'">Gekopieerd</span></span></button></div>
       </section>
     </div>
 
-    <div v-if="done" class="banner rise" role="status">
-      <img src="/app-icon.png" alt="" width="34" height="34" />
-      <span><strong>Gekoppeld met {{ CLIENT_NAMES[done] }}</strong><br />{{ done === 'claude' ? 'Start Claude opnieuw om EB MCP te zien.' : 'Cursor pakt de wijziging meestal zelf op; anders even opnieuw starten.' }}</span>
-    </div>
+    <Transition name="banner">
+      <div v-if="done" class="banner" role="status">
+        <img src="/app-icon.png" alt="" width="34" height="34" />
+        <span><strong>Gekoppeld met {{ CLIENT_NAMES[done] }}</strong><br />{{ done === 'claude' ? 'Start Claude opnieuw om EB MCP te zien.' : 'Cursor pakt de wijziging meestal zelf op; anders even opnieuw starten.' }}</span>
+      </div>
+    </Transition>
   </div>
 
-  <Sheet v-if="confirming" :title="`Koppelen met ${CLIENT_NAMES[confirming.client]}`" :width="640" @close="confirming = null">
-    <p>EB MCP {{ confirming.replaces ? 'vervangt zijn eigen regel' : 'voegt de server toe' }} in het instellingenbestand van {{ CLIENT_NAMES[confirming.client] }}. {{ confirming.otherServers.length ? 'Je andere servers blijven staan.' : '' }}</p>
-    <div class="file"><span class="mono">{{ confirming.path }}</span><span class="chip">{{ confirming.exists ? `${confirming.otherServers.length} andere servers` : 'nieuw bestand' }}</span></div>
-    <div class="diff mono">
-      <span v-for="name in confirming.otherServers" :key="name" class="ctx">  "{{ name }}": { … }</span>
-      <span class="add">+ "eb-mcp":</span>
-    </div>
-    <JsonView :value="previewEntry" />
-    <div class="row-line">
-      <button type="button" class="btn small" :aria-pressed="revealInPreview" @click="togglePreviewToken">{{ revealInPreview ? 'Token verbergen' : 'Token tonen' }}</button>
-      <span class="muted small">Het token staat straks leesbaar in dit bestand, net als bij elke andere server.</span>
-    </div>
-    <ul class="bullets">
-      <li v-if="confirming.exists">Eerst een reservekopie: {{ confirming.backup }}</li>
-      <li v-if="confirming.client === 'claude'">Claude Desktop start EB MCP via een kleine brug in de app, omdat Claude alleen lokale stdio-servers start.</li>
-      <li>{{ confirming.client === 'claude' ? 'Start Claude daarna opnieuw; Claude leest het bestand alleen bij de start.' : 'Cursor pakt de wijziging meestal zelf op.' }}</li>
-    </ul>
-    <template #footer>
-      <button type="button" class="btn" :disabled="busy" @click="confirming = null">Annuleren</button>
-      <button type="button" class="btn primary" :disabled="busy" @click="confirmLink"><Icon name="plug" :size="15" />{{ busy ? 'Bezig…' : 'Koppelen' }}</button>
-    </template>
-  </Sheet>
+  <Transition name="modal">
+    <Sheet v-if="confirming" :title="`Koppelen met ${CLIENT_NAMES[confirming.client]}`" :width="640" @close="confirming = null">
+      <p>EB MCP {{ confirming.replaces ? 'vervangt zijn eigen regel' : 'voegt de server toe' }} in het instellingenbestand van {{ CLIENT_NAMES[confirming.client] }}. {{ confirming.otherServers.length ? 'Je andere servers blijven staan.' : '' }}</p>
+      <div class="file"><span class="mono">{{ confirming.path }}</span><span class="chip">{{ confirming.exists ? `${confirming.otherServers.length} andere servers` : 'nieuw bestand' }}</span></div>
+      <div class="diff mono">
+        <span v-for="name in confirming.otherServers" :key="name" class="ctx">  "{{ name }}": { … }</span>
+        <span class="add">+ "eb-mcp":</span>
+      </div>
+      <JsonView :value="previewEntry" />
+      <div class="row-line">
+        <button type="button" class="btn small" :aria-pressed="revealInPreview" @click="togglePreviewToken">{{ revealInPreview ? 'Token verbergen' : 'Token tonen' }}</button>
+        <span class="muted small">Het token staat straks leesbaar in dit bestand, net als bij elke andere server.</span>
+      </div>
+      <ul class="bullets">
+        <li v-if="confirming.exists">Eerst een reservekopie: {{ confirming.backup }}</li>
+        <li v-if="confirming.client === 'claude'">Claude Desktop start EB MCP via een kleine brug in de app, omdat Claude alleen lokale stdio-servers start.</li>
+        <li>{{ confirming.client === 'claude' ? 'Start Claude daarna opnieuw; Claude leest het bestand alleen bij de start.' : 'Cursor pakt de wijziging meestal zelf op.' }}</li>
+      </ul>
+      <template #footer>
+        <button type="button" class="btn" :disabled="busy" @click="confirming = null">Annuleren</button>
+        <button type="button" class="btn primary" :disabled="busy" :aria-busy="busy" @click="confirmLink"><span class="btn-label"><Icon name="plug" :size="15" />Koppelen</span></button>
+      </template>
+    </Sheet>
+  </Transition>
 
-  <Alert v-if="failure" title="Koppelen lukte niet" tone="danger" @close="failure = null">
-    <p>{{ failure }}</p>
-    <p>Er is niets veranderd. Herstel het bestand of zet de reservekopie terug, en probeer het opnieuw.</p>
-    <template #buttons><button type="button" class="btn primary" @click="failure = null">OK</button></template>
-  </Alert>
+  <Transition name="modal">
+    <Alert v-if="failure" title="Koppelen lukte niet" tone="danger" @close="failure = null">
+      <p>{{ failure }}</p>
+      <p>Er is niets veranderd. Herstel het bestand of zet de reservekopie terug, en probeer het opnieuw.</p>
+      <template #buttons><button type="button" class="btn primary" @click="failure = null">OK</button></template>
+    </Alert>
+  </Transition>
 
-  <Alert v-if="renewing" title="Nieuw token maken?" tone="warn" @close="renewing = false">
-    <p>Het huidige token werkt dan meteen niet meer. Gekoppelde clients krijgen een fout tot hun bestand opnieuw geschreven is.</p>
-    <template #buttons>
-      <button type="button" class="btn" @click="renewing = false">Annuleren</button>
-      <button type="button" class="btn primary" @click="confirmRenew">Vernieuwen</button>
-    </template>
-  </Alert>
+  <Transition name="modal">
+    <Alert v-if="renewing" title="Nieuw token maken?" tone="warn" @close="renewing = false">
+      <p>Het huidige token werkt dan meteen niet meer. Gekoppelde clients krijgen een fout tot hun bestand opnieuw geschreven is.</p>
+      <template #buttons>
+        <button type="button" class="btn" @click="renewing = false">Annuleren</button>
+        <button type="button" class="btn primary" @click="confirmRenew">Vernieuwen</button>
+      </template>
+    </Alert>
+  </Transition>
 
-  <Alert v-if="unlinking" :title="`Ontkoppelen van ${CLIENT_NAMES[unlinking]}?`" @close="unlinking = null">
-    <p>EB MCP haalt alleen zijn eigen regel uit het bestand, na een reservekopie.</p>
-    <template #buttons>
-      <button type="button" class="btn" @click="unlinking = null">Annuleren</button>
-      <button type="button" class="btn primary" @click="confirmUnlink">Ontkoppelen</button>
-    </template>
-  </Alert>
+  <Transition name="modal">
+    <Alert v-if="unlinking" :title="`Ontkoppelen van ${CLIENT_NAMES[unlinking]}?`" @close="unlinking = null">
+      <p>EB MCP haalt alleen zijn eigen regel uit het bestand, na een reservekopie.</p>
+      <template #buttons>
+        <button type="button" class="btn" @click="unlinking = null">Annuleren</button>
+        <button type="button" class="btn primary" @click="confirmUnlink">Ontkoppelen</button>
+      </template>
+    </Alert>
+  </Transition>
 </template>
 
 <style scoped>
@@ -249,8 +261,10 @@ function stateText(c: ClientStatus): string {
   position: fixed; right: 16px; top: 12px; z-index: 25; display: flex; align-items: center; gap: 10px; width: 340px; box-sizing: border-box; padding: 12px 14px; border-radius: 20px;
   background: var(--glass-pop); -webkit-backdrop-filter: blur(40px) saturate(190%); backdrop-filter: blur(40px) saturate(190%); box-shadow: var(--pop-shadow); animation: banner 300ms var(--ease) both;
 }
+.banner.banner-leave-active { animation: banner-out 150ms cubic-bezier(0.4, 0, 1, 1) both; }
 .banner img { border-radius: 8px; }
 @keyframes banner { from { opacity: 0; transform: translateX(24px) scale(0.98); } to { opacity: 1; transform: none; } }
+@keyframes banner-out { to { opacity: 0; transform: translateX(24px); } }
 .file { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 9px; background: var(--sunken); font-size: 12px; }
 .file .mono { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .diff { display: flex; flex-direction: column; font-size: 12px; line-height: 18px; }
@@ -258,5 +272,9 @@ function stateText(c: ClientStatus): string {
 .diff .add { color: var(--success); }
 .row-line { display: flex; align-items: center; gap: 8px; }
 .bullets { margin: 0; padding-left: 18px; font-size: 12px; line-height: 18px; color: var(--label); }
-@media (prefers-reduced-motion: reduce) { .banner { animation: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .banner { animation: fade-in 150ms ease both; }
+  .banner.banner-leave-active { animation: banner-fade-out 150ms cubic-bezier(0.4, 0, 1, 1) both; }
+}
+@keyframes banner-fade-out { to { opacity: 0; } }
 </style>

@@ -108,11 +108,11 @@ async function changeIdle() {
         </span>
         <span class="actions">
           <button v-if="account.session && !account.session.expired" type="button" class="btn small" @click="signOut(account.id)">Uitloggen</button>
-          <button v-else type="button" class="btn small" :class="{ primary: account.session?.expired }" :disabled="account.signingIn" @click="startSignIn(account)">
-            {{ account.signingIn ? 'Bezig…' : account.session?.expired ? 'Opnieuw inloggen' : 'Inloggen' }}
+          <button v-else type="button" class="btn small" :class="{ primary: account.session?.expired }" :disabled="account.signingIn" :aria-busy="account.signingIn" @click="startSignIn(account)">
+            <span class="btn-label">{{ account.session?.expired ? 'Opnieuw inloggen' : 'Inloggen' }}</span>
           </button>
           <button type="button" class="icon-btn" :aria-pressed="account.isDefault" :title="account.isDefault ? 'Standaard voor AI-clients' : 'Maak standaard voor AI-clients'" :aria-label="`${account.label} standaard maken`" @click="setDefault(account.id)">
-            <Icon name="star" :size="15" :filled="account.isDefault" :class="account.isDefault ? 'star on' : 'star'" />
+            <Icon name="star" :size="15" :class="account.isDefault ? 'star on' : 'star'" />
           </button>
           <button type="button" class="icon-btn hov" title="Bewerken" :aria-label="`${account.label} bewerken`" @click="editing = account"><Icon name="pencil" :size="15" /></button>
           <button type="button" class="icon-btn hov danger" title="Verwijderen" :aria-label="`${account.label} verwijderen`" @click="removing = account"><Icon name="trash" :size="15" /></button>
@@ -141,36 +141,40 @@ async function changeIdle() {
     </div>
   </div>
 
-  <AccountForm v-if="adding" @close="adding = false" @saved="onSaved" />
-  <AccountForm v-if="editing" :account="editing" @close="editing = null" @saved="onSaved" />
+  <Transition name="modal"><AccountForm v-if="adding" @close="adding = false" @saved="onSaved" /></Transition>
+  <Transition name="modal"><AccountForm v-if="editing" :account="editing" @close="editing = null" @saved="onSaved" /></Transition>
 
-  <Sheet v-if="watched" :title="`Inloggen bij ${watched.label}`" :width="440" @close="closeSignin">
-    <span class="who">
-      <Avatar :label="watched.label" :size="32" />
-      <span class="stack"><span class="name">{{ watched.label }}</span><span class="sub">{{ watched.store === 'onePassword' ? '1Password' : 'Sleutelhanger' }}</span></span>
-    </span>
-    <SigninSteps :account="watched" :event="watchedEvent" />
-    <template #footer>
-      <button v-if="!ended" type="button" class="btn" @click="closeSignin">Annuleren</button>
-      <template v-else>
-        <button v-if="watchedEvent?.step === 'failed'" type="button" class="btn" @click="editing = watched; closeSignin()">Gegevens wijzigen</button>
-        <button v-if="watchedEvent?.step !== 'done'" type="button" class="btn primary" @click="startSignIn(watched)">Opnieuw</button>
-        <button type="button" class="btn" :class="{ primary: watchedEvent?.step === 'done' }" @click="closeSignin">Sluiten</button>
+  <Transition name="modal">
+    <Sheet v-if="watched" :title="`Inloggen bij ${watched.label}`" :width="440" @close="closeSignin">
+      <span class="who">
+        <Avatar :label="watched.label" :size="32" />
+        <span class="stack"><span class="name">{{ watched.label }}</span><span class="sub">{{ watched.store === 'onePassword' ? '1Password' : 'Sleutelhanger' }}</span></span>
+      </span>
+      <SigninSteps :account="watched" :event="watchedEvent" />
+      <template #footer>
+        <button v-if="!ended" type="button" class="btn" @click="closeSignin">Annuleren</button>
+        <template v-else>
+          <button v-if="watchedEvent?.step === 'failed'" type="button" class="btn" @click="editing = watched; closeSignin()">Gegevens wijzigen</button>
+          <button v-if="watchedEvent?.step !== 'done'" type="button" class="btn primary" @click="startSignIn(watched)">Opnieuw</button>
+          <button type="button" class="btn" :class="{ primary: watchedEvent?.step === 'done' }" @click="closeSignin">Sluiten</button>
+        </template>
       </template>
-    </template>
-  </Sheet>
+    </Sheet>
+  </Transition>
 
-  <Alert v-if="removing" :title="`${removing.label} verwijderen?`" tone="danger" @close="removing = null">
-    <p>
-      EB MCP logt dit account uit bij e-Boekhouden{{ removing.store === 'system' ? ' en haalt het wachtwoord uit je sleutelhanger' : '' }}.
-      {{ removing.store === 'onePassword' ? 'Je 1Password-item blijft staan.' : '' }} Je account bij e-Boekhouden zelf blijft bestaan.
-    </p>
-    <p v-if="removeError" class="error" role="alert">{{ removeError }}</p>
-    <template #buttons>
-      <button type="button" class="btn" @click="removing = null">Annuleren</button>
-      <button type="button" class="btn danger-fill" @click="confirmRemove">Verwijderen</button>
-    </template>
-  </Alert>
+  <Transition name="modal">
+    <Alert v-if="removing" :title="`${removing.label} verwijderen?`" tone="danger" @close="removing = null">
+      <p>
+        EB MCP logt dit account uit bij e-Boekhouden{{ removing.store === 'system' ? ' en haalt het wachtwoord uit je sleutelhanger' : '' }}.
+        {{ removing.store === 'onePassword' ? 'Je 1Password-item blijft staan.' : '' }} Je account bij e-Boekhouden zelf blijft bestaan.
+      </p>
+      <p v-if="removeError" class="error" role="alert">{{ removeError }}</p>
+      <template #buttons>
+        <button type="button" class="btn" @click="removing = null">Annuleren</button>
+        <button type="button" class="btn danger-fill" @click="confirmRemove">Verwijderen</button>
+      </template>
+    </Alert>
+  </Transition>
 </template>
 
 <style scoped>
@@ -193,13 +197,14 @@ async function changeIdle() {
 .session.on { color: var(--success); }
 .session.bad { color: var(--danger); }
 .actions { display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
-.icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); transition: background-color 150ms ease, color 150ms ease, opacity 150ms ease; }
+.icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); transition: background-color 150ms ease, color 150ms ease, opacity 150ms ease, transform 120ms var(--ease); }
 .icon-btn:hover { background: var(--hover); color: var(--text); }
+.icon-btn:active { transform: scale(0.92); }
 .icon-btn.danger { color: var(--danger); }
 .icon-btn.hov { opacity: 0; }
 .row:hover .icon-btn.hov, .row:focus-within .icon-btn.hov { opacity: 1; }
-.star { color: var(--off); }
-.star.on { color: #f59e0b; }
+.star { color: var(--off); fill: transparent; transition: color 150ms ease, fill 150ms ease; }
+.star.on { color: #f59e0b; fill: currentColor; }
 .cards { display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px; }
 .card { padding: 16px 18px; display: flex; flex-direction: column; gap: 8px; }
 .card h2 { font-size: 13px; font-weight: 700; }
@@ -207,4 +212,5 @@ async function changeIdle() {
 .idle { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .select { height: 24px; padding: 0 8px; border: 0; border-radius: 7px; background: var(--glass-bar); box-shadow: var(--glass-bar-edge); }
 .error { color: var(--danger); }
+@media (prefers-reduced-motion: reduce) { .icon-btn:active { transform: none; } }
 </style>

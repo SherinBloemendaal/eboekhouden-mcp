@@ -5,7 +5,7 @@ defineProps<{ icon: string; title: string }>()
 </script>
 
 <template>
-  <div class="empty rise">
+  <div class="empty">
     <span class="badge"><Icon :name="icon" :size="24" /></span>
     <h2>{{ title }}</h2>
     <p><slot /></p>

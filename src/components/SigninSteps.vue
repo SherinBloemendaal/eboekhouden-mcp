@@ -70,48 +70,81 @@ function onInput() {
 
 <template>
   <div class="steps" :class="{ compact }">
-    <ol role="list">
-      <li v-for="row in rows" :key="row.label" :class="row.state" class="rise">
+    <TransitionGroup tag="ol" name="step" role="list">
+      <li v-for="row in rows" :key="row.label" :class="row.state">
         <span class="mark" aria-hidden="true">
-          <Icon v-if="row.state === 'done'" name="check" :size="11" />
-          <span v-else-if="row.state === 'run'" class="spin" />
-          <span v-else-if="row.state === 'fail'">!</span>
+          <Transition name="mark">
+            <span v-if="row.state === 'done'" key="done" class="disc ok"><Icon name="check" :size="11" /></span>
+            <span v-else-if="row.state === 'run'" key="run" class="spin" />
+            <span v-else-if="row.state === 'fail'" key="fail" class="disc bad">!</span>
+          </Transition>
         </span>
         {{ row.label }}
       </li>
-    </ol>
-    <form v-if="event?.step === 'code'" class="code rise" @submit.prevent="submitCode">
-      <label :for="`code-${account.id}`">Code uit je authenticator-app</label>
-      <span class="code-row">
-        <input
-          :id="`code-${account.id}`" v-model="code" class="field mono" inputmode="numeric" autocomplete="one-time-code"
-          maxlength="8" placeholder="000000" @input="onInput"
-        />
-        <button type="submit" class="btn primary" :disabled="sending || code.length < 6">{{ sending ? 'Bezig…' : 'Inloggen' }}</button>
-      </span>
-      <span class="hint">EB MCP geeft de code door aan e-Boekhouden en bewaart hem niet.</span>
-      <span v-if="codeError" class="error" role="alert">{{ codeError }}</span>
-    </form>
-    <p v-if="event?.message && (event.step === 'failed' || event.step === 'unknown')" class="note bad rise" role="alert">{{ event.message }}</p>
-    <p v-if="event?.step === 'done'" class="note ok rise" role="status">
-      Ingelogd{{ event.message ? ` bij ${event.message}` : '' }}. De sessie staat alleen in het geheugen van EB MCP.
-    </p>
+    </TransitionGroup>
+    <Transition name="accordion">
+      <div v-if="event?.step === 'code'" class="accordion">
+        <div>
+          <form class="code" @submit.prevent="submitCode">
+            <label :for="`code-${account.id}`">Code uit je authenticator-app</label>
+            <span class="code-row">
+              <input
+                :id="`code-${account.id}`" v-model="code" class="field mono" inputmode="numeric" autocomplete="one-time-code"
+                maxlength="8" placeholder="000000" @input="onInput"
+              />
+              <button type="submit" class="btn primary" :disabled="sending || code.length < 6" :aria-busy="sending"><span class="btn-label">Inloggen</span></button>
+            </span>
+            <span class="hint">EB MCP geeft de code door aan e-Boekhouden en bewaart hem niet.</span>
+            <span v-if="codeError" class="error" role="alert">{{ codeError }}</span>
+          </form>
+        </div>
+      </div>
+    </Transition>
+    <Transition name="accordion">
+      <div v-if="event?.message && (event.step === 'failed' || event.step === 'unknown')" class="accordion">
+        <div><p class="note bad" role="alert">{{ event.message }}</p></div>
+      </div>
+    </Transition>
+    <Transition name="accordion">
+      <div v-if="event?.step === 'done'" class="accordion">
+        <div>
+          <p class="note ok" role="status">
+            Ingelogd{{ event.message ? ` bij ${event.message}` : '' }}. De sessie staat alleen in het geheugen van EB MCP.
+          </p>
+        </div>
+      </div>
+    </Transition>
   </div>
 </template>
 
 <style scoped>
-.steps { display: flex; flex-direction: column; gap: 10px; }
-ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-li { display: flex; align-items: center; gap: 10px; min-height: 24px; color: var(--muted); }
+.steps { display: flex; flex-direction: column; }
+/* The gap sits inside each collapsing block, so it opens and closes with it. */
+.code, .note { margin-top: 10px; }
+/* Block flow, not flex: a leaving row is taken out of flow and must keep its own place. */
+ol { position: relative; list-style: none; margin: 0; padding: 0; }
+li + li { margin-top: 4px; }
+li { display: flex; align-items: center; gap: 10px; min-height: 24px; color: var(--muted); transition: color 150ms ease; }
 li.done, li.run { color: var(--text); }
 li.fail { color: var(--danger); }
 .compact li { min-height: 20px; font-size: 12px; }
-.mark { width: 16px; height: 16px; flex: none; box-sizing: border-box; border-radius: 50%; border: 1.5px solid var(--off); display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; }
-li.done .mark { border: 0; background: var(--success-solid); color: #fff; }
-li.fail .mark { border: 0; background: var(--danger); color: #fff; }
-li.run .mark { border: 0; }
-.spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--muted); animation: spin 800ms linear infinite; }
+.step-enter-active { transition: opacity 150ms var(--ease), transform 150ms var(--ease); }
+.step-leave-active { position: absolute; transition: opacity 120ms cubic-bezier(0.4, 0, 1, 1); }
+.step-enter-from { opacity: 0; transform: translateY(-4px); }
+.step-leave-to { opacity: 0; }
+.step-move { transition: transform 200ms var(--ease); }
+.mark { position: relative; width: 16px; height: 16px; flex: none; font-size: 11px; font-weight: 700; }
+.mark::before { content: ''; position: absolute; inset: 0; box-sizing: border-box; border-radius: 50%; border: 1.5px solid var(--off); transition: opacity 150ms ease; }
+li:not(.wait) .mark::before { opacity: 0; }
+.disc { position: absolute; inset: 0; border-radius: 50%; color: #fff; display: flex; align-items: center; justify-content: center; }
+.disc.ok { background: var(--success-solid); }
+.disc.bad { background: var(--danger); }
+.spin { position: absolute; inset: 0; margin: auto; box-sizing: border-box; width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--muted); animation: spin 800ms linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+.mark-enter-active { transition: opacity 200ms var(--ease), transform 200ms var(--ease); }
+.mark-leave-active { transition: opacity 150ms cubic-bezier(0.4, 0, 1, 1); }
+.mark-enter-from, .mark-leave-to { opacity: 0; }
+.disc.mark-enter-from { transform: scale(0.6); }
 .code { display: flex; flex-direction: column; gap: 6px; }
 .code label { font-size: 12px; font-weight: 600; color: var(--label); }
 .code-row { display: flex; gap: 8px; }
@@ -122,5 +155,9 @@ li.run .mark { border: 0; }
 .note { padding: 9px 11px; border-radius: 10px; font-size: 12px; line-height: 16px; }
 .note.bad { background: var(--danger-soft); color: var(--danger); }
 .note.ok { background: var(--success-soft); color: var(--success); }
-@media (prefers-reduced-motion: reduce) { .spin { animation-duration: 2400ms; } }
+@media (prefers-reduced-motion: reduce) {
+  .spin { animation-duration: 2400ms; }
+  .step-enter-from, .disc.mark-enter-from { transform: none; }
+  .step-move { transition: none; }
+}
 </style>

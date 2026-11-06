@@ -17,6 +17,8 @@ const client = ref('')
 const account = ref('')
 const errorsOnly = ref(false)
 const expanded = ref(new Set<number>())
+// Only the row the user just opened or closed animates; live entries under an open row arrive without motion.
+const toggled = ref<number | null>(null)
 const selectedId = ref<number | null>(null)
 const detail = ref<Entry | null>(null)
 const clearing = ref(false)
@@ -53,6 +55,7 @@ const rows = computed(() => {
 const maxMs = computed(() => Math.max(1000, ...log.entries.map((e) => e.durationMs)))
 
 function toggle(id: number) {
+  toggled.value = id
   const next = new Set(expanded.value)
   if (next.has(id)) next.delete(id)
   else next.add(id)
@@ -107,6 +110,10 @@ async function confirmClear() {
   detail.value = null
 }
 
+function settled(id: number) {
+  if (toggled.value === id) toggled.value = null
+}
+
 function initials(text: string | null): string {
   if (!text) return ''
   const words = text.split(/\s+/)
@@ -138,7 +145,7 @@ function initials(text: string | null): string {
       <button type="button" class="pick" :class="{ on: errorsOnly }" :aria-pressed="errorsOnly" @click="errorsOnly = !errorsOnly">Alleen fouten</button>
       <button type="button" class="btn small live" :aria-pressed="!log.paused" @click="setPaused(!log.paused)">
         <template v-if="log.paused">Gepauzeerd{{ log.pending ? ` · ${log.pending} nieuw` : '' }}</template>
-        <template v-else><span class="dot on" />Live</template>
+        <template v-else><span class="dot on pulse" />Live</template>
       </button>
     </div>
 
@@ -175,70 +182,74 @@ function initials(text: string | null): string {
               <span class="right muted">{{ size(entry.bytes) }}</span>
               <span class="who" :title="`${entry.client}${entry.account ? ` · ${entry.account}` : ''}`"><span class="tag">{{ initials(entry.client) }}</span><span v-if="entry.account" class="tag acc">{{ initials(entry.account) }}</span></span>
             </div>
-            <template v-if="tab === 'all' && expanded.has(entry.id)">
-              <div v-for="(child, i) in children" :key="child.id" class="row item child" role="row" :class="{ sel: selectedId === child.id }" @click="select(child)">
-                <span class="mono muted small">{{ time(child.at) }}</span>
-                <span><span class="badge eb">{{ child.method }}</span></span>
-                <span class="main"><span class="tree" :class="{ last: i === children.length - 1 }" /><span class="mono path">{{ child.path }}</span></span>
-                <span class="status" :class="{ bad: isError(child) }"><span class="dot" :class="isError(child) ? 'bad' : 'on-static'" />{{ statusLabel(child) }}</span>
-                <span class="right dur">{{ duration(child.durationMs) }}<span class="bar"><span :style="{ width: `${Math.max(4, (child.durationMs / maxMs) * 100)}%` }" :class="{ slow: child.durationMs >= 1000 }" /></span></span>
-                <span class="right muted">{{ size(child.bytes) }}</span>
-                <span class="who"><span class="tag">{{ initials(child.client) }}</span><span v-if="child.account" class="tag acc">{{ initials(child.account) }}</span></span>
+            <Transition name="kids" :css="toggled === entry.id" @after-enter="settled(entry.id)" @after-leave="settled(entry.id)">
+              <div v-if="tab === 'all' && expanded.has(entry.id)" class="kids">
+                <div v-for="(child, i) in children" :key="child.id" class="row item child" role="row" :class="{ sel: selectedId === child.id }" @click="select(child)">
+                  <span class="mono muted small">{{ time(child.at) }}</span>
+                  <span><span class="badge eb">{{ child.method }}</span></span>
+                  <span class="main"><span class="tree" :class="{ last: i === children.length - 1 }" /><span class="mono path">{{ child.path }}</span></span>
+                  <span class="status" :class="{ bad: isError(child) }"><span class="dot" :class="isError(child) ? 'bad' : 'on-static'" />{{ statusLabel(child) }}</span>
+                  <span class="right dur">{{ duration(child.durationMs) }}<span class="bar"><span :style="{ width: `${Math.max(4, (child.durationMs / maxMs) * 100)}%` }" :class="{ slow: child.durationMs >= 1000 }" /></span></span>
+                  <span class="right muted">{{ size(child.bytes) }}</span>
+                  <span class="who"><span class="tag">{{ initials(child.client) }}</span><span v-if="child.account" class="tag acc">{{ initials(child.account) }}</span></span>
+                </div>
               </div>
-            </template>
+            </Transition>
           </template>
         </div>
       </div>
 
-      <aside v-if="detail" class="detail" aria-label="Details">
-        <div class="detail-head">
-          <div class="title-line">
-            <span class="badge" :class="detail.kind">{{ detail.kind === 'mcp' ? 'MCP' : detail.method }}</span>
-            <strong class="mono title">{{ detail.kind === 'mcp' ? detail.tool : detail.path }}</strong>
-            <button type="button" class="icon-btn" aria-label="Details sluiten" title="Sluiten" @click="detail = null; selectedId = null">✕</button>
+      <Transition name="detail">
+        <aside v-if="detail" class="detail" aria-label="Details">
+          <div class="detail-head">
+            <div class="title-line">
+              <span class="badge" :class="detail.kind">{{ detail.kind === 'mcp' ? 'MCP' : detail.method }}</span>
+              <strong class="mono title">{{ detail.kind === 'mcp' ? detail.tool : detail.path }}</strong>
+              <button type="button" class="icon-btn" aria-label="Details sluiten" title="Sluiten" @click="detail = null; selectedId = null">✕</button>
+            </div>
+            <div class="facts">
+              <span class="chip" :class="isError(detail) ? 'bad' : 'ok'">{{ statusLabel(detail) }}</span>
+              <span class="chip">{{ duration(detail.durationMs) }}</span>
+              <span class="chip">{{ size(detail.bytes) }}</span>
+              <span class="chip">{{ detail.client }}</span>
+              <span v-if="detail.account" class="chip info">{{ detail.account }}</span>
+              <span class="chip mono">{{ time(detail.at) }}</span>
+            </div>
+            <button v-if="parentOf" type="button" class="parent" @click="select(parentOf.parent)">
+              Door <strong class="mono">{{ parentOf.parent.tool }}</strong> van {{ parentOf.parent.client }}, aanroep {{ parentOf.index }} van {{ parentOf.total }}
+            </button>
           </div>
-          <div class="facts">
-            <span class="chip" :class="isError(detail) ? 'bad' : 'ok'">{{ statusLabel(detail) }}</span>
-            <span class="chip">{{ duration(detail.durationMs) }}</span>
-            <span class="chip">{{ size(detail.bytes) }}</span>
-            <span class="chip">{{ detail.client }}</span>
-            <span v-if="detail.account" class="chip info">{{ detail.account }}</span>
-            <span class="chip mono">{{ time(detail.at) }}</span>
+          <div class="detail-body">
+            <p v-if="detail.error" class="note bad" role="alert">{{ detail.error }}</p>
+            <template v-if="detail.kind === 'mcp'">
+              <section><h3 class="section-label">Argumenten</h3><JsonView :value="detail.args" /></section>
+              <section v-if="detailCalls.length">
+                <h3 class="section-label">Naar e-Boekhouden · {{ detailCalls.length }} {{ detailCalls.length === 1 ? 'aanroep' : 'aanroepen' }}, {{ duration(detail.durationMs) }}</h3>
+                <button v-for="call in detailCalls" :key="call.id" type="button" class="wf" @click="select(call)">
+                  <span class="mono path">{{ call.path }}</span>
+                  <span class="wf-track"><span class="wf-bar" :class="{ bad: isError(call) }" :style="{ left: `${((call.at - span.start) / span.total) * 100}%`, width: `${Math.max(2, (call.durationMs / span.total) * 100)}%` }" /></span>
+                  <span class="right small">{{ duration(call.durationMs) }}</span>
+                </button>
+              </section>
+              <section v-if="detail.result !== undefined && detail.result !== null"><h3 class="section-label">Resultaat, zoals de client het kreeg</h3><JsonView :value="detail.result" :max-height="320" /></section>
+            </template>
+            <template v-else>
+              <section v-if="detail.query.length">
+                <h3 class="section-label">Query</h3>
+                <dl class="kv"><template v-for="[k, v] in detail.query" :key="k"><dt class="mono">{{ k }}</dt><dd class="mono selectable">{{ v || '(leeg)' }}</dd></template></dl>
+              </section>
+              <section>
+                <h3 class="section-label">Headers</h3>
+                <dl class="kv"><template v-for="[k, v] in detail.headers" :key="k"><dt class="mono">{{ k }}</dt><dd class="mono">{{ v }}<span v-if="v.startsWith('••')" class="chip">verborgen</span></dd></template></dl>
+              </section>
+              <section v-if="detail.response !== undefined && detail.response !== null">
+                <h3 class="section-label">Antwoord<span v-if="detail.rows !== null" class="chip">{{ detail.rows }} rijen</span><span v-if="detail.truncated" class="chip">ingekort</span></h3>
+                <JsonView :value="detail.response" :max-height="360" />
+              </section>
+            </template>
           </div>
-          <button v-if="parentOf" type="button" class="parent" @click="select(parentOf.parent)">
-            Door <strong class="mono">{{ parentOf.parent.tool }}</strong> van {{ parentOf.parent.client }}, aanroep {{ parentOf.index }} van {{ parentOf.total }}
-          </button>
-        </div>
-        <div class="detail-body">
-          <p v-if="detail.error" class="note bad" role="alert">{{ detail.error }}</p>
-          <template v-if="detail.kind === 'mcp'">
-            <section><h3 class="section-label">Argumenten</h3><JsonView :value="detail.args" /></section>
-            <section v-if="detailCalls.length">
-              <h3 class="section-label">Naar e-Boekhouden · {{ detailCalls.length }} {{ detailCalls.length === 1 ? 'aanroep' : 'aanroepen' }}, {{ duration(detail.durationMs) }}</h3>
-              <button v-for="call in detailCalls" :key="call.id" type="button" class="wf" @click="select(call)">
-                <span class="mono path">{{ call.path }}</span>
-                <span class="wf-track"><span class="wf-bar" :class="{ bad: isError(call) }" :style="{ left: `${((call.at - span.start) / span.total) * 100}%`, width: `${Math.max(2, (call.durationMs / span.total) * 100)}%` }" /></span>
-                <span class="right small">{{ duration(call.durationMs) }}</span>
-              </button>
-            </section>
-            <section v-if="detail.result !== undefined && detail.result !== null"><h3 class="section-label">Resultaat, zoals de client het kreeg</h3><JsonView :value="detail.result" :max-height="320" /></section>
-          </template>
-          <template v-else>
-            <section v-if="detail.query.length">
-              <h3 class="section-label">Query</h3>
-              <dl class="kv"><template v-for="[k, v] in detail.query" :key="k"><dt class="mono">{{ k }}</dt><dd class="mono selectable">{{ v || '(leeg)' }}</dd></template></dl>
-            </section>
-            <section>
-              <h3 class="section-label">Headers</h3>
-              <dl class="kv"><template v-for="[k, v] in detail.headers" :key="k"><dt class="mono">{{ k }}</dt><dd class="mono">{{ v }}<span v-if="v.startsWith('••')" class="chip">verborgen</span></dd></template></dl>
-            </section>
-            <section v-if="detail.response !== undefined && detail.response !== null">
-              <h3 class="section-label">Antwoord<span v-if="detail.rows !== null" class="chip">{{ detail.rows }} rijen</span><span v-if="detail.truncated" class="chip">ingekort</span></h3>
-              <JsonView :value="detail.response" :max-height="360" />
-            </section>
-          </template>
-        </div>
-      </aside>
+        </aside>
+      </Transition>
     </div>
   </div>
 
@@ -283,8 +294,13 @@ function initials(text: string | null): string {
 .args, .path { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1; }
 .args { font-size: 11px; }
 .chev, .chev-space { width: 18px; height: 18px; flex: none; }
-.chev { border: 0; border-radius: 5px; background: transparent; color: var(--muted); padding: 0; }
-.chev:hover { background: var(--hover); }
+.chev { border: 0; border-radius: 5px; background: transparent; color: var(--muted); padding: 0; transition: background-color 150ms ease, color 150ms ease, transform 120ms var(--ease); }
+.chev:hover { background: var(--hover); color: var(--text); }
+.chev:active { transform: scale(0.92); }
+.kids-enter-active { transition: opacity 150ms var(--ease), transform 150ms var(--ease); }
+.kids-leave-active { transition: opacity 120ms cubic-bezier(0.4, 0, 1, 1); }
+.kids-enter-from { opacity: 0; transform: translateY(-4px); }
+.kids-leave-to { opacity: 0; }
 .chev span { display: inline-block; transition: transform 180ms var(--ease); }
 .chev span.open { transform: rotate(90deg); }
 .tree { position: relative; width: 18px; height: 28px; flex: none; }
@@ -310,13 +326,17 @@ function initials(text: string | null): string {
   width: 400px; flex: none; margin: 0 8px 8px 0; border-radius: 14px; overflow: hidden; display: flex; flex-direction: column;
   background: var(--group); box-shadow: var(--group-edge); animation: slide 240ms var(--ease) both;
 }
+.detail.detail-leave-active { animation: slide-out 140ms cubic-bezier(0.4, 0, 1, 1) both; pointer-events: none; }
 @keyframes slide { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: none; } }
+@keyframes slide-out { to { opacity: 0; transform: translateX(12px); } }
+@keyframes fade-out { to { opacity: 0; } }
 .detail-head { padding: 14px 16px 10px; border-bottom: 0.5px solid var(--line-soft); display: flex; flex-direction: column; gap: 8px; }
 .title-line { display: flex; align-items: center; gap: 8px; }
 .title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
 .facts { display: flex; flex-wrap: wrap; gap: 6px; }
 .facts .chip { margin-left: 0; }
-.parent { text-align: left; border: 0; border-radius: 10px; padding: 7px 10px; background: rgba(175, 82, 222, 0.13); color: #7a3fc7; font-size: 12px; }
+.parent { text-align: left; border: 0; border-radius: 10px; padding: 7px 10px; background: rgba(175, 82, 222, 0.13); color: #7a3fc7; font-size: 12px; transition: background-color 150ms ease; }
+.parent:hover { background: rgba(175, 82, 222, 0.2); }
 .detail-body { flex: 1; overflow: auto; padding: 12px 16px 18px; display: flex; flex-direction: column; gap: 16px; }
 section { display: flex; flex-direction: column; gap: 6px; }
 h3 { display: flex; align-items: center; margin: 0; }
@@ -332,8 +352,14 @@ h3 { display: flex; align-items: center; margin: 0; }
 .wf-bar.bad { background: #d93025; }
 .note { padding: 9px 11px; border-radius: 10px; font-size: 12px; line-height: 16px; }
 .note.bad { background: var(--danger-soft); color: var(--danger); }
-.icon-btn { width: 24px; height: 24px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); transition: background-color 150ms ease; }
+.icon-btn { width: 24px; height: 24px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); transition: background-color 150ms ease, color 150ms ease, transform 120ms var(--ease); }
 .icon-btn:hover { background: var(--hover); color: var(--text); }
+.icon-btn:active { transform: scale(0.92); }
 @media (max-width: 1240px) { .detail { width: 340px; } .row { grid-template-columns: 84px 50px minmax(0, 1fr) 76px 92px 52px; } .row > :nth-child(6) { display: none; } }
-@media (prefers-reduced-motion: reduce) { .detail { animation: none; } .chev span { transition: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .detail { animation: fade-in 150ms ease both; }
+  .detail.detail-leave-active { animation: fade-out 140ms cubic-bezier(0.4, 0, 1, 1) both; }
+  .chev span { transition: none; }
+  .chev:active, .icon-btn:active, .kids-enter-from { transform: none; }
+}
 </style>
