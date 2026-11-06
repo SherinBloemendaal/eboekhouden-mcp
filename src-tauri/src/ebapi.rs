@@ -17,6 +17,8 @@ const AT_ONCE: usize = 2;
 const BACKOFF_START: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a call may wait for its turn under the rate limit before it gives up (Sherin, 2026-11-06).
+const QUEUE_WAIT: Duration = Duration::from_secs(10);
 
 /// One call as the request log keeps it. Secrets never get in here.
 #[derive(Clone, Debug, Serialize)]
@@ -90,7 +92,12 @@ impl EbClient {
                 return call;
             }
         };
-        let _permit = self.limiter.acquire().await;
+        let Some(_permit) = self.limiter.acquire().await else {
+            call.error = Some(
+                "Te veel aanroepen tegelijk: EB MCP houdt e-Boekhouden rustig (30 per minuut). Probeer het over een minuut opnieuw.".into(),
+            );
+            return call;
+        };
         let started = Instant::now();
         let mut request = self
             .http
@@ -230,7 +237,14 @@ impl Limiter {
         }
     }
 
-    async fn acquire(&self) -> tokio::sync::SemaphorePermit<'_> {
+    /// A place under the limit, or None when none comes free within QUEUE_WAIT.
+    async fn acquire(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        tokio::time::timeout(QUEUE_WAIT, self.wait_for_turn())
+            .await
+            .ok()
+    }
+
+    async fn wait_for_turn(&self) -> tokio::sync::SemaphorePermit<'_> {
         let permit = self.slots.acquire().await.expect("limiter closed");
         loop {
             let wait = {
@@ -361,14 +375,15 @@ mod tests {
         let limiter = Limiter::new();
         let start = tokio::time::Instant::now();
         for _ in 0..PER_MINUTE {
-            drop(limiter.acquire().await);
+            assert!(limiter.acquire().await.is_some());
         }
         assert!(start.elapsed() < Duration::from_secs(1));
-        drop(limiter.acquire().await);
+        // The 31st waits at most 10 s for a place, then gives up instead of hanging for the rest of the minute.
+        assert!(limiter.acquire().await.is_none());
+        let waited = start.elapsed();
         assert!(
-            start.elapsed() >= Duration::from_secs(59),
-            "{:?}",
-            start.elapsed()
+            waited >= Duration::from_secs(10) && waited < Duration::from_secs(11),
+            "{waited:?}"
         );
     }
 
@@ -377,11 +392,14 @@ mod tests {
         let limiter = Limiter::new();
         limiter.failed(None).await;
         let start = tokio::time::Instant::now();
-        drop(limiter.acquire().await);
+        assert!(limiter.acquire().await.is_some());
         assert!(start.elapsed() >= Duration::from_secs(2));
-        limiter.failed(Some(Duration::from_secs(10))).await;
+        limiter.failed(Some(Duration::from_secs(6))).await;
         let start = tokio::time::Instant::now();
-        drop(limiter.acquire().await);
-        assert!(start.elapsed() >= Duration::from_secs(10));
+        assert!(limiter.acquire().await.is_some());
+        assert!(start.elapsed() >= Duration::from_secs(6));
+        // A pause longer than the queue wait fails the call instead of holding it for minutes.
+        limiter.failed(Some(Duration::from_secs(120))).await;
+        assert!(limiter.acquire().await.is_none());
     }
 }

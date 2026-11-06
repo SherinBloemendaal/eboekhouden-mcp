@@ -265,18 +265,36 @@ fn bridge_path() -> std::path::PathBuf {
         .unwrap_or_else(|| name.into())
 }
 
+/// The bridge Claude Desktop starts. Development builds pass the dev token file,
+/// since their token is not in the Keychain (secrets::DevFileStore).
+fn bridge(app: &AppHandle) -> connect::Bridge {
+    let token_file = cfg!(debug_assertions)
+        .then(|| app.path().app_config_dir().ok())
+        .flatten()
+        .map(|dir| dir.join("dev-token.json"));
+    connect::Bridge {
+        path: bridge_path(),
+        token_file,
+    }
+}
+
 #[tauri::command]
-fn clients_status(server: Shared<'_, Server>) -> Vec<connect::ClientStatus> {
+fn clients_status(app: AppHandle, server: Shared<'_, Server>) -> Vec<connect::ClientStatus> {
     let paths = connect::Paths::system();
-    let token = server.token();
-    [connect::Client::Claude, connect::Client::Cursor]
-        .into_iter()
-        .map(|c| connect::status(&paths, c, &token))
-        .collect()
+    let (token, bridge) = (server.token(), bridge(&app));
+    [
+        connect::Client::Claude,
+        connect::Client::Cursor,
+        connect::Client::ClaudeCode,
+    ]
+    .into_iter()
+    .map(|c| connect::status(&paths, c, &mcp::url(), &token, &bridge))
+    .collect()
 }
 
 #[tauri::command]
 fn connect_preview(
+    app: AppHandle,
     server: Shared<'_, Server>,
     client: connect::Client,
 ) -> Result<connect::Preview, String> {
@@ -285,12 +303,16 @@ fn connect_preview(
         client,
         &mcp::url(),
         &server.token(),
-        &bridge_path(),
+        &bridge(&app),
     )
 }
 
 #[tauri::command]
-fn connect_link(server: Shared<'_, Server>, client: connect::Client) -> Result<(), String> {
+fn connect_link(
+    app: AppHandle,
+    server: Shared<'_, Server>,
+    client: connect::Client,
+) -> Result<(), String> {
     if client == connect::Client::Claude && !bridge_path().is_file() {
         return Err("De brug voor Claude (eb-mcp-bridge) ontbreekt naast de app. Installeer EB MCP opnieuw.".into());
     }
@@ -299,7 +321,7 @@ fn connect_link(server: Shared<'_, Server>, client: connect::Client) -> Result<(
         client,
         &mcp::url(),
         &server.token(),
-        &bridge_path(),
+        &bridge(&app),
     )
 }
 
@@ -352,8 +374,39 @@ fn settings_get(settings: Shared<'_, SettingsStore>) -> Settings {
 }
 
 #[tauri::command]
-fn settings_set(settings: Shared<'_, SettingsStore>, value: Settings) -> Result<(), String> {
-    settings.set(value)
+fn settings_set(
+    app: AppHandle,
+    settings: Shared<'_, SettingsStore>,
+    value: Settings,
+) -> Result<(), String> {
+    let appearance = value.appearance;
+    settings.set(value)?;
+    apply_appearance(&app, appearance);
+    Ok(())
+}
+
+/// Sets EB MCP's own windows to light, dark or the system's choice; the pages follow
+/// through prefers-color-scheme. The hidden e-Boekhouden webviews are left alone.
+fn apply_appearance(app: &AppHandle, appearance: settings::Appearance) {
+    let theme = match appearance {
+        settings::Appearance::System => None,
+        settings::Appearance::Light => Some(tauri::Theme::Light),
+        settings::Appearance::Dark => Some(tauri::Theme::Dark),
+    };
+    for label in [MAIN, PANEL] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.set_theme(theme);
+        }
+    }
+}
+
+/// For a sign-in that stopped at a step EB MCP does not know: the user goes on in their own browser.
+#[tauri::command]
+fn open_eboekhouden(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(signin::LOGIN_URL, None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -427,6 +480,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(updates::UpdateListener::default())
         // A new page in the main window does not listen for Sparkle's relaunch question until it says so (updates.rs).
         .on_page_load(|webview, payload| {
@@ -449,6 +503,7 @@ pub fn run() {
             sign_out_all,
             settings_get,
             settings_set,
+            open_eboekhouden,
             log_list,
             log_get,
             log_clear,
@@ -486,6 +541,7 @@ pub fn run() {
             let dir = app.path().app_config_dir()?;
             let accounts = AccountStore::open(&dir).map_err(std::io::Error::other)?;
             let settings = Arc::new(SettingsStore::open(&dir));
+            apply_appearance(app.handle(), settings.get().appearance);
             let app_state = Arc::new(AppState::new(
                 accounts,
                 EbClient::production(),

@@ -154,7 +154,10 @@ function main([dist, tag, build, notesFile, notesHtmlFile]) {
     const path = join(dist, `${file}.sig`)
     return existsSync(path) ? readFileSync(path, 'utf8').trim() : null
   }
-  writeFileSync(join(dist, 'latest.json'), `${JSON.stringify(latestJson({ tag, notes, pubDate, signatureOf }), null, 2)}\n`)
+  // Windows ships after the first Mac release: without its setup there is no Tauri feed yet.
+  if (TAURI_PLATFORMS.some(([, file]) => existsSync(join(dist, file)))) {
+    writeFileSync(join(dist, 'latest.json'), `${JSON.stringify(latestJson({ tag, notes, pubDate, signatureOf }), null, 2)}\n`)
+  }
   const [feed, file] = SPARKLE_FEED
   const sparkle = join(dist, `${file}.sparkle`)
   if (!existsSync(sparkle)) {

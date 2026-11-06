@@ -1,4 +1,4 @@
-//! Small app settings on disk (no secrets): the idle sign-out time.
+//! Small app settings on disk (no secrets): the idle sign-out time and the appearance.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,16 +8,30 @@ use serde::{Deserialize, Serialize};
 
 pub const IDLE_CHOICES: [u32; 4] = [15, 30, 60, 240];
 
+/// Systeem, Licht or Donker (Instellingen, Cmd+,).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     /// Minutes without an AI call before an account is signed out.
     pub idle_minutes: u32,
+    pub appearance: Appearance,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { idle_minutes: 30 }
+        Self {
+            idle_minutes: 30,
+            appearance: Appearance::System,
+        }
     }
 }
 
@@ -66,8 +80,38 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let store = SettingsStore::open(&dir);
         assert_eq!(store.get().idle_minutes, 30);
-        assert!(store.set(Settings { idle_minutes: 7 }).is_err());
-        store.set(Settings { idle_minutes: 60 }).unwrap();
+        assert!(
+            store
+                .set(Settings {
+                    idle_minutes: 7,
+                    ..Settings::default()
+                })
+                .is_err()
+        );
+        store
+            .set(Settings {
+                idle_minutes: 60,
+                appearance: Appearance::Dark,
+            })
+            .unwrap();
         assert_eq!(SettingsStore::open(&dir).get().idle_minutes, 60);
+        assert_eq!(SettingsStore::open(&dir).get().appearance, Appearance::Dark);
+    }
+}
+
+#[cfg(test)]
+mod older_files {
+    use super::*;
+
+    #[test]
+    fn a_file_from_before_the_appearance_setting_still_loads() {
+        let settings: Settings = serde_json::from_str(r#"{"idleMinutes": 15}"#).unwrap();
+        assert_eq!(
+            settings,
+            Settings {
+                idle_minutes: 15,
+                appearance: Appearance::System
+            }
+        );
     }
 }
