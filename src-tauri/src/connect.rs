@@ -1,5 +1,5 @@
-//! Koppelen: writes the EB MCP entry into Claude Desktop's or Cursor's own
-//! MCP config, after the user saw exactly what changes. A backup goes next to
+//! Koppelen: writes the EB MCP entry into the MCP config of Claude Desktop,
+//! Cursor or Claude Code, after the user saw exactly what changes. A backup goes next to
 //! the file first; a file that is not valid JSON is never touched; after
 //! writing, the file is read back to check.
 
@@ -10,13 +10,21 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 pub const ENTRY: &str = "eb-mcp";
-pub const TOKEN_ENV: &str = "EB_MCP_TOKEN";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Client {
     Claude,
     Cursor,
+    ClaudeCode,
+}
+
+/// How Claude Desktop starts EB MCP: the bridge next to the app. Release builds
+/// let it read the token from the Keychain; development builds point it at the
+/// dev token file (secrets::DevFileStore). Claude's config never holds the token.
+pub struct Bridge {
+    pub path: PathBuf,
+    pub token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -25,7 +33,7 @@ pub enum LinkState {
     /// No config file, or no EB MCP entry in it.
     None,
     Linked,
-    /// Linked with a token that is no longer the current one.
+    /// Linked, but not as EB MCP would write it now (an older token, or the app moved).
     Stale,
     /// The file exists but is not valid JSON.
     Broken,
@@ -82,6 +90,7 @@ impl Paths {
                 .join("Claude")
                 .join("claude_desktop_config.json"),
             Client::Cursor => self.home.join(".cursor").join("mcp.json"),
+            Client::ClaudeCode => self.home.join(".claude.json"),
         }
     }
 }
@@ -94,15 +103,24 @@ fn dirs_home() -> PathBuf {
 }
 
 /// The entry for a client. Claude Desktop only starts stdio servers, so it gets
-/// the bridge; Cursor speaks HTTP and gets the URL with the token header.
-pub fn entry(client: Client, url: &str, token: &str, bridge: &Path) -> Value {
+/// the bridge, which finds the token itself; Cursor and Claude Code speak HTTP
+/// and get the URL with the token header.
+pub fn entry(client: Client, url: &str, token: &str, bridge: &Bridge) -> Value {
     match client {
-        Client::Claude => json!({
-            "command": bridge.to_string_lossy(),
-            "args": ["--url", url],
-            "env": { TOKEN_ENV: token },
-        }),
+        Client::Claude => {
+            let mut args = vec![json!("--url"), json!(url)];
+            if let Some(file) = &bridge.token_file {
+                args.push(json!("--token-file"));
+                args.push(json!(file.to_string_lossy()));
+            }
+            json!({ "command": bridge.path.to_string_lossy(), "args": args })
+        }
         Client::Cursor => json!({
+            "url": url,
+            "headers": { "Authorization": format!("Bearer {token}") },
+        }),
+        Client::ClaudeCode => json!({
+            "type": "http",
             "url": url,
             "headers": { "Authorization": format!("Bearer {token}") },
         }),
@@ -165,26 +183,37 @@ pub fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Whether the entry holds `token`, in either client's shape.
-fn holds_token(entry: &Value, token: &str) -> bool {
-    entry
-        .pointer(&format!("/env/{TOKEN_ENV}"))
-        .and_then(Value::as_str)
-        == Some(token)
-        || entry
-            .pointer("/headers/Authorization")
-            .and_then(Value::as_str)
-            == Some(&format!("Bearer {token}"))
+/// Whether the entry is the one EB MCP would write now: for Claude the same
+/// bridge and arguments (and no token of an older version), for the HTTP
+/// clients the current token.
+fn is_current(client: Client, entry: &Value, url: &str, token: &str, bridge: &Bridge) -> bool {
+    match client {
+        Client::Claude => entry == &self::entry(client, url, token, bridge),
+        Client::Cursor | Client::ClaudeCode => {
+            entry
+                .pointer("/headers/Authorization")
+                .and_then(Value::as_str)
+                == Some(&format!("Bearer {token}"))
+        }
+    }
 }
 
-pub fn status(paths: &Paths, client: Client, token: &str) -> ClientStatus {
+pub fn status(
+    paths: &Paths,
+    client: Client,
+    url: &str,
+    token: &str,
+    bridge: &Bridge,
+) -> ClientStatus {
     let path = paths.config(client);
     let (state, error) = match read(&path) {
         Err(e) => (LinkState::Broken, Some(e)),
         Ok(None) => (LinkState::None, None),
         Ok(Some(config)) => match servers(&config).and_then(|s| s.get(ENTRY)) {
             None => (LinkState::None, None),
-            Some(entry) if holds_token(entry, token) => (LinkState::Linked, None),
+            Some(entry) if is_current(client, entry, url, token, bridge) => {
+                (LinkState::Linked, None)
+            }
             Some(_) => (LinkState::Stale, None),
         },
     };
@@ -201,7 +230,7 @@ pub fn preview(
     client: Client,
     url: &str,
     token: &str,
-    bridge: &Path,
+    bridge: &Bridge,
 ) -> Result<Preview, String> {
     let path = paths.config(client);
     let config = read(&path)?;
@@ -231,7 +260,7 @@ pub fn link(
     client: Client,
     url: &str,
     token: &str,
-    bridge: &Path,
+    bridge: &Bridge,
 ) -> Result<(), String> {
     let path = paths.config(client);
     let mut config = read(&path)?.unwrap_or_else(|| json!({}));
@@ -247,7 +276,7 @@ pub fn link(
     };
     servers.insert(ENTRY.into(), entry(client, url, token, bridge));
     write(&path, &config)?;
-    match status(paths, client, token).state {
+    match status(paths, client, url, token, bridge).state {
         LinkState::Linked => Ok(()),
         _ => Err("Het bestand is geschreven, maar EB MCP leest de koppeling niet terug".into()),
     }
@@ -300,8 +329,11 @@ mod tests {
         }
     }
 
-    fn bridge() -> PathBuf {
-        PathBuf::from("/Applications/EB MCP.app/Contents/MacOS/eb-mcp-bridge")
+    fn bridge() -> Bridge {
+        Bridge {
+            path: PathBuf::from("/Applications/EB MCP.app/Contents/MacOS/eb-mcp-bridge"),
+            token_file: None,
+        }
     }
 
     #[test]
@@ -314,7 +346,10 @@ mod tests {
             r#"{"mcpServers": {"agenda": {"url": "http://x"}}, "andere": 1}"#,
         )
         .unwrap();
-        assert_eq!(status(&p, Client::Cursor, TOKEN).state, LinkState::None);
+        assert_eq!(
+            status(&p, Client::Cursor, URL, TOKEN, &bridge()).state,
+            LinkState::None
+        );
         link(&p, Client::Cursor, URL, TOKEN, &bridge()).unwrap();
         let written: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(written["andere"], 1);
@@ -324,21 +359,76 @@ mod tests {
             format!("Bearer {TOKEN}")
         );
         assert!(backup_path(&file).exists());
-        assert_eq!(status(&p, Client::Cursor, TOKEN).state, LinkState::Linked);
         assert_eq!(
-            status(&p, Client::Cursor, "another").state,
+            status(&p, Client::Cursor, URL, TOKEN, &bridge()).state,
+            LinkState::Linked
+        );
+        assert_eq!(
+            status(&p, Client::Cursor, URL, "another", &bridge()).state,
             LinkState::Stale
         );
     }
 
     #[test]
-    fn creates_claudes_file_with_the_bridge() {
+    fn creates_claudes_file_with_the_bridge_and_no_token() {
         let p = paths();
         link(&p, Client::Claude, URL, TOKEN, &bridge()).unwrap();
-        let written: Value =
-            serde_json::from_str(&fs::read_to_string(p.config(Client::Claude)).unwrap()).unwrap();
+        let text = fs::read_to_string(p.config(Client::Claude)).unwrap();
+        let written: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(written["mcpServers"][ENTRY]["args"], json!(["--url", URL]));
-        assert_eq!(written["mcpServers"][ENTRY]["env"][TOKEN_ENV], TOKEN);
+        assert!(
+            !text.contains(TOKEN),
+            "Claude's config must not hold the token"
+        );
+        // A token renewal changes nothing for Claude: the bridge reads the current token itself.
+        assert_eq!(
+            status(&p, Client::Claude, URL, "renewed", &bridge()).state,
+            LinkState::Linked
+        );
+    }
+
+    #[test]
+    fn an_older_claude_entry_with_a_token_is_stale() {
+        let p = paths();
+        let file = p.config(Client::Claude);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let old = json!({"mcpServers": {ENTRY: {"command": bridge().path, "args": ["--url", URL], "env": {"EB_MCP_TOKEN": TOKEN}}}});
+        fs::write(&file, old.to_string()).unwrap();
+        assert_eq!(
+            status(&p, Client::Claude, URL, TOKEN, &bridge()).state,
+            LinkState::Stale
+        );
+    }
+
+    #[test]
+    fn development_builds_point_the_bridge_at_the_token_file() {
+        let dev = Bridge {
+            path: PathBuf::from("/x/eb-mcp-bridge"),
+            token_file: Some(PathBuf::from("/cfg/dev-token.json")),
+        };
+        assert_eq!(
+            entry(Client::Claude, URL, TOKEN, &dev)["args"],
+            json!(["--url", URL, "--token-file", "/cfg/dev-token.json"])
+        );
+    }
+
+    #[test]
+    fn links_claude_code_over_http_in_its_own_file() {
+        let p = paths();
+        let file = p.config(Client::ClaudeCode);
+        fs::write(&file, r#"{"numStartups": 12, "projects": {"/x": {}}}"#).unwrap();
+        link(&p, Client::ClaudeCode, URL, TOKEN, &bridge()).unwrap();
+        let written: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(
+            written["numStartups"], 12,
+            "Claude Code's own settings stay"
+        );
+        assert_eq!(written["mcpServers"][ENTRY]["type"], "http");
+        assert_eq!(
+            written["mcpServers"][ENTRY]["headers"]["Authorization"],
+            format!("Bearer {TOKEN}")
+        );
+        assert!(file.ends_with(".claude.json"));
     }
 
     #[test]
@@ -354,7 +444,10 @@ mod tests {
         let error = link(&p, Client::Cursor, URL, TOKEN, &bridge()).unwrap_err();
         assert!(error.contains("regel 4"), "{error}");
         assert!(fs::read_to_string(&file).unwrap().contains("\"b\": 2"));
-        assert_eq!(status(&p, Client::Cursor, TOKEN).state, LinkState::Broken);
+        assert_eq!(
+            status(&p, Client::Cursor, URL, TOKEN, &bridge()).state,
+            LinkState::Broken
+        );
     }
 
     #[test]
