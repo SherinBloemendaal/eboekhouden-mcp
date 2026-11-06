@@ -35,7 +35,7 @@ onMounted(async () => {
   <div class="shell">
     <nav class="sidebar" aria-label="Hoofdmenu" data-tauri-drag-region>
       <div class="traffic-space" data-tauri-drag-region />
-      <div class="section-label side-label">EB MCP</div>
+      <div class="section-label side-label" data-tauri-drag-region>EB MCP</div>
       <RouterLink v-for="item in nav" :key="item.to" :to="item.to" class="nav" active-class="active">
         <Icon :name="item.icon" class="nav-icon" />
         <span>{{ item.label }}</span>
@@ -55,7 +55,8 @@ onMounted(async () => {
       </div>
     </nav>
     <main class="main">
-      <header class="toolbar" data-tauri-drag-region>
+      <!-- deep: the title drags too; buttons in the toolbar stay clickable. -->
+      <header class="toolbar" data-tauri-drag-region="deep">
         <h1>{{ title }}</h1>
         <span id="toolbar-actions" class="toolbar-actions" />
       </header>
