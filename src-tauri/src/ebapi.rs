@@ -42,6 +42,9 @@ impl ApiCall {
     }
 }
 
+/// Where e-Boekhouden's own app runs; its API calls carry this as Origin.
+const APP_ORIGIN: &str = "https://secure20.e-boekhouden.nl";
+
 pub struct EbClient {
     base: Url,
     http: reqwest::Client,
@@ -177,16 +180,19 @@ impl EbClient {
             error: None,
         };
         let url = self.base.join("auth/login").expect("login URL");
-        let body = serde_json::json!({
-            "username": username,
-            "password": password,
-            "twoFactorCode": code.unwrap_or_default(),
-        });
+        // As their app sends it: `twoFactorCode` only when there is a code (theirs is `undefined`, so left out).
+        let mut body = serde_json::json!({ "username": username, "password": password });
+        if let Some(code) = code {
+            body["twoFactorCode"] = Value::String(code.to_owned());
+        }
         let started = Instant::now();
         let result = self
             .http
             .post(url)
             .header(reqwest::header::ACCEPT, "application/json")
+            // What the browser adds for their app on secure20.
+            .header(reqwest::header::ORIGIN, APP_ORIGIN)
+            .header(reqwest::header::REFERER, format!("{APP_ORIGIN}/login"))
             .json(&body)
             .send()
             .await;
@@ -365,8 +371,20 @@ pub fn login_outcome(
     if status == 429 {
         return Login::Refused("e-Boekhouden vraagt om even te wachten met inloggen".into());
     }
+    let detail = json
+        .and_then(|j| {
+            ["message", "error", "detail", "title"]
+                .iter()
+                .find_map(|k| j.get(*k).and_then(Value::as_str))
+        })
+        .map(str::to_owned)
+        .or_else(|| {
+            (!text.trim().is_empty() && !text.contains('<')).then(|| text.trim().to_owned())
+        })
+        .map(|d| format!(": {}", d.chars().take(200).collect::<String>()))
+        .unwrap_or_default();
     Login::Error(format!(
-        "e-Boekhouden gaf een fout bij het inloggen ({status})"
+        "e-Boekhouden gaf een fout bij het inloggen ({status}){detail}"
     ))
 }
 
@@ -503,6 +521,14 @@ mod tests {
                 "/v1/api/auth/login",
                 axum::routing::post(|body: String| async move {
                     let body: Value = serde_json::from_str(&body).unwrap_or_default();
+                    // e-Boekhouden answers 500 on an empty code; their app leaves the field out.
+                    if body.get("twoFactorCode").and_then(Value::as_str) == Some("") {
+                        return (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            [("set-cookie", "SRVRID=9s13; path=/; Secure")],
+                            "Object reference not set".to_owned(),
+                        );
+                    }
                     match (body["username"].as_str(), body["password"].as_str(), body["twoFactorCode"].as_str()) {
                         (Some("jan@studionoord.example"), Some("geheim"), Some("123456")) => (
                             axum::http::StatusCode::OK,
@@ -725,5 +751,15 @@ mod tests {
             login_outcome(502, None, "", vec![]),
             Login::Error(_)
         ));
+        assert_eq!(
+            login_outcome(500, None, "Object reference not set", vec![]),
+            Login::Error(
+                "e-Boekhouden gaf een fout bij het inloggen (500): Object reference not set".into()
+            )
+        );
+        assert_eq!(
+            login_outcome(500, None, "<html>stack</html>", vec![]),
+            Login::Error("e-Boekhouden gaf een fout bij het inloggen (500)".into())
+        );
     }
 }
