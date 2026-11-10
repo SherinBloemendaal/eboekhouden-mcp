@@ -20,6 +20,13 @@ use crate::state::{AppState, CookieJar, now_ms};
 pub const LOGIN_URL: &str = "https://secure.e-boekhouden.nl/bh/";
 const LOGOUT_URL: &str = "https://secure.e-boekhouden.nl/bh/uitloggen.asp";
 const API_ORIGIN: &str = "https://secure20.e-boekhouden.nl/";
+const ASP_ORIGIN: &str = "https://secure.e-boekhouden.nl/";
+/// e-Boekhouden's own way into its app after a login (its "hybrid route", as the EB Sessions extension uses it).
+/// Plain /bh/ keeps the old frameset; only the app on secure20 sets the `auth-token` cookie the API needs.
+const APP_ENTRY: &str =
+    "https://secure.e-boekhouden.nl/bh?v2Url=https%3A%2F%2Fsecure20.e-boekhouden.nl%2F";
+/// After the login answer, how long e-Boekhouden gets to finish its own token steps before EB MCP opens the app.
+const APP_SETTLE: Duration = Duration::from_millis(1500);
 const DRIVER: &str = include_str!("../js/signin-driver.js");
 const DIALOG_HOOK: &str = include_str!("../js/dialog-hook.js");
 const POLL: Duration = Duration::from_millis(400);
@@ -371,6 +378,8 @@ async fn run(
     let mut last_seen = String::new();
     let mut last_phase = String::new();
     let mut had_token = false;
+    let mut app_opened = false;
+    let mut last_cookies = String::new();
     let outcome = loop {
         if cancel.load(Ordering::SeqCst) {
             break (Step::Cancelled, None);
@@ -410,6 +419,29 @@ async fn run(
         let has_token = cookies_of(&window)
             .iter()
             .any(|(k, v)| k == "auth-token" && !v.is_empty());
+        let names = cookie_names(&window);
+        if names != last_cookies {
+            signins.trace(account_id, format!("Cookies (alleen namen): {names}"));
+            last_cookies = names;
+        }
+        // Signed in, but still on the old frameset: open e-Boekhouden's app, which sets the session token.
+        if filled
+            && !has_token
+            && !app_opened
+            && probe.phase == "app"
+            && since.elapsed() > APP_SETTLE
+        {
+            signins.trace(
+                account_id,
+                "Ingelogd; de app van e-Boekhouden openen voor het sessietoken",
+            );
+            if let Err(e) = window.navigate(APP_ENTRY.parse().expect("app entry URL")) {
+                signins.trace(account_id, format!("De app openen lukte niet: {e}"));
+            }
+            app_opened = true;
+            since = Instant::now();
+            continue;
+        }
         if has_token != had_token {
             signins.trace(
                 account_id,
@@ -575,6 +607,28 @@ async fn run_js(window: &WebviewWindow, js: String) -> Option<String> {
         .await
         .ok()?
         .ok()
+}
+
+/// For the diagnosis: the names of e-Boekhouden's cookies per host, never their values.
+fn cookie_names(window: &WebviewWindow) -> String {
+    let names = |origin: &str| {
+        let mut list: Vec<String> = window
+            .cookies_for_url(origin.parse().expect("origin"))
+            .map(|l| l.into_iter().map(|c| c.name().to_owned()).collect())
+            .unwrap_or_default();
+        list.sort();
+        list.dedup();
+        if list.is_empty() {
+            "geen".to_owned()
+        } else {
+            list.join(", ")
+        }
+    };
+    format!(
+        "secure20: {}; secure: {}",
+        names(API_ORIGIN),
+        names(ASP_ORIGIN)
+    )
 }
 
 fn cookies_of(window: &WebviewWindow) -> Vec<(String, String)> {
