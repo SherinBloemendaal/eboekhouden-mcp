@@ -1,21 +1,22 @@
 <script setup lang="ts">
 // The steps of a sign-in out of sight, and the code field when e-Boekhouden asks for one.
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { sendCode, signinShow, signinTraces, type AccountView, type SigninEvent, type Trace } from '../lib/accounts'
+import { sendCode, signinTraces, type AccountView, type SigninEvent, type Trace } from '../lib/accounts'
 import TraceView from './TraceView.vue'
 import { openEboekhouden } from '../lib/server'
 import Icon from './Icon.vue'
 
 const props = defineProps<{ account: AccountView; event: SigninEvent | undefined; compact?: boolean }>()
 
-const ORDER = ['credentials', 'page', 'code', 'administration'] as const
+const ORDER = ['credentials', 'submit', 'code', 'administration'] as const
 const code = ref('')
 const codeError = ref<string | null>(null)
 const sending = ref(false)
 const lastIndex = ref(0)
 
 function indexOf(step: string): number {
-  if (step === 'submit') return 1
+  // Sending the two-step code is still the code step.
+  if (step === 'submit') return lastIndex.value >= 2 ? 2 : 1
   const i = ORDER.indexOf(step as (typeof ORDER)[number])
   return i < 0 ? lastIndex.value : i
 }
@@ -64,13 +65,11 @@ async function submitCode() {
   }
 }
 
-// Debugging a sign-in: Details shows the trace (refreshed while it runs), Toon e-Boekhouden the hidden window.
+// Debugging a sign-in: Details shows the trace, refreshed while it runs.
 const running = computed(() => !!props.event && !['done', 'failed', 'unknown', 'cancelled'].includes(props.event.step))
 const ended = computed(() => !!props.event && ['done', 'failed', 'unknown'].includes(props.event.step))
 const showDetails = ref(false)
 const trace = ref<Trace | null>(null)
-const slow = ref(false)
-let slowTimer: ReturnType<typeof setTimeout> | undefined
 let poll: ReturnType<typeof setInterval> | undefined
 
 async function loadTrace() {
@@ -84,24 +83,10 @@ watch(showDetails, (open) => {
 })
 watch(() => props.event?.step, () => {
   if (showDetails.value) void loadTrace()
-  clearTimeout(slowTimer)
-  slow.value = false
-  // Toon e-Boekhouden comes up when a step takes long, which is when you want to look.
-  if (running.value && props.event?.step !== 'code') slowTimer = setTimeout(() => (slow.value = true), 8000)
 })
 onBeforeUnmount(() => {
   clearInterval(poll)
-  clearTimeout(slowTimer)
 })
-const showError = ref<string | null>(null)
-async function show() {
-  showError.value = null
-  try {
-    await signinShow(props.account.id)
-  } catch (e) {
-    showError.value = String(e)
-  }
-}
 
 function onInput() {
   code.value = code.value.replace(/\D/g, '').slice(0, 8)
@@ -136,7 +121,7 @@ function onInput() {
               <button type="submit" class="btn primary" :disabled="sending || code.length < 6" :aria-busy="sending"><span class="btn-label">Inloggen</span></button>
             </span>
             <span class="hint">EB MCP geeft de code door aan e-Boekhouden en bewaart hem niet.</span>
-            <span v-if="codeError" class="error" role="alert">{{ codeError }}</span>
+            <span v-if="codeError || event?.message" class="error" role="alert">{{ codeError ?? event?.message }}</span>
           </form>
         </div>
       </div>
@@ -153,13 +138,7 @@ function onInput() {
       <button type="button" class="btn small ghost" :aria-expanded="showDetails" @click="showDetails = !showDetails">
         <Icon name="list" :size="14" />{{ showDetails ? 'Verberg details' : 'Details' }}
       </button>
-      <Transition name="fade-in">
-        <button v-if="running && slow" type="button" class="btn small ghost" @click="show"><Icon name="external" :size="14" />Toon e-Boekhouden</button>
-      </Transition>
     </div>
-    <Transition name="accordion">
-      <div v-if="showError" class="accordion"><div><p class="note bad" role="alert">{{ showError }}</p></div></div>
-    </Transition>
     <Transition name="accordion">
       <div v-if="showDetails" class="accordion">
         <div class="details"><TraceView v-if="trace" :trace="trace" /><p v-else class="hint">Nog niets vastgelegd.</p></div>
@@ -217,9 +196,6 @@ li:not(.wait) .mark::before { opacity: 0; }
 .open-eb { margin-top: 8px; }
 .debug { display: flex; gap: 4px; margin-top: 8px; margin-left: -10px; }
 .details { padding-top: 6px; }
-.fade-in-enter-active { transition: opacity 200ms var(--ease); }
-.fade-in-leave-active { transition: opacity 120ms ease; }
-.fade-in-enter-from, .fade-in-leave-to { opacity: 0; }
 .note.ok { background: var(--success-soft); color: var(--success); }
 @media (prefers-reduced-motion: reduce) {
   .spin { animation-duration: 2400ms; }

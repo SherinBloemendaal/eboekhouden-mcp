@@ -1,6 +1,6 @@
-//! What the app knows while it runs. Sessions live only here, in memory: one
-//! hidden webview per signed-in account holds e-Boekhouden's own session and
-//! keeps renewing it the way their app does.
+//! What the app knows while it runs. Sessions live only here, in memory: per
+//! signed-in account the cookies e-Boekhouden's `auth/login` gave, the
+//! `auth-token` among them (signin.rs, SessionJar).
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -17,11 +17,12 @@ use crate::accounts::AccountStore;
 use crate::ebapi::{ApiCall, EbClient, auth_token};
 use crate::reqlog::RequestLog;
 
-/// Reads the cookies of a session's webview and signs it out. The app uses the
-/// webviews; tests use a fake.
+/// Holds the cookies of each session, by key, and forgets them at sign-out. The app keeps them in memory
+/// (signin.rs, SessionJar); tests use a fake.
 pub trait CookieJar: Send + Sync {
-    fn cookies(&self, webview: &str) -> Result<Vec<(String, String)>, String>;
-    fn sign_out(&self, webview: &str);
+    fn cookies(&self, key: &str) -> Result<Vec<(String, String)>, String>;
+    fn put(&self, key: &str, cookies: Vec<(String, String)>);
+    fn sign_out(&self, key: &str);
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +131,11 @@ impl AppState {
             .values()
             .filter(|s| !s.expired)
             .count()
+    }
+
+    /// Keeps a new session's cookies under `key`, before `add_session` names it.
+    pub fn jar_put(&self, key: &str, cookies: Vec<(String, String)>) {
+        self.jar.put(key, cookies);
     }
 
     /// Called by the sign-in once e-Boekhouden accepted the account.
@@ -333,6 +339,10 @@ pub mod testing {
                 .get(webview)
                 .cloned()
                 .unwrap_or_default())
+        }
+
+        fn put(&self, key: &str, cookies: Vec<(String, String)>) {
+            self.cookies.lock().unwrap().insert(key.to_owned(), cookies);
         }
 
         fn sign_out(&self, webview: &str) {

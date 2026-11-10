@@ -124,7 +124,7 @@ function sessionText(account: AccountView): { tone: string; text: string } {
       </section>
       <section class="group card">
         <h2>Sessies</h2>
-        <p>Een account wordt uitgelogd na {{ idleMinutes === 60 ? '1 uur' : idleMinutes === 240 ? '4 uur' : `${idleMinutes} minuten` }} zonder aanroep van een AI-client. Afsluiten logt altijd alle sessies uit bij e-Boekhouden.</p>
+        <p>Een account wordt uitgelogd na {{ idleMinutes === 60 ? '1 uur' : idleMinutes === 240 ? '4 uur' : `${idleMinutes} minuten` }} zonder aanroep van een AI-client. Afsluiten vergeet altijd alle sessies; EB MCP bewaart ze nergens.</p>
         <RouterLink class="btn small" to="/instellingen">Wijzigen in Instellingen</RouterLink>
       </section>
     </div>
@@ -154,7 +154,7 @@ function sessionText(account: AccountView): { tone: string; text: string } {
   <Transition name="modal">
     <Alert v-if="removing" :title="`${removing.label} verwijderen?`" tone="danger" @close="removing = null">
       <p>
-        EB MCP logt dit account uit bij e-Boekhouden{{ removing.store === 'system' ? ' en haalt het wachtwoord uit je sleutelhanger' : '' }}.
+        EB MCP vergeet de sessie van dit account{{ removing.store === 'system' ? ' en haalt het wachtwoord uit je sleutelhanger' : '' }}.
         {{ removing.store === 'onePassword' ? 'Je 1Password-item blijft staan.' : '' }} Je account bij e-Boekhouden zelf blijft bestaan.
       </p>
       <p v-if="removeError" class="error" role="alert">{{ removeError }}</p>

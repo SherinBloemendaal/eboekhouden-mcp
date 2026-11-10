@@ -81,7 +81,7 @@ const appearances: { value: Appearance; label: string }[] = [
           <option :value="240">4 uur</option>
         </select>
       </div>
-      <p class="hint">Afsluiten logt altijd alle sessies uit bij e-Boekhouden. Na een update log je zelf opnieuw in.</p>
+      <p class="hint">Afsluiten vergeet altijd alle sessies; EB MCP bewaart ze nergens. Na een update log je zelf opnieuw in.</p>
       <p v-if="error" class="error" role="alert">{{ error }}</p>
     </section>
     <h2 class="section">Diagnose</h2>

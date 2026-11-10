@@ -1,52 +1,39 @@
-//! Signing in out of sight (SPEC.md, Sign-in): a hidden, in-memory webview
-//! opens e-Boekhouden's own login page; js/signin-driver.js fills it and
-//! clicks their button; the user only sees the steps, and types a two-step
-//! code into EB MCP's own field when e-Boekhouden asks for one.
+//! Signing in (SPEC.md, Sign-in), the way e-Boekhouden's own app does it: the username and password from
+//! 1Password or the Keychain go to `auth/login` on e-Boekhouden's API, which answers with the session token.
+//! When the account uses two-step verification, the user types the code into EB MCP's own field and the
+//! login is sent once more with it. The token and the cookies of the answer live only in memory (SessionJar).
+//!
+//! Until 0.1.8 EB MCP filled e-Boekhouden's classic login page in a hidden webview. That signs in to the
+//! old ASP pages only: their API never accepted that session (Sherin's traces of 2026-11-10).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::AppHandle;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::creds;
+use crate::ebapi::Login;
 use crate::state::{AppState, CookieJar, now_ms};
 
+/// e-Boekhouden's login page, for "Open e-Boekhouden in je browser".
 pub const LOGIN_URL: &str = "https://secure.e-boekhouden.nl/bh/";
-const LOGOUT_URL: &str = "https://secure.e-boekhouden.nl/bh/uitloggen.asp";
-const API_ORIGIN: &str = "https://secure20.e-boekhouden.nl/";
-const ASP_ORIGIN: &str = "https://secure.e-boekhouden.nl/";
-/// e-Boekhouden's own way into its app after a login (its "hybrid route", as the EB Sessions extension uses it).
-/// Plain /bh/ keeps the old frameset; only the app on secure20 sets the `auth-token` cookie the API needs.
-const APP_ENTRY: &str =
-    "https://secure.e-boekhouden.nl/bh?v2Url=https%3A%2F%2Fsecure20.e-boekhouden.nl%2F";
-/// After the login answer, how long e-Boekhouden gets to finish its own token steps before EB MCP opens the app.
-const APP_SETTLE: Duration = Duration::from_millis(1500);
-/// After the login answer: how often EB MCP asks e-Boekhouden's API whether the session is signed in.
-const AUTH_EVERY: Duration = Duration::from_millis(1500);
-/// Checks that say "not yet" before EB MCP opens e-Boekhouden's app, which completes the session on secure20.
-const AUTH_TRIES_BEFORE_APP: u32 = 2;
-const DRIVER: &str = include_str!("../js/signin-driver.js");
-const DIALOG_HOOK: &str = include_str!("../js/dialog-hook.js");
-const POLL: Duration = Duration::from_millis(400);
-const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
-const SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+const POLL: Duration = Duration::from_millis(200);
 const CODE_TIMEOUT: Duration = Duration::from_secs(300);
-/// The whole sign-in, not counting the time the user takes to type a two-step code.
-const TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// How many finished sign-ins Instellingen › Diagnose keeps.
 const TRACES_KEPT: usize = 10;
+/// Wrong codes in a row before EB MCP stops asking.
+const CODE_TRIES: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Step {
     Credentials,
-    Page,
     Submit,
     Code,
     Administration,
@@ -62,15 +49,6 @@ pub struct SigninEvent {
     pub account_id: Uuid,
     pub step: Step,
     pub message: Option<String>,
-}
-
-#[derive(Debug, Deserialize, PartialEq)]
-pub struct Probe {
-    pub phase: String,
-    pub message: Option<String>,
-    /// For the diagnosis only: which frames the driver saw and what it found in them. Never a value typed in.
-    #[serde(default)]
-    pub detail: Option<String>,
 }
 
 /// One line of a sign-in's diagnosis: what EB MCP saw and did, with the time since the start.
@@ -90,47 +68,6 @@ pub struct Trace {
     pub started_at: u64,
     pub outcome: Option<String>,
     pub lines: Vec<TraceLine>,
-}
-
-#[derive(Debug, PartialEq)]
-pub enum Action {
-    Wait,
-    Fill,
-    AskCode,
-    Success,
-    Fail(String),
-    Unknown(String),
-}
-
-/// What to do next, from what the page shows. Pure, so it can be tested.
-pub fn decide(probe: &Probe, has_token: bool, filled: bool, waited: Duration) -> Action {
-    if filled && has_token {
-        return Action::Success;
-    }
-    match probe.phase.as_str() {
-        "form" if !filled => Action::Fill,
-        "form" | "app" if waited > SUBMIT_TIMEOUT => {
-            Action::Unknown("e-Boekhouden reageerde niet zoals verwacht op het inloggen".into())
-        }
-        "form" | "app" => Action::Wait,
-        "error" => Action::Fail(
-            probe
-                .message
-                .clone()
-                .unwrap_or_else(|| "e-Boekhouden weigerde het inloggen".into()),
-        ),
-        "code" => Action::AskCode,
-        "unknown" => Action::Unknown(
-            probe
-                .message
-                .clone()
-                .unwrap_or_else(|| "e-Boekhouden vroeg om een stap die EB MCP niet kent".into()),
-        ),
-        _ if waited > LOAD_TIMEOUT => {
-            Action::Unknown("De inlogpagina van e-Boekhouden laadde niet".into())
-        }
-        _ => Action::Wait,
-    }
 }
 
 /// The administration's name from `administratie/uwgegevens`, whatever its exact shape.
@@ -157,12 +94,9 @@ pub fn administration_name(json: &Value) -> Option<String> {
     let object = json.as_object()?;
     pick(object).or_else(|| object.values().filter_map(Value::as_object).find_map(pick))
 }
-
 struct Pending {
     cancel: Arc<AtomicBool>,
     code: Option<oneshot::Sender<String>>,
-    /// The hidden webview, once it exists, so Toon e-Boekhouden can show it.
-    window: Option<String>,
 }
 
 /// Sign-ins that are running, by account, and the diagnosis of the last few.
@@ -232,15 +166,6 @@ impl Signins {
             .collect()
     }
 
-    /// The hidden webview of a running sign-in, for Toon e-Boekhouden.
-    pub fn window_of(&self, id: Uuid) -> Option<String> {
-        self.pending
-            .lock()
-            .unwrap()
-            .get(&id)
-            .and_then(|p| p.window.clone())
-    }
-
     pub fn is_running(&self, id: Uuid) -> bool {
         self.pending.lock().unwrap().contains_key(&id)
     }
@@ -299,7 +224,6 @@ pub async fn sign_in(
             Pending {
                 cancel: cancel.clone(),
                 code: None,
-                window: None,
             },
         );
     }
@@ -368,189 +292,66 @@ async fn run(
         return (Step::Cancelled, None);
     }
 
-    emit(app, account_id, Step::Page, None);
-    signins.trace(account_id, "Inlogpagina openen in een verborgen venster");
-    let label = format!("eb-{}-{}", account_id.simple(), now_ms());
-    let url = WebviewUrl::External(LOGIN_URL.parse().expect("login URL"));
-    let window = match WebviewWindowBuilder::new(app, &label, url)
-        .title("e-Boekhouden")
-        .visible(false)
-        .incognito(true)
-        .skip_taskbar(true)
-        .inner_size(1100.0, 800.0)
-        .initialization_script_for_all_frames(DIALOG_HOOK)
-        .build()
-    {
-        Ok(w) => w,
-        Err(e) => {
-            return (
-                Step::Failed,
-                Some(format!("EB MCP kon geen sessie openen: {e}")),
-            );
-        }
-    };
-    if let Some(p) = signins.pending.lock().unwrap().get_mut(&account_id) {
-        p.window = Some(label.clone());
-    }
-
-    let mut filled = false;
-    let mut since = Instant::now();
-    let started = Instant::now();
-    let mut code_time = Duration::ZERO;
-    let mut fill_failing: Option<Instant> = None;
-    let mut last_seen = String::new();
-    let mut last_phase = String::new();
-    let mut had_token = false;
-    let mut app_opened = false;
-    let mut last_cookies = String::new();
-    let mut logged_in_page = false;
-    let mut last_auth: Option<Instant> = None;
-    let mut auth_tries = 0u32;
-    let mut session_valid = false;
-    let mut last_auth_status = 0u16;
-    let outcome = loop {
-        if cancel.load(Ordering::SeqCst) {
-            break (Step::Cancelled, None);
-        }
-        if started.elapsed().saturating_sub(code_time) > TOTAL_TIMEOUT {
-            break (
-                Step::Unknown,
-                Some("Inloggen bij e-Boekhouden duurde langer dan 2 minuten. Kijk bij Details of met Toon e-Boekhouden waar het bleef hangen.".into()),
-            );
-        }
-        tokio::time::sleep(POLL).await;
-        let probe = probe(&window).await;
-        let seen = format!(
-            "{} {}",
-            probe.phase,
-            probe.detail.as_deref().unwrap_or_default()
+    emit(app, account_id, Step::Submit, None);
+    let mut code: Option<String> = None;
+    let mut code_tries = 0u32;
+    let cookies = loop {
+        signins.trace(
+            account_id,
+            if code.is_some() {
+                "Inloggen bij e-Boekhouden met de tweestapscode"
+            } else {
+                "Inloggen bij e-Boekhouden (auth/login)"
+            },
         );
-        if seen != last_seen {
-            signins.trace(
-                account_id,
-                format!(
-                    "Pagina: {}{}",
-                    probe.phase,
-                    probe
-                        .detail
-                        .as_deref()
-                        .map(|d| format!(" ({d})"))
-                        .unwrap_or_default()
-                ),
-            );
-            last_seen = seen;
+        let (call, outcome) = state
+            .client
+            .login(
+                &credentials.username,
+                &credentials.password,
+                code.as_deref(),
+            )
+            .await;
+        state.log_signin_call(&call, account_id, &account.label);
+        signins.trace(
+            account_id,
+            format!("Antwoord: status {}, {}", call.status, describe(&outcome)),
+        );
+        if cancel.load(Ordering::SeqCst) {
+            return (Step::Cancelled, None);
         }
-        if probe.phase != last_phase {
-            last_phase = probe.phase.clone();
-            since = Instant::now();
-        }
-        let has_token = cookies_of(&window)
-            .iter()
-            .any(|(k, v)| k == "auth-token" && !v.is_empty());
-        let names = cookie_names(&window);
-        if names != last_cookies {
-            signins.trace(account_id, format!("Cookies (alleen namen): {names}"));
-            last_cookies = names;
-        }
-        if filled && probe.phase == "app" {
-            logged_in_page = true;
-        }
-        // After the login answer, ask e-Boekhouden's API itself whether these cookies make a signed-in session:
-        // that is what the MCP calls need, whatever cookie carries it.
-        if logged_in_page
-            && !session_valid
-            && since.elapsed() > APP_SETTLE
-            && last_auth.is_none_or(|t| t.elapsed() >= AUTH_EVERY)
-        {
-            last_auth = Some(Instant::now());
-            auth_tries += 1;
-            let call = state.client.auth(&cookies_of(&window)).await;
-            state.log_signin_call(&call, account_id, &account.label);
-            session_valid = crate::ebapi::valid_session(&call);
-            last_auth_status = call.status;
-            signins.trace(
-                account_id,
-                format!(
-                    "API-controle {auth_tries}: status {}, {}",
-                    call.status,
-                    if session_valid {
-                        "ingelogd"
-                    } else {
-                        "nog niet ingelogd"
-                    }
-                ),
-            );
-            if session_valid {
-                break (Step::Done, None);
-            }
-            // Signed in on the old frameset only: open e-Boekhouden's app, which completes the session on secure20.
-            if !app_opened && auth_tries >= AUTH_TRIES_BEFORE_APP {
-                signins.trace(
-                    account_id,
-                    "De app van e-Boekhouden openen om de sessie af te maken",
+        match outcome {
+            Login::Session(cookies) => break cookies,
+            Login::Refused(message) if code.is_none() => return (Step::Failed, Some(message)),
+            Login::Refused(_) | Login::NeedsCode if code.is_some() && code_tries >= CODE_TRIES => {
+                return (
+                    Step::Failed,
+                    Some("De tweestapscode werd drie keer niet geaccepteerd".into()),
                 );
-                if let Err(e) = window.navigate(APP_ENTRY.parse().expect("app entry URL")) {
-                    signins.trace(account_id, format!("De app openen lukte niet: {e}"));
-                }
-                app_opened = true;
-                since = Instant::now();
-                continue;
             }
-        }
-        if has_token != had_token {
-            signins.trace(
-                account_id,
-                if has_token {
-                    "Sessiecookie van e-Boekhouden ontvangen"
-                } else {
-                    "Sessiecookie weer weg"
-                },
-            );
-            had_token = has_token;
-        }
-        match decide(&probe, has_token, filled, since.elapsed()) {
-            Action::Wait => {}
-            Action::Fill => {
-                let js = format!(
-                    "{DRIVER}\n;window.__ebmcpSignin.fill({}, {})",
-                    serde_json::to_string(&credentials.username).unwrap_or_default(),
-                    serde_json::to_string(&credentials.password).unwrap_or_default()
-                );
-                let result = run_js(&window, js).await;
-                if result.as_deref() == Some("\"ok\"") {
-                    signins.trace(account_id, "Gegevens ingevuld en verstuurd");
-                    filled = true;
-                    fill_failing = None;
-                    since = Instant::now();
-                    emit(app, account_id, Step::Submit, None);
-                } else {
-                    let result = result.unwrap_or_else(|| "geen antwoord".into());
-                    let first = *fill_failing.get_or_insert_with(|| {
-                        signins.trace(account_id, format!("Invullen lukt niet: {result}"));
-                        Instant::now()
-                    });
-                    // The form is there but cannot be filled (no password field, say): stop instead of trying forever.
-                    if first.elapsed() > LOAD_TIMEOUT {
-                        break (Step::Unknown, Some(fill_failed_message(&result)));
-                    }
+            Login::Refused(_) | Login::NeedsCode => {
+                if code.is_some() {
+                    signins.trace(account_id, "De code werd niet geaccepteerd; opnieuw vragen");
                 }
-            }
-            Action::AskCode => {
                 let (tx, rx) = oneshot::channel();
                 if let Some(p) = signins.pending.lock().unwrap().get_mut(&account_id) {
                     p.code = Some(tx);
                 }
-                emit(app, account_id, Step::Code, None);
-                signins.trace(account_id, "e-Boekhouden vraagt om een tweestapscode");
-                let asked = Instant::now();
-                let code = tokio::select! {
-                    code = rx => code.ok(),
+                emit(
+                    app,
+                    account_id,
+                    Step::Code,
+                    code.is_some().then(|| {
+                        "Die code werd niet geaccepteerd. Probeer de volgende.".to_owned()
+                    }),
+                );
+                let given = tokio::select! {
+                    given = rx => given.ok(),
                     _ = tokio::time::sleep(CODE_TIMEOUT) => None,
                     _ = wait_cancel(cancel) => None,
                 };
-                code_time += asked.elapsed();
-                let Some(code) = code else {
-                    break if cancel.load(Ordering::SeqCst) {
+                let Some(given) = given else {
+                    return if cancel.load(Ordering::SeqCst) {
                         (Step::Cancelled, None)
                     } else {
                         (
@@ -559,39 +360,42 @@ async fn run(
                         )
                     };
                 };
-                let js = format!(
-                    "{DRIVER}\n;window.__ebmcpSignin.code({})",
-                    serde_json::to_string(&code).unwrap_or_default()
-                );
-                run_js(&window, js).await;
-                since = Instant::now();
+                code = Some(given);
+                code_tries += 1;
                 emit(app, account_id, Step::Submit, None);
             }
-            Action::Success => break (Step::Done, None),
-            Action::Fail(message) => break (Step::Failed, Some(message)),
-            // Signed in on the page, but the API check itself kept failing: say that, not that the page did not load.
-            Action::Unknown(_)
-                if auth_tries > 0 && !matches!(last_auth_status, 200..=299 | 401 | 403) =>
-            {
-                break (
-                    Step::Unknown,
-                    Some(format!(
-                        "Ingelogd op de pagina, maar EB MCP kon de sessie niet controleren: e-Boekhouden gaf status {last_auth_status}"
-                    )),
-                );
-            }
-            Action::Unknown(message) => break (Step::Unknown, Some(message)),
+            Login::Error(message) => return (Step::Unknown, Some(message)),
         }
     };
     drop(credentials);
 
-    if outcome.0 != Step::Done {
-        let _ = window.destroy();
-        return outcome;
+    // The check e-Boekhouden's own app makes at startup: does the API accept this session?
+    let check = state.client.auth(&cookies).await;
+    state.log_signin_call(&check, account_id, &account.label);
+    let valid = crate::ebapi::valid_session(&check);
+    signins.trace(
+        account_id,
+        format!(
+            "API-controle: status {}, {}",
+            check.status,
+            if valid { "ingelogd" } else { "niet ingelogd" }
+        ),
+    );
+    if !valid {
+        return (
+            Step::Unknown,
+            Some(format!(
+                "e-Boekhouden gaf een sessie, maar de API accepteert hem niet (status {})",
+                check.status
+            )),
+        );
     }
-    // Toon e-Boekhouden may have shown the window; the session itself stays out of sight.
-    let _ = window.hide();
-    state.add_session(account_id, &account.label, &label);
+
+    let key = format!("api-{}-{}", account_id.simple(), now_ms());
+    state.jar_put(&key, cookies);
+    state.add_session(account_id, &account.label, &key);
+    signins.trace(account_id, "Ingelogd; sessie staat alleen in het geheugen");
+
     emit(app, account_id, Step::Administration, None);
     let query = [("adm".to_owned(), "true".to_owned())];
     let call = state
@@ -603,6 +407,9 @@ async fn run(
             "EB MCP",
         )
         .await;
+    if let Some(error) = &call.error {
+        signins.trace(account_id, format!("Administratie ophalen: {error}"));
+    }
     if let Some(name) = call.json.as_ref().and_then(administration_name) {
         state.set_administration(account_id, &name);
     }
@@ -615,27 +422,18 @@ async fn run(
     )
 }
 
-/// What to tell the user when e-Boekhouden's form is there but cannot be filled.
-fn fill_failed_message(result: &str) -> String {
-    if result.contains("nopassword") {
-        "EB MCP vindt het wachtwoordveld niet op de inlogpagina van e-Boekhouden. Kijk met Toon e-Boekhouden wat de pagina laat zien.".into()
-    } else {
-        "EB MCP kan het inlogformulier van e-Boekhouden niet invullen. Kijk met Toon e-Boekhouden wat de pagina laat zien.".into()
+/// For the diagnosis: what `auth/login` answered, without any token.
+fn describe(outcome: &Login) -> String {
+    match outcome {
+        Login::Session(cookies) => {
+            let mut names: Vec<&str> = cookies.iter().map(|(k, _)| k.as_str()).collect();
+            names.sort_unstable();
+            format!("ingelogd (cookies: {})", names.join(", "))
+        }
+        Login::NeedsCode => "vraagt om een tweestapscode".into(),
+        Login::Refused(m) => format!("geweigerd: {m}"),
+        Login::Error(m) => format!("fout: {m}"),
     }
-}
-
-/// Toon e-Boekhouden: brings the hidden sign-in window into view, to see what e-Boekhouden shows.
-pub fn show_window(app: &AppHandle, signins: &Signins, id: Uuid) -> Result<(), String> {
-    let label = signins
-        .window_of(id)
-        .ok_or("Er loopt nu geen aanmelding voor dit account")?;
-    let window = app
-        .get_webview_window(&label)
-        .ok_or("Het inlogvenster is al gesloten")?;
-    signins.trace(id, "Inlogvenster getoond (Toon e-Boekhouden)");
-    let _ = window.center();
-    window.show().map_err(|e| e.to_string())?;
-    window.set_focus().map_err(|e| e.to_string())
 }
 
 async fn wait_cancel(cancel: &AtomicBool) {
@@ -644,92 +442,32 @@ async fn wait_cancel(cancel: &AtomicBool) {
     }
 }
 
-async fn probe(window: &WebviewWindow) -> Probe {
-    let js = format!(
-        "{DRIVER}\n;(() => {{ try {{ return window.__ebmcpSignin.probe(); }} catch (e) {{ return {{ phase: 'loading', message: null }}; }} }})()"
-    );
-    run_js(window, js)
-        .await
-        .and_then(|text| serde_json::from_str::<Probe>(&text).ok())
-        .unwrap_or(Probe {
-            phase: "loading".into(),
-            message: None,
-            detail: Some("geen antwoord van de pagina".into()),
-        })
+/// The sessions' cookies, in memory only: what `auth/login` gave, `auth-token` among them.
+#[derive(Default)]
+pub struct SessionJar {
+    sessions: Mutex<HashMap<String, Vec<(String, String)>>>,
 }
 
-/// Evaluates `js` in the page and returns its result as JSON text.
-async fn run_js(window: &WebviewWindow, js: String) -> Option<String> {
-    let (tx, rx) = oneshot::channel();
-    let tx = Mutex::new(Some(tx));
-    window
-        .eval_with_callback(js, move |result| {
-            if let Some(tx) = tx.lock().unwrap().take() {
-                let _ = tx.send(result);
-            }
-        })
-        .ok()?;
-    tokio::time::timeout(Duration::from_secs(5), rx)
-        .await
-        .ok()?
-        .ok()
-}
-
-/// For the diagnosis: the names of e-Boekhouden's cookies per host, never their values.
-fn cookie_names(window: &WebviewWindow) -> String {
-    let names = |origin: &str| {
-        let mut list: Vec<String> = window
-            .cookies_for_url(origin.parse().expect("origin"))
-            .map(|l| l.into_iter().map(|c| c.name().to_owned()).collect())
-            .unwrap_or_default();
-        list.sort();
-        list.dedup();
-        if list.is_empty() {
-            "geen".to_owned()
-        } else {
-            list.join(", ")
-        }
-    };
-    format!(
-        "secure20: {}; secure: {}",
-        names(API_ORIGIN),
-        names(ASP_ORIGIN)
-    )
-}
-
-fn cookies_of(window: &WebviewWindow) -> Vec<(String, String)> {
-    window
-        .cookies_for_url(API_ORIGIN.parse().expect("API origin"))
-        .map(|list| {
-            list.into_iter()
-                .map(|c| (c.name().to_owned(), c.value().to_owned()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The webviews as the session store sees them.
-pub struct WebviewJar(pub AppHandle);
-
-impl CookieJar for WebviewJar {
-    fn cookies(&self, webview: &str) -> Result<Vec<(String, String)>, String> {
-        let window = self
-            .0
-            .get_webview_window(webview)
-            .ok_or("De sessie is gesloten")?;
-        Ok(cookies_of(&window))
+impl CookieJar for SessionJar {
+    fn cookies(&self, key: &str) -> Result<Vec<(String, String)>, String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .ok_or_else(|| "De sessie is gesloten".into())
     }
 
-    /// Signs out at e-Boekhouden in the session's own webview, then closes it.
-    fn sign_out(&self, webview: &str) {
-        let Some(window) = self.0.get_webview_window(webview) else {
-            return;
-        };
-        let _ = window.navigate(LOGOUT_URL.parse().expect("logout URL"));
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            let _ = window.destroy();
-        });
+    fn put(&self, key: &str, cookies: Vec<(String, String)>) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), cookies);
+    }
+
+    /// Forgets the session. e-Boekhouden's API has no sign-out of its own; the token stops working when it expires.
+    fn sign_out(&self, key: &str) {
+        self.sessions.lock().unwrap().remove(key);
     }
 }
 
@@ -737,62 +475,6 @@ impl CookieJar for WebviewJar {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    fn p(phase: &str, message: Option<&str>) -> Probe {
-        Probe {
-            phase: phase.into(),
-            message: message.map(str::to_owned),
-            detail: None,
-        }
-    }
-
-    const SHORT: Duration = Duration::from_secs(1);
-    const LONG: Duration = Duration::from_secs(31);
-
-    #[test]
-    fn fills_once_and_then_waits() {
-        assert_eq!(decide(&p("form", None), false, false, SHORT), Action::Fill);
-        assert_eq!(decide(&p("form", None), false, true, SHORT), Action::Wait);
-        assert!(matches!(
-            decide(&p("form", None), false, true, LONG),
-            Action::Unknown(_)
-        ));
-    }
-
-    #[test]
-    fn success_needs_the_token_after_our_submit() {
-        assert_eq!(decide(&p("app", None), true, true, SHORT), Action::Success);
-        assert_eq!(decide(&p("app", None), false, true, SHORT), Action::Wait);
-        assert_eq!(
-            decide(&p("form", None), true, false, SHORT),
-            Action::Fill,
-            "a token before our submit proves nothing"
-        );
-    }
-
-    #[test]
-    fn passes_on_errors_codes_and_unknown_steps() {
-        assert_eq!(
-            decide(&p("error", Some("Onjuist wachtwoord")), false, true, SHORT),
-            Action::Fail("Onjuist wachtwoord".into())
-        );
-        assert_eq!(
-            decide(&p("code", None), false, true, SHORT),
-            Action::AskCode
-        );
-        assert!(matches!(
-            decide(&p("unknown", None), false, true, SHORT),
-            Action::Unknown(_)
-        ));
-        assert_eq!(
-            decide(&p("loading", None), false, false, SHORT),
-            Action::Wait
-        );
-        assert!(matches!(
-            decide(&p("loading", None), false, false, LONG),
-            Action::Unknown(_)
-        ));
-    }
 
     #[test]
     fn finds_the_administration_name() {
@@ -823,7 +505,6 @@ mod tests {
             Pending {
                 cancel: Arc::new(AtomicBool::new(false)),
                 code: Some(tx),
-                window: None,
             },
         );
         signins.give_code(id, " 482913 ".into()).unwrap();
@@ -850,8 +531,25 @@ mod tests {
     }
 
     #[test]
-    fn names_a_missing_password_field() {
-        assert!(fill_failed_message("\"nopassword\"").contains("wachtwoordveld"));
-        assert!(fill_failed_message("geen antwoord").contains("inlogformulier"));
+    fn the_jar_keeps_cookies_until_sign_out() {
+        let jar = SessionJar::default();
+        assert!(jar.cookies("a").is_err());
+        jar.put("a", vec![("auth-token".into(), "jwt".into())]);
+        assert_eq!(
+            jar.cookies("a").unwrap(),
+            vec![("auth-token".to_owned(), "jwt".to_owned())]
+        );
+        jar.sign_out("a");
+        assert!(jar.cookies("a").is_err());
+    }
+
+    #[test]
+    fn describes_the_answer_without_the_token() {
+        let text = describe(&Login::Session(vec![
+            ("auth-token".into(), "geheim-jwt".into()),
+            ("SRVRID".into(), "9".into()),
+        ]));
+        assert!(text.contains("auth-token") && text.contains("SRVRID"));
+        assert!(!text.contains("geheim-jwt"));
     }
 }

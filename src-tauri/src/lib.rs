@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::accounts::{Account, AccountInput, AccountStore, Store};
 use crate::ebapi::EbClient;
 use crate::settings::{Settings, SettingsStore};
-use crate::signin::{Signins, WebviewJar};
+use crate::signin::{SessionJar, Signins};
 use crate::state::{AppState, SessionView};
 
 const PANEL: &str = "panel";
@@ -220,12 +220,6 @@ fn signin_traces(signins: Shared<'_, Signins>) -> Vec<signin::Trace> {
     signins.traces()
 }
 
-/// Toon e-Boekhouden: the hidden sign-in window comes into view, to see what e-Boekhouden shows.
-#[tauri::command]
-fn signin_show(app: AppHandle, signins: Shared<'_, Signins>, id: Uuid) -> Result<(), String> {
-    signin::show_window(&app, &signins, id)
-}
-
 /// Opens the folder with EB MCP's log files in Finder or Explorer.
 #[tauri::command]
 fn open_log_dir(app: AppHandle) -> Result<(), String> {
@@ -400,11 +394,8 @@ async fn prepare_update_restart(
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let had_sessions = app_state.session_count() > 0;
+    // Sessions are only in memory, so forgetting them is immediate.
     app_state.sign_out_all();
-    if had_sessions {
-        tokio::time::sleep(Duration::from_millis(2500)).await;
-    }
     Ok(())
 }
 
@@ -538,11 +529,7 @@ async fn quit(app: AppHandle, app_state: Shared<'_, AppState>) -> Result<(), Str
 }
 
 async fn quit_now(app: &AppHandle, app_state: &AppState) {
-    let had_sessions = app_state.session_count() > 0;
     app_state.sign_out_all();
-    if had_sessions {
-        tokio::time::sleep(Duration::from_millis(2500)).await;
-    }
     app.exit(0);
 }
 
@@ -756,7 +743,6 @@ pub fn run() {
             open_eboekhouden,
             op_items,
             signin_traces,
-            signin_show,
             open_log_dir,
             open_op_install,
             log_list,
@@ -805,7 +791,7 @@ pub fn run() {
             let app_state = Arc::new(AppState::new(
                 accounts,
                 EbClient::production(),
-                Arc::new(WebviewJar(app.handle().clone())),
+                Arc::new(SessionJar::default()),
             ));
             app.manage(app_state.clone());
             app.manage(settings.clone());

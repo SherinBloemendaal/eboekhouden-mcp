@@ -71,7 +71,7 @@ export function opLabel(account: Pick<AccountView, 'opRef' | 'opTitle' | 'opVaul
 }
 
 export type Step =
-  | 'credentials' | 'page' | 'submit' | 'code' | 'administration' | 'done' | 'failed' | 'unknown' | 'cancelled'
+  | 'credentials' | 'submit' | 'code' | 'administration' | 'done' | 'failed' | 'unknown' | 'cancelled'
 
 export interface SigninEvent {
   accountId: string
@@ -136,8 +136,6 @@ export interface Trace {
   lines: { ms: number; text: string }[]
 }
 export const signinTraces = () => (inApp() ? invoke<Trace[]>('signin_traces') : Promise.resolve<Trace[]>([]))
-/** Toon e-Boekhouden: the hidden sign-in window comes into view. */
-export const signinShow = (id: string) => invoke('signin_show', { id })
 
 /** A trace as plain text, to paste into a message. */
 export function traceText(trace: Trace): string {

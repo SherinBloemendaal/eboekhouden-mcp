@@ -31,7 +31,7 @@ async function notNow() {
   <Transition name="modal">
     <Alert v-if="asking" :title="updates.restartAsked ? 'EB MCP herstarten om bij te werken?' : `EB MCP ${updates.available?.version} installeren?`" tone="warn" @close="notNow">
       <p v-if="!updates.restartAsked && updates.available?.notes" class="notes">{{ updates.available.notes }}</p>
-      <p v-if="signedIn.length">{{ signedIn.join(' en ') }} {{ signedIn.length === 1 ? 'wordt' : 'worden' }} uitgelogd bij e-Boekhouden. Na de herstart log je opnieuw in; tot dan horen AI-clients dat ze even moeten wachten.</p>
+      <p v-if="signedIn.length">{{ signedIn.join(' en ') }} {{ signedIn.length === 1 ? 'wordt' : 'worden' }} uitgelogd in EB MCP. Na de herstart log je opnieuw in; tot dan horen AI-clients dat ze even moeten wachten.</p>
       <p v-else>EB MCP start daarna opnieuw. Lopende aanroepen maken eerst af.</p>
       <p v-if="updates.progress !== null">Downloaden… {{ Math.round(updates.progress * 100) }}%</p>
       <p v-if="updates.error" class="error" role="alert">{{ updates.error }}</p>

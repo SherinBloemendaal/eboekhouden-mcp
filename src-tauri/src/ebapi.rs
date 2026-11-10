@@ -156,6 +156,75 @@ impl EbClient {
         call
     }
 
+    /// `POST /v1/api/auth/login`, how e-Boekhouden's own app signs in: username, password and, when the account
+    /// asks for it, the two-step code. The answer's token becomes the `auth-token` cookie the API reads, next to
+    /// the cookies the answer sets. The password goes only into this request's body.
+    pub async fn login(
+        &self,
+        username: &str,
+        password: &str,
+        code: Option<&str>,
+    ) -> (ApiCall, Login) {
+        let mut call = ApiCall {
+            method: "POST",
+            path: "auth/login".into(),
+            query: Vec::new(),
+            status: 0,
+            duration_ms: 0,
+            bytes: 0,
+            rows: None,
+            json: None,
+            error: None,
+        };
+        let url = self.base.join("auth/login").expect("login URL");
+        let body = serde_json::json!({
+            "username": username,
+            "password": password,
+            "twoFactorCode": code.unwrap_or_default(),
+        });
+        let started = Instant::now();
+        let result = self
+            .http
+            .post(url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&body)
+            .send()
+            .await;
+        let outcome = match result {
+            Err(e) => Login::Error(if e.is_timeout() {
+                "e-Boekhouden antwoordde niet binnen 30 s".into()
+            } else {
+                "Geen verbinding met e-Boekhouden".into()
+            }),
+            Ok(response) => {
+                call.status = response.status().as_u16();
+                let set: Vec<(String, String)> = response
+                    .headers()
+                    .get_all(reqwest::header::SET_COOKIE)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .filter_map(|v| v.split(';').next())
+                    .filter_map(|pair| pair.split_once('='))
+                    .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+                    .filter(|(k, _)| !k.is_empty())
+                    .collect();
+                let bytes = response.bytes().await.unwrap_or_default();
+                call.bytes = bytes.len();
+                let json = serde_json::from_slice::<Value>(&bytes).ok();
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                login_outcome(call.status, json.as_ref(), &text, set)
+            }
+        };
+        call.duration_ms = started.elapsed().as_millis() as u64;
+        if let Login::Refused(m) | Login::Error(m) = &outcome {
+            call.error = Some(m.clone());
+        }
+        if matches!(outcome, Login::NeedsCode) {
+            call.error = Some("e-Boekhouden vraagt om een tweestapscode".into());
+        }
+        (call, outcome)
+    }
+
     /// `POST /v1/api/auth`, the check e-Boekhouden's own app makes at startup: whether these cookies make a
     /// signed-in session. The answer's `valid` says so; `valid_session` reads it.
     pub async fn auth(&self, cookies: &[(String, String)]) -> ApiCall {
@@ -231,6 +300,74 @@ pub fn cookie_header(cookies: &[(String, String)]) -> String {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// What `auth/login` answered.
+#[derive(Debug, PartialEq)]
+pub enum Login {
+    /// Signed in: the session's cookies, `auth-token` among them. Never logged or shown.
+    Session(Vec<(String, String)>),
+    /// The account uses two-step verification: sign in again with the code.
+    NeedsCode,
+    /// e-Boekhouden refused, with its own message where it gave one.
+    Refused(String),
+    Error(String),
+}
+
+const TWO_STEP: [&str; 7] = [
+    "twofactor",
+    "two-factor",
+    "two factor",
+    "2fa",
+    "tweestap",
+    "authenticator",
+    "verificatiecode",
+];
+
+/// Reads `auth/login`'s answer. Pure, so it can be tested without e-Boekhouden.
+pub fn login_outcome(
+    status: u16,
+    json: Option<&Value>,
+    text: &str,
+    mut cookies: Vec<(String, String)>,
+) -> Login {
+    let token = json
+        .and_then(|j| j.get("token"))
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty());
+    if (200..300).contains(&status)
+        && let Some(token) = token
+    {
+        cookies.retain(|(k, _)| k != "auth-token");
+        cookies.push(("auth-token".into(), token.to_owned()));
+        return Login::Session(cookies);
+    }
+    let lower = text.to_lowercase();
+    if (200..300).contains(&status) || status == 400 || status == 401 || status == 403 {
+        if TWO_STEP.iter().any(|w| lower.contains(w)) {
+            return Login::NeedsCode;
+        }
+        let message = json
+            .and_then(|j| {
+                ["message", "error", "detail", "title"]
+                    .iter()
+                    .find_map(|k| j.get(*k).and_then(Value::as_str))
+            })
+            .map(str::to_owned)
+            .or_else(|| json.and_then(Value::as_str).map(str::to_owned))
+            .or_else(|| {
+                (!text.trim().is_empty() && text.len() < 300 && !text.contains('<'))
+                    .then(|| text.trim().to_owned())
+            })
+            .unwrap_or_else(|| "e-Boekhouden weigerde de gebruikersnaam of het wachtwoord".into());
+        return Login::Refused(message.chars().take(300).collect());
+    }
+    if status == 429 {
+        return Login::Refused("e-Boekhouden vraagt om even te wachten met inloggen".into());
+    }
+    Login::Error(format!(
+        "e-Boekhouden gaf een fout bij het inloggen ({status})"
+    ))
 }
 
 /// Whether `POST auth` said the session is signed in (`{"valid": true, ...}`).
@@ -362,6 +499,29 @@ mod tests {
                 }),
             )
             .route("/v1/api/kapot", get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }))
+            .route(
+                "/v1/api/auth/login",
+                axum::routing::post(|body: String| async move {
+                    let body: Value = serde_json::from_str(&body).unwrap_or_default();
+                    match (body["username"].as_str(), body["password"].as_str(), body["twoFactorCode"].as_str()) {
+                        (Some("jan@studionoord.example"), Some("geheim"), Some("123456")) => (
+                            axum::http::StatusCode::OK,
+                            [("set-cookie", "SRVRID=9s13; path=/; Secure")],
+                            json!({"token": "jwt"}).to_string(),
+                        ),
+                        (Some("jan@studionoord.example"), Some("geheim"), _) => (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            [("set-cookie", "SRVRID=9s13; path=/; Secure")],
+                            json!({"message": "TwoFactorCodeRequired"}).to_string(),
+                        ),
+                        _ => (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            [("set-cookie", "SRVRID=9s13; path=/; Secure")],
+                            json!({"message": "Gebruikersnaam of wachtwoord onjuist"}).to_string(),
+                        ),
+                    }
+                }),
+            )
             // Like e-Boekhouden: without a JSON content type the API answers 415.
             .route(
                 "/v1/api/auth",
@@ -509,5 +669,61 @@ mod tests {
         assert_eq!(not_yet.status, 200);
         assert!(!valid_session(&not_yet));
         assert!(not_yet.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn signs_in_like_e_boekhoudens_app_with_a_two_step_code() {
+        let client = EbClient::new(&mock().await);
+        let (call, wrong) = client.login("jan@studionoord.example", "fout", None).await;
+        assert_eq!(call.status, 401);
+        assert_eq!(
+            wrong,
+            Login::Refused("Gebruikersnaam of wachtwoord onjuist".into())
+        );
+        let (_, needs) = client
+            .login("jan@studionoord.example", "geheim", None)
+            .await;
+        assert_eq!(needs, Login::NeedsCode);
+        let (call, ok) = client
+            .login("jan@studionoord.example", "geheim", Some("123456"))
+            .await;
+        assert_eq!(call.status, 200);
+        assert_eq!(
+            ok,
+            Login::Session(vec![
+                ("SRVRID".into(), "9s13".into()),
+                ("auth-token".into(), "jwt".into())
+            ])
+        );
+        assert!(call.error.is_none());
+    }
+
+    #[test]
+    fn reads_the_login_answer() {
+        let json = |v: Value| Some(v);
+        assert!(matches!(
+            login_outcome(200, json(json!({"token": "t"})).as_ref(), "", vec![]),
+            Login::Session(_)
+        ));
+        assert_eq!(
+            login_outcome(200, json(json!({"token": ""})).as_ref(), "", vec![]),
+            Login::Refused("e-Boekhouden weigerde de gebruikersnaam of het wachtwoord".into())
+        );
+        assert_eq!(
+            login_outcome(400, None, "Two-factor authentication code required", vec![]),
+            Login::NeedsCode
+        );
+        assert_eq!(
+            login_outcome(401, json(json!("Account geblokkeerd")).as_ref(), "", vec![]),
+            Login::Refused("Account geblokkeerd".into())
+        );
+        assert_eq!(
+            login_outcome(401, None, "<html>nope</html>", vec![]),
+            Login::Refused("e-Boekhouden weigerde de gebruikersnaam of het wachtwoord".into())
+        );
+        assert!(matches!(
+            login_outcome(502, None, "", vec![]),
+            Login::Error(_)
+        ));
     }
 }
