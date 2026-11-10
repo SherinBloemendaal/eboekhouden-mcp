@@ -27,6 +27,10 @@ const APP_ENTRY: &str =
     "https://secure.e-boekhouden.nl/bh?v2Url=https%3A%2F%2Fsecure20.e-boekhouden.nl%2F";
 /// After the login answer, how long e-Boekhouden gets to finish its own token steps before EB MCP opens the app.
 const APP_SETTLE: Duration = Duration::from_millis(1500);
+/// After the login answer: how often EB MCP asks e-Boekhouden's API whether the session is signed in.
+const AUTH_EVERY: Duration = Duration::from_millis(1500);
+/// Checks that say "not yet" before EB MCP opens e-Boekhouden's app, which completes the session on secure20.
+const AUTH_TRIES_BEFORE_APP: u32 = 2;
 const DRIVER: &str = include_str!("../js/signin-driver.js");
 const DIALOG_HOOK: &str = include_str!("../js/dialog-hook.js");
 const POLL: Duration = Duration::from_millis(400);
@@ -305,7 +309,26 @@ pub async fn sign_in(
         .map(|a| a.label)
         .unwrap_or_default();
     signins.trace_start(account_id, &label);
+    let started = Instant::now();
     let (step, message) = run(&app, &state, &signins, account_id, &cancel).await;
+    // The sign-in itself in Verzoeken, also when it failed.
+    let call = crate::ebapi::ApiCall {
+        method: "LOGIN",
+        path: "inloggen".into(),
+        query: Vec::new(),
+        status: match step {
+            Step::Done => 200,
+            Step::Failed => 401,
+            Step::Cancelled => 499,
+            _ => 0,
+        },
+        duration_ms: started.elapsed().as_millis() as u64,
+        bytes: 0,
+        rows: None,
+        json: None,
+        error: (step != Step::Done).then(|| message.clone().unwrap_or_else(|| format!("{step:?}"))),
+    };
+    state.log_signin_call(&call, account_id, &label);
     signins.trace_end(
         account_id,
         match &message {
@@ -380,6 +403,10 @@ async fn run(
     let mut had_token = false;
     let mut app_opened = false;
     let mut last_cookies = String::new();
+    let mut logged_in_page = false;
+    let mut last_auth: Option<Instant> = None;
+    let mut auth_tries = 0u32;
+    let mut session_valid = false;
     let outcome = loop {
         if cancel.load(Ordering::SeqCst) {
             break (Step::Cancelled, None);
@@ -424,23 +451,49 @@ async fn run(
             signins.trace(account_id, format!("Cookies (alleen namen): {names}"));
             last_cookies = names;
         }
-        // Signed in, but still on the old frameset: open e-Boekhouden's app, which sets the session token.
-        if filled
-            && !has_token
-            && !app_opened
-            && probe.phase == "app"
+        if filled && probe.phase == "app" {
+            logged_in_page = true;
+        }
+        // After the login answer, ask e-Boekhouden's API itself whether these cookies make a signed-in session:
+        // that is what the MCP calls need, whatever cookie carries it.
+        if logged_in_page
+            && !session_valid
             && since.elapsed() > APP_SETTLE
+            && last_auth.is_none_or(|t| t.elapsed() >= AUTH_EVERY)
         {
+            last_auth = Some(Instant::now());
+            auth_tries += 1;
+            let call = state.client.auth(&cookies_of(&window)).await;
+            state.log_signin_call(&call, account_id, &account.label);
+            session_valid = crate::ebapi::valid_session(&call);
             signins.trace(
                 account_id,
-                "Ingelogd; de app van e-Boekhouden openen voor het sessietoken",
+                format!(
+                    "API-controle {auth_tries}: status {}, {}",
+                    call.status,
+                    if session_valid {
+                        "ingelogd"
+                    } else {
+                        "nog niet ingelogd"
+                    }
+                ),
             );
-            if let Err(e) = window.navigate(APP_ENTRY.parse().expect("app entry URL")) {
-                signins.trace(account_id, format!("De app openen lukte niet: {e}"));
+            if session_valid {
+                break (Step::Done, None);
             }
-            app_opened = true;
-            since = Instant::now();
-            continue;
+            // Signed in on the old frameset only: open e-Boekhouden's app, which completes the session on secure20.
+            if !app_opened && auth_tries >= AUTH_TRIES_BEFORE_APP {
+                signins.trace(
+                    account_id,
+                    "De app van e-Boekhouden openen om de sessie af te maken",
+                );
+                if let Err(e) = window.navigate(APP_ENTRY.parse().expect("app entry URL")) {
+                    signins.trace(account_id, format!("De app openen lukte niet: {e}"));
+                }
+                app_opened = true;
+                since = Instant::now();
+                continue;
+            }
         }
         if has_token != had_token {
             signins.trace(

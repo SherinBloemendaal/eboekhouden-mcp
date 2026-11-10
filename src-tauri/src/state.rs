@@ -246,6 +246,18 @@ impl AppState {
         call
     }
 
+    /// A sign-in attempt or one of its checks in Verzoeken, so they show next to the AI calls.
+    pub fn log_signin_call(&self, call: &ApiCall, account_id: Uuid, label: &str) {
+        self.log.add_eb(
+            call,
+            None,
+            "EB MCP (inloggen)",
+            Some((account_id, label.to_owned())),
+            true,
+        );
+        let _ = self.events.send(AppEvent::LogChanged);
+    }
+
     fn note_use(&self, account_id: Uuid, token_hash: Option<u64>) {
         if let Some(s) = self.sessions.write().unwrap().get_mut(&account_id) {
             s.last_used = Instant::now();

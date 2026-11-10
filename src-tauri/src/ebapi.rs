@@ -156,6 +156,49 @@ impl EbClient {
         call
     }
 
+    /// `POST /v1/api/auth`, the check e-Boekhouden's own app makes at startup: whether these cookies make a
+    /// signed-in session. The answer's `valid` says so; `valid_session` reads it.
+    pub async fn auth(&self, cookies: &[(String, String)]) -> ApiCall {
+        let mut call = ApiCall {
+            method: "POST",
+            path: "auth".into(),
+            query: Vec::new(),
+            status: 0,
+            duration_ms: 0,
+            bytes: 0,
+            rows: None,
+            json: None,
+            error: None,
+        };
+        let url = self.base.join("auth").expect("auth URL");
+        let started = Instant::now();
+        let mut request = self
+            .http
+            .post(url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CONTENT_LENGTH, "0");
+        if !cookies.is_empty() {
+            request = request.header(reqwest::header::COOKIE, cookie_header(cookies));
+        }
+        if let Some(token) = auth_token(cookies) {
+            request = request.bearer_auth(token);
+        }
+        match request.send().await {
+            Err(_) => call.error = Some("Geen verbinding met e-Boekhouden".into()),
+            Ok(response) => {
+                call.status = response.status().as_u16();
+                let body = response.bytes().await.unwrap_or_default();
+                call.bytes = body.len();
+                call.json = serde_json::from_slice::<Value>(&body).ok();
+                if !valid_session(&call) {
+                    call.error = Some("Nog geen geldige sessie bij e-Boekhouden".into());
+                }
+            }
+        }
+        call.duration_ms = started.elapsed().as_millis() as u64;
+        call
+    }
+
     fn url(&self, path: &str, query: &[(String, String)]) -> Result<Url, String> {
         let path = path.trim_start_matches('/');
         if path.is_empty()
@@ -186,6 +229,17 @@ pub fn cookie_header(cookies: &[(String, String)]) -> String {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Whether `POST auth` said the session is signed in (`{"valid": true, ...}`).
+pub fn valid_session(call: &ApiCall) -> bool {
+    (200..300).contains(&call.status)
+        && call
+            .json
+            .as_ref()
+            .and_then(|j| j.get("valid"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// e-Boekhouden's app reads its JWT from the script-set `auth-token` cookie.
@@ -401,5 +455,33 @@ mod tests {
         // A pause longer than the queue wait fails the call instead of holding it for minutes.
         limiter.failed(Some(Duration::from_secs(120))).await;
         assert!(limiter.acquire().await.is_none());
+    }
+
+    #[test]
+    fn reads_whether_auth_says_signed_in() {
+        let call = |status: u16, json: Option<Value>| ApiCall {
+            method: "POST",
+            path: "auth".into(),
+            query: Vec::new(),
+            status,
+            duration_ms: 0,
+            bytes: 0,
+            rows: None,
+            json,
+            error: None,
+        };
+        assert!(valid_session(&call(
+            200,
+            Some(serde_json::json!({"valid": true, "abId": 1}))
+        )));
+        assert!(!valid_session(&call(
+            200,
+            Some(serde_json::json!({"valid": false}))
+        )));
+        assert!(!valid_session(&call(
+            401,
+            Some(serde_json::json!({"valid": true}))
+        )));
+        assert!(!valid_session(&call(200, None)));
     }
 }
