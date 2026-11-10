@@ -1,7 +1,9 @@
 <script setup lang="ts">
 // Add or edit an account. Passwords go straight to the system store; the app keeps none.
 import { computed, reactive, ref } from 'vue'
-import { addAccount, updateAccount, type AccountView, type StoreKind } from '../lib/accounts'
+import { addAccount, updateAccount, type AccountView, type OpItem, type StoreKind } from '../lib/accounts'
+import Icon from './Icon.vue'
+import OpItemPicker from './OpItemPicker.vue'
 import Sheet from './Sheet.vue'
 
 const props = defineProps<{ account?: AccountView }>()
@@ -12,6 +14,8 @@ const form = reactive({
   label: props.account?.label ?? '',
   store: (props.account?.store ?? 'onePassword') as StoreKind,
   opRef: props.account?.opRef ?? '',
+  opTitle: props.account?.opTitle ?? null as string | null,
+  opVault: props.account?.opVault ?? null as string | null,
   username: props.account?.store === 'system' ? props.account.username : '',
   password: '',
   isDefault: props.account?.isDefault ?? false,
@@ -19,6 +23,49 @@ const form = reactive({
 const error = ref<string | null>(null)
 const busy = ref(false)
 const showPassword = ref(false)
+
+/** 1Password: the chosen item as a card, the list to pick from, or a reference typed by hand. */
+type OpMode = 'card' | 'picker' | 'manual'
+const opMode = ref<OpMode>(props.account?.opRef ? 'card' : 'picker')
+/** The list asks 1Password for consent, so it only loads after a click. */
+const pickerOpen = ref(false)
+
+/** The username shown on the card: from the picked item, else the one read at the last sign-in. */
+const pickedUser = ref<string | null>(props.account?.store === 'onePassword' ? props.account.username || null : null)
+const cardSub = computed(() =>
+  form.opTitle ? [form.opVault, pickedUser.value].filter(Boolean).join(' · ') || '1Password' : 'Zelf ingevulde verwijzing',
+)
+
+function pick(item: OpItem) {
+  pickedUser.value = item.username || null
+  form.opRef = item.reference
+  form.opTitle = item.title || null
+  form.opVault = item.vault || null
+  if (!form.label.trim() && item.title) form.label = item.title.slice(0, 60)
+  opMode.value = 'card'
+  pickerOpen.value = false
+}
+
+function changeItem() {
+  opMode.value = 'picker'
+  pickerOpen.value = true
+}
+
+function closePicker() {
+  pickerOpen.value = false
+  if (form.opRef) opMode.value = 'card'
+}
+
+function typeByHand() {
+  opMode.value = 'manual'
+  pickerOpen.value = false
+}
+
+/** A reference typed by hand has no title or vault to show. */
+function onManualInput() {
+  form.opTitle = null
+  form.opVault = null
+}
 
 async function save() {
   if (busy.value) return
@@ -29,6 +76,8 @@ async function save() {
     username: form.store === 'system' ? form.username : (props.account?.username ?? ''),
     store: form.store,
     opRef: form.store === 'onePassword' ? form.opRef : null,
+    opTitle: form.store === 'onePassword' ? form.opTitle : null,
+    opVault: form.store === 'onePassword' ? form.opVault : null,
     isDefault: form.isDefault,
   }
   try {
@@ -74,11 +123,34 @@ async function save() {
       <Transition name="accordion" mode="out-in">
         <div v-if="form.store === 'onePassword'" key="onePassword" class="accordion fields">
           <div class="fields-inner">
-            <label class="field-block">
-              <span class="label">1Password-item</span>
-              <input v-model="form.opRef" class="field mono" placeholder="op://Werk/e-Boekhouden Studio Noord" spellcheck="false" />
-              <span class="hint">EB MCP leest de velden username en password van dit item via de 1Password-CLI, alleen op het moment van inloggen.</span>
-            </label>
+            <div class="field-block">
+              <span id="op-item-label" class="label">1Password-item</span>
+              <Transition name="swap-op" mode="out-in">
+                <div v-if="opMode === 'card'" key="card" class="op-card" role="group" aria-labelledby="op-item-label">
+                  <span class="op-icon"><Icon name="key" :size="16" /></span>
+                  <span class="op-text">
+                    <span class="op-title" :class="{ mono: !form.opTitle }">{{ form.opTitle ?? form.opRef }}</span>
+                    <span class="op-sub">{{ cardSub }}</span>
+                  </span>
+                  <button type="button" class="btn small" @click="changeItem">Wijzigen</button>
+                </div>
+                <div v-else-if="opMode === 'picker'" key="picker" class="op-picker">
+                  <Transition name="swap-op" mode="out-in">
+                    <OpItemPicker v-if="pickerOpen" :current="form.opRef || null" @pick="pick" @close="closePicker" />
+                    <button v-else type="button" class="btn op-choose" @click="pickerOpen = true"><Icon name="search" :size="15" />Kies uit 1Password…</button>
+                  </Transition>
+                </div>
+                <input
+                  v-else key="manual" v-model="form.opRef" class="field mono" placeholder="op://Werk/e-Boekhouden Studio Noord"
+                  aria-labelledby="op-item-label" spellcheck="false" @input="onManualInput"
+                />
+              </Transition>
+              <span class="op-links">
+                <button v-if="opMode !== 'manual'" type="button" class="link" @click="typeByHand">Verwijzing zelf invullen</button>
+                <button v-else type="button" class="link" @click="changeItem">Kies uit de lijst</button>
+              </span>
+              <span class="hint">EB MCP leest gebruikersnaam en wachtwoord van dit item via de 1Password-CLI, alleen op het moment van inloggen. Het bewaart alleen de verwijzing.</span>
+            </div>
           </div>
         </div>
         <div v-else key="system" class="accordion fields">
@@ -140,6 +212,22 @@ async function save() {
 .option.on .ring::after { opacity: 1; transform: none; }
 .fields-inner { display: flex; flex-direction: column; gap: 14px; }
 .fields.accordion-leave-active, .fields.accordion-leave-active > * { transition-duration: 120ms; }
+.op-card { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 12px; background: var(--sunken); box-shadow: inset 0 0 0 0.5px var(--line); }
+.op-icon { width: 32px; height: 32px; flex: none; border-radius: 8px; background: var(--info-soft); color: var(--info); display: flex; align-items: center; justify-content: center; }
+.op-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.op-title, .op-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.op-title { font-size: 13px; font-weight: 600; }
+.op-sub { font-size: 12px; color: var(--muted); }
+.op-choose { align-self: flex-start; }
+.op-picker { display: flex; flex-direction: column; }
+.op-links { display: flex; }
+.link { padding: 0; border: 0; background: transparent; color: var(--accent); font-size: 12px; transition: opacity 150ms ease; }
+.link:hover { opacity: 0.75; }
+.swap-op-enter-active { transition: opacity 180ms var(--ease), transform 180ms var(--ease); }
+.swap-op-leave-active { transition: opacity 120ms cubic-bezier(0.4, 0, 1, 1); }
+.swap-op-enter-from { opacity: 0; transform: translateY(-4px); }
+.swap-op-leave-to { opacity: 0; }
+@media (prefers-reduced-motion: reduce) { .swap-op-enter-from { transform: none; } }
 .with-button { display: flex; gap: 6px; align-items: center; }
 .check { display: flex; align-items: center; gap: 8px; }
 .check input { accent-color: var(--accent); width: 14px; height: 14px; margin: 0; }

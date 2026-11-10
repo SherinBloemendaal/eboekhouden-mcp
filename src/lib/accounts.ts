@@ -20,6 +20,8 @@ export interface AccountView {
   username: string
   store: StoreKind
   opRef: string | null
+  opTitle: string | null
+  opVault: string | null
   administration: string | null
   isDefault: boolean
   session: SessionView | null
@@ -31,7 +33,41 @@ export interface AccountInput {
   username: string
   store: StoreKind
   opRef: string | null
+  opTitle: string | null
+  opVault: string | null
   isDefault: boolean
+}
+
+/** A Login item in 1Password, as `op item list` gives it. Never carries a password. */
+export interface OpItem {
+  /** `op://<vault id>/<item id>`: keeps working when the item is renamed. */
+  reference: string
+  title: string
+  vault: string
+  username: string
+  /** For e-Boekhouden: its website or title says so. */
+  suggested: boolean
+}
+
+export type OpListError = { kind: 'missing' } | { kind: 'locked' } | { kind: 'other'; message: string }
+
+export const opItems = () => invoke<OpItem[]>('op_items')
+export const openOpInstall = () => (inApp() ? invoke('open_op_install') : Promise.resolve())
+
+/** Every word of the query must appear in the title, username or vault; e-Boekhouden items come first. */
+export function filterOpItems(items: OpItem[], query: string): { suggested: OpItem[]; other: OpItem[] } {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean)
+  const hits = items.filter((item) => {
+    const text = `${item.title} ${item.username} ${item.vault}`.toLowerCase()
+    return words.every((word) => text.includes(word))
+  })
+  return { suggested: hits.filter((i) => i.suggested), other: hits.filter((i) => !i.suggested) }
+}
+
+/** How the list names a 1Password item: "Kluis · Titel" when it was picked, else the reference. */
+export function opLabel(account: Pick<AccountView, 'opRef' | 'opTitle' | 'opVault'>): string {
+  if (account.opTitle) return account.opVault ? `${account.opVault} · ${account.opTitle}` : account.opTitle
+  return account.opRef ?? ''
 }
 
 export type Step =
