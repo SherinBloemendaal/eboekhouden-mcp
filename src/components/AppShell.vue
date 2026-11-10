@@ -68,12 +68,15 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.shell { display: flex; height: 100%; }
+.shell { display: flex; height: 100%; background: var(--glass-window); }
+/* A floating glass sidebar, inset from the window edge, with the traffic lights inside it (the boards' window()). */
 .sidebar {
   width: 216px; flex: none; box-sizing: border-box; display: flex; flex-direction: column;
-  padding: 0 10px 12px;
+  margin: 8px 0 8px 8px; padding: 0 10px 10px; border-radius: 14px;
+  background: var(--glass-side); box-shadow: var(--glass-side-edge);
+  -webkit-backdrop-filter: blur(30px) saturate(180%); backdrop-filter: blur(30px) saturate(180%);
 }
-.traffic-space { height: 52px; flex: none; }
+.traffic-space { height: 44px; flex: none; }
 .side-label { padding: 6px 8px 4px; }
 .nav {
   box-sizing: border-box; height: 28px; display: flex; align-items: center; gap: 8px; padding: 0 8px;
@@ -87,10 +90,7 @@ onMounted(async () => {
 .side-foot { margin-top: auto; display: flex; flex-direction: column; gap: 6px; padding: 0 4px; }
 .server-line { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 500; }
 .server-addr { font-size: 11px; color: var(--muted); padding-left: 14px; }
-.main {
-  flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--content);
-  border-left: 0.5px solid var(--line-soft);
-}
+.main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .toolbar { height: 52px; flex: none; display: flex; align-items: center; padding: 0 20px; }
 .toolbar h1 { font-size: 15px; font-weight: 700; }
 .toolbar-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }

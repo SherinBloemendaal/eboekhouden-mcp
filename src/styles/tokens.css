@@ -76,6 +76,27 @@
   :root { --content: #1e1e21; --glass-bar: #3a3a3e; }
 }
 
+/* The window and its floating sidebar, as on the boards (common.py: gWin, gSide, gSideEdge).
+   The window's own vibrancy is underneath, so both stay translucent. */
+:root {
+  --glass-window: rgba(246, 246, 248, 0.86);
+  --glass-side: rgba(255, 255, 255, 0.46);
+  --glass-side-edge: inset 0 0.5px 0 rgba(255, 255, 255, 0.9), 0 0 0 0.5px rgba(0, 0, 0, 0.08), 0 6px 20px rgba(0, 0, 0, 0.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --glass-window: rgba(30, 30, 33, 0.84);
+    --glass-side: rgba(255, 255, 255, 0.07);
+    --glass-side-edge: inset 0 0.5px 0 rgba(255, 255, 255, 0.16), 0 0 0 0.5px rgba(255, 255, 255, 0.08), 0 6px 20px rgba(0, 0, 0, 0.3);
+  }
+}
+@media (prefers-reduced-transparency: reduce) {
+  :root { --glass-window: #f5f5f7; --glass-side: #ececf0; }
+}
+@media (prefers-reduced-transparency: reduce) and (prefers-color-scheme: dark) {
+  :root { --glass-window: #1e1e21; --glass-side: #2a2a2e; }
+}
+
 :root {
   --glass-pop: rgba(246, 246, 248, 0.72);
   --seg-on: #ffffff;

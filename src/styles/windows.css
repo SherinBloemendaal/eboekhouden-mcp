@@ -27,3 +27,12 @@
 }
 :root[data-platform='windows'] .traffic-space { height: 32px; }
 :root[data-platform='windows'] [role='dialog'], :root[data-platform='windows'] [role='alertdialog'] { border-radius: 8px !important; }
+
+/* Fluent keeps a flat sidebar on Mica: no floating glass card as on macOS (AppShell.vue). */
+:root[data-platform='windows'] .shell { background: transparent; }
+:root[data-platform='windows'] .sidebar {
+  margin: 0; padding: 0 10px 12px; border-radius: 0; background: transparent; box-shadow: none;
+  -webkit-backdrop-filter: none; backdrop-filter: none;
+}
+:root[data-platform='windows'] .traffic-space { height: 52px; }
+:root[data-platform='windows'] .main { background: var(--content); border-left: 0.5px solid var(--line-soft); }
