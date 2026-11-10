@@ -4,7 +4,8 @@ import Alert from '../components/Alert.vue'
 import Icon from '../components/Icon.vue'
 import JsonView from '../components/JsonView.vue'
 import Sheet from '../components/Sheet.vue'
-import { CLIENT_NAMES, clientsStatus, link, otherClientSettings, preview, renewToken, revealToken, unlink, type Client, type ClientStatus, type Preview } from '../lib/connect'
+import ClientIcon from '../components/ClientIcon.vue'
+import { CLIENT_NAMES, SERVER_NAMES, usesBridge, clientsStatus, link, otherClientSettings, preview, renewToken, revealToken, unlink, type Client, type ClientStatus, type Preview } from '../lib/connect'
 import { masked, serverInfo, type ServerInfo } from '../lib/server'
 
 const info = ref<ServerInfo | null>(null)
@@ -141,7 +142,7 @@ function stateText(c: ClientStatus): string {
     <div class="clients">
       <section v-for="c in clients" :key="c.client" class="group card client">
         <div class="client-head">
-          <span class="client-icon">{{ ({ claude: 'Cl', claudeCode: 'CC', cursor: 'Cu' } as const)[c.client] }}</span>
+          <ClientIcon :client="c.client" />
           <span class="stack">
             <strong>{{ CLIENT_NAMES[c.client] }}</strong>
             <span class="client-state" :class="c.state"><span class="dot" :class="{ on: c.state === 'linked', off: c.state === 'none', bad: c.state === 'broken' || c.state === 'stale' }" />{{ stateText(c) }}</span>
@@ -155,7 +156,7 @@ function stateText(c: ClientStatus): string {
           <button v-if="c.state === 'linked' || c.state === 'stale'" type="button" class="btn" @click="unlinking = c.client">Ontkoppelen</button>
         </div>
       </section>
-      <section class="group card client">
+      <section class="group card client other">
         <div class="client-head">
           <span class="client-icon dashed"><Icon name="plug" :size="16" /></span>
           <span class="stack"><strong>Andere client</strong><span class="client-state">Zelf instellen</span></span>
@@ -168,7 +169,7 @@ function stateText(c: ClientStatus): string {
     <Transition name="banner">
       <div v-if="done" class="banner" role="status">
         <img src="/app-icon.png" alt="" width="34" height="34" />
-        <span><strong>Gekoppeld met {{ CLIENT_NAMES[done] }}</strong><br />{{ done === 'claude' ? 'Start Claude opnieuw om EB MCP te zien.' : 'Cursor pakt de wijziging meestal zelf op; anders even opnieuw starten.' }}</span>
+        <span><strong>Gekoppeld met {{ CLIENT_NAMES[done] }}</strong><br />{{ ({ claude: 'Start Claude opnieuw om e-Boekhouden MCP te zien.', claudeCode: 'Nieuwe Claude Code-sessies zien e-boekhouden meteen.', cursor: 'Cursor pakt de wijziging meestal zelf op; anders even opnieuw starten.', codex: 'Start Codex opnieuw om e-boekhouden te zien.' } as const)[done] }}</span>
       </div>
     </Transition>
   </div>
@@ -177,20 +178,30 @@ function stateText(c: ClientStatus): string {
     <Sheet v-if="confirming" :title="`Koppelen met ${CLIENT_NAMES[confirming.client]}`" :width="640" @close="confirming = null">
       <p>EB MCP {{ confirming.replaces ? 'vervangt zijn eigen regel' : 'voegt de server toe' }} in het instellingenbestand van {{ CLIENT_NAMES[confirming.client] }}. {{ confirming.otherServers.length ? 'Je andere servers blijven staan.' : '' }}</p>
       <div class="file"><span class="mono">{{ confirming.path }}</span><span class="chip">{{ confirming.exists ? `${confirming.otherServers.length} andere servers` : 'nieuw bestand' }}</span></div>
-      <div class="diff mono">
-        <span v-for="name in confirming.otherServers" :key="name" class="ctx">  "{{ name }}": { … }</span>
-        <span class="add">+ "eb-mcp":</span>
-      </div>
-      <JsonView :value="previewEntry" />
-      <div v-if="confirming.client !== 'claude'" class="row-line">
+      <template v-if="confirming.toml">
+        <div class="diff mono">
+          <span v-for="name in confirming.otherServers" :key="name" class="ctx">  [mcp_servers.{{ name }}] …</span>
+        </div>
+        <pre class="toml mono">{{ confirming.toml }}</pre>
+      </template>
+      <template v-else>
+        <div class="diff mono">
+          <span v-for="name in confirming.otherServers" :key="name" class="ctx">  "{{ name }}": { … }</span>
+          <span class="add">+ "{{ SERVER_NAMES[confirming.client] }}":</span>
+        </div>
+        <JsonView :value="previewEntry" />
+      </template>
+      <div v-if="!usesBridge(confirming.client)" class="row-line">
         <button type="button" class="btn small" :aria-pressed="revealInPreview" @click="togglePreviewToken">{{ revealInPreview ? 'Token verbergen' : 'Token tonen' }}</button>
         <span class="muted small">Het token staat straks leesbaar in dit bestand, net als bij elke andere server.</span>
       </div>
       <ul class="bullets">
         <li v-if="confirming.exists">Eerst een reservekopie: {{ confirming.backup }}</li>
+        <li v-if="confirming.legacy">Een koppeling onder de oude naam eb-mcp maakt plaats voor {{ SERVER_NAMES[confirming.client] }}.</li>
         <li v-if="confirming.client === 'claude'">Claude Desktop start EB MCP via een kleine brug in de app, omdat Claude alleen lokale stdio-servers start.</li>
-        <li v-if="confirming.client === 'claude'">Het token staat niet in dit bestand: de brug leest het uit je sleutelhanger.</li>
-        <li>{{ ({ claude: 'Start Claude daarna opnieuw; Claude leest het bestand alleen bij de start.', claudeCode: 'Start een nieuwe Claude Code-sessie; lopende sessies zien de server pas na een herstart.', cursor: 'Cursor pakt de wijziging meestal zelf op.' } as const)[confirming.client] }}</li>
+        <li v-if="confirming.client === 'codex'">Codex start EB MCP via een kleine brug in de app; je andere Codex-instellingen en opmerkingen blijven staan.</li>
+        <li v-if="usesBridge(confirming.client)">Het token staat niet in dit bestand: de brug leest het uit je sleutelhanger.</li>
+        <li>{{ ({ claude: 'Start Claude daarna opnieuw; Claude leest het bestand alleen bij de start.', claudeCode: 'Start een nieuwe Claude Code-sessie; lopende sessies zien de server pas na een herstart.', cursor: 'Cursor pakt de wijziging meestal zelf op.', codex: 'Start Codex daarna opnieuw; Codex leest config.toml alleen bij de start.' } as const)[confirming.client] }}</li>
       </ul>
       <template #footer>
         <button type="button" class="btn" :disabled="busy" @click="confirming = null">Annuleren</button>
@@ -246,6 +257,8 @@ function stateText(c: ClientStatus): string {
 .chip { height: 18px; display: inline-flex; align-items: center; padding: 0 7px; border-radius: 999px; background: var(--subtle); color: var(--label); font-size: 11px; font-weight: 500; white-space: nowrap; }
 .chip.mcp { background: rgba(175, 82, 222, 0.13); color: #7a3fc7; }
 .clients { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.client.other { grid-column: 1 / -1; }
+.toml { margin: 0; padding: 10px 12px; border-radius: 10px; background: var(--sunken); font-size: 12px; line-height: 18px; white-space: pre-wrap; word-break: break-all; -webkit-user-select: text; user-select: text; }
 .client-head { display: flex; align-items: center; gap: 12px; }
 .client-icon { width: 40px; height: 40px; flex: none; border-radius: 10px; background: var(--subtle); color: var(--label); font-weight: 700; display: flex; align-items: center; justify-content: center; }
 .client-icon.dashed { background: transparent; border: 1.5px dashed var(--field); box-sizing: border-box; }

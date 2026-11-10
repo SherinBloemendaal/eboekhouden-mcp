@@ -2,6 +2,8 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { describe, expect, it } from 'vitest'
 import { router } from '../router'
 import App from '../App.vue'
+import ClientIcon from '../components/ClientIcon.vue'
+import { CLIENT_NAMES, SERVER_NAMES, usesBridge, type Client } from '../lib/connect'
 
 async function mountAt(path: string) {
   router.push(path)
@@ -50,5 +52,35 @@ describe('accounts page', () => {
     const wrapper = await mountAt('/accounts')
     expect(wrapper.text()).toContain('Nog geen accounts')
     expect(wrapper.find('button.primary').text()).toContain('Account toevoegen')
+  })
+})
+
+describe('koppelen', () => {
+  it('draws a logo for every client, Codex included', () => {
+    const clients = Object.keys(CLIENT_NAMES) as Client[]
+    expect(clients).toEqual(['claude', 'claudeCode', 'cursor', 'codex'])
+    for (const client of clients) {
+      const wrapper = mount(ClientIcon, { props: { client } })
+      expect(wrapper.find('svg path').exists()).toBe(true)
+      expect(wrapper.classes()).toContain(client)
+    }
+  })
+
+  it('names the server e-Boekhouden MCP where the client allows it', () => {
+    expect(SERVER_NAMES.claude).toBe('e-Boekhouden MCP')
+    expect(SERVER_NAMES.codex).toMatch(/^[a-z0-9_-]+$/)
+    expect(SERVER_NAMES.claudeCode).toMatch(/^[a-z0-9_-]+$/)
+    expect(usesBridge('codex')).toBe(true)
+    expect(usesBridge('cursor')).toBe(false)
+  })
+})
+
+describe('instellingen', () => {
+  it('offers Openen bij inloggen and Toon in Dock as switches', async () => {
+    const wrapper = await mountAt('/instellingen')
+    const switches = wrapper.findAll('[role="switch"]').map((s) => s.attributes('aria-label'))
+    expect(switches).toEqual(['Openen bij inloggen', 'Toon in Dock'])
+    expect(wrapper.find('[aria-label="Toon in Dock"]').attributes('aria-checked')).toBe('false')
+    wrapper.unmount()
   })
 })

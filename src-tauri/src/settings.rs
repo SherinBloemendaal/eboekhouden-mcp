@@ -1,4 +1,5 @@
-//! Small app settings on disk (no secrets): the idle sign-out time and the appearance.
+//! Small app settings on disk (no secrets): the idle sign-out time, the appearance and the Dock icon.
+//! Opening at login is not kept here: the system's own login item is the truth (lib.rs, autostart).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,8 @@ pub struct Settings {
     /// Minutes without an AI call before an account is signed out.
     pub idle_minutes: u32,
     pub appearance: Appearance,
+    /// macOS: an icon in the Dock as well as in the menu bar. Off by default, like most menu-bar apps.
+    pub show_in_dock: bool,
 }
 
 impl Default for Settings {
@@ -31,6 +34,7 @@ impl Default for Settings {
         Self {
             idle_minutes: 30,
             appearance: Appearance::System,
+            show_in_dock: false,
         }
     }
 }
@@ -92,10 +96,12 @@ mod tests {
             .set(Settings {
                 idle_minutes: 60,
                 appearance: Appearance::Dark,
+                show_in_dock: true,
             })
             .unwrap();
         assert_eq!(SettingsStore::open(&dir).get().idle_minutes, 60);
         assert_eq!(SettingsStore::open(&dir).get().appearance, Appearance::Dark);
+        assert!(SettingsStore::open(&dir).get().show_in_dock);
     }
 }
 
@@ -110,8 +116,16 @@ mod older_files {
             settings,
             Settings {
                 idle_minutes: 15,
-                appearance: Appearance::System
+                appearance: Appearance::System,
+                show_in_dock: false,
             }
         );
+    }
+
+    #[test]
+    fn keeps_the_dock_choice() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"idleMinutes": 30, "showInDock": true}"#).unwrap();
+        assert!(settings.show_in_dock);
     }
 }

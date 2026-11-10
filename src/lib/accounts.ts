@@ -48,6 +48,8 @@ export type Appearance = 'system' | 'light' | 'dark'
 export interface Settings {
   idleMinutes: number
   appearance: Appearance
+  /** macOS: an icon in the Dock as well as in the menu bar. */
+  showInDock: boolean
 }
 
 /** One shared, reactive view of the accounts and their sign-ins. */
@@ -91,7 +93,7 @@ export const cancelSignIn = (id: string) => invoke('signin_cancel', { id })
 export const sendCode = (id: string, code: string) => invoke('signin_code', { id, code })
 export const signOut = (id: string) => invoke('sign_out', { id }).finally(refresh)
 export const signOutAll = () => invoke('sign_out_all').finally(refresh)
-export const getSettings = () => (inApp() ? invoke<Settings>('settings_get') : Promise.resolve<Settings>({ idleMinutes: 30, appearance: 'system' }))
+export const getSettings = () => (inApp() ? invoke<Settings>('settings_get') : Promise.resolve<Settings>({ idleMinutes: 30, appearance: 'system', showInDock: false }))
 export const saveSettings = (value: Settings) => invoke('settings_set', { value })
 
 export function dismissSignin(id: string): void {

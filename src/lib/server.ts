@@ -31,6 +31,15 @@ export async function openEboekhouden(): Promise<void> {
   if (inApp()) await invoke('open_eboekhouden')
 }
 
+/** Sizes the menu-bar panel to its content (logical pixels; the app keeps it between limits). */
+export async function fitPanel(height: number): Promise<void> {
+  if (inApp()) await invoke('panel_fit', { height })
+}
+
+/** Whether the system opens EB MCP at login (its own login item, not a setting of ours). */
+export const autostartGet = (): Promise<boolean> => (inApp() ? invoke<boolean>('autostart_get') : Promise.resolve(false))
+export const autostartSet = (enabled: boolean): Promise<boolean> => invoke<boolean>('autostart_set', { enabled })
+
 export async function quitApp(): Promise<void> {
   if (inApp()) await invoke('quit')
 }

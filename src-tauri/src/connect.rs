@@ -1,6 +1,6 @@
 //! Koppelen: writes the EB MCP entry into the MCP config of Claude Desktop,
-//! Cursor or Claude Code, after the user saw exactly what changes. A backup goes next to
-//! the file first; a file that is not valid JSON is never touched; after
+//! Cursor, Claude Code or Codex, after the user saw exactly what changes. A backup goes next to
+//! the file first; a file that is not valid JSON (or TOML, for Codex) is never touched; after
 //! writing, the file is read back to check.
 
 use std::fs;
@@ -9,7 +9,19 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-pub const ENTRY: &str = "eb-mcp";
+/// The name before 0.1.2. A client that only has this entry shows as Stale, and
+/// Koppelen replaces it with the entry under the new name.
+pub const LEGACY: &str = "eb-mcp";
+
+/// The server's name in each client's config, which is what the client shows.
+/// Claude Code and Codex only accept letters, digits, `-` and `_` there, since the
+/// name becomes part of every tool name.
+pub fn name(client: Client) -> &'static str {
+    match client {
+        Client::Claude | Client::Cursor => "e-Boekhouden MCP",
+        Client::ClaudeCode | Client::Codex => "e-boekhouden",
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,6 +29,7 @@ pub enum Client {
     Claude,
     Cursor,
     ClaudeCode,
+    Codex,
 }
 
 /// How Claude Desktop starts EB MCP: the bridge next to the app. Release builds
@@ -57,7 +70,11 @@ pub struct Preview {
     pub exists: bool,
     pub other_servers: Vec<String>,
     pub replaces: bool,
+    /// There is still an entry under the old name eb-mcp, which Koppelen removes.
+    pub legacy: bool,
     pub entry: Value,
+    /// For Codex: the exact TOML table that will be written, since its file is not JSON.
+    pub toml: Option<String>,
     pub backup: String,
 }
 
@@ -65,6 +82,8 @@ pub struct Paths {
     pub home: PathBuf,
     /// %APPDATA% on Windows.
     pub app_data: Option<PathBuf>,
+    /// $CODEX_HOME, when Codex keeps its config somewhere other than ~/.codex.
+    pub codex_home: Option<PathBuf>,
 }
 
 impl Paths {
@@ -72,6 +91,7 @@ impl Paths {
         Self {
             home: dirs_home(),
             app_data: std::env::var_os("APPDATA").map(PathBuf::from),
+            codex_home: std::env::var_os("CODEX_HOME").map(PathBuf::from),
         }
     }
 
@@ -91,6 +111,11 @@ impl Paths {
                 .join("claude_desktop_config.json"),
             Client::Cursor => self.home.join(".cursor").join("mcp.json"),
             Client::ClaudeCode => self.home.join(".claude.json"),
+            Client::Codex => self
+                .codex_home
+                .clone()
+                .unwrap_or_else(|| self.home.join(".codex"))
+                .join("config.toml"),
         }
     }
 }
@@ -103,11 +128,12 @@ fn dirs_home() -> PathBuf {
 }
 
 /// The entry for a client. Claude Desktop only starts stdio servers, so it gets
-/// the bridge, which finds the token itself; Cursor and Claude Code speak HTTP
-/// and get the URL with the token header.
+/// the bridge, which finds the token itself. Codex gets the bridge too, so its
+/// config holds no token either. Cursor and Claude Code speak HTTP and get the
+/// URL with the token header.
 pub fn entry(client: Client, url: &str, token: &str, bridge: &Bridge) -> Value {
     match client {
-        Client::Claude => {
+        Client::Claude | Client::Codex => {
             let mut args = vec![json!("--url"), json!(url)];
             if let Some(file) = &bridge.token_file {
                 args.push(json!("--token-file"));
@@ -140,6 +166,91 @@ pub fn mask(value: &Value, token: &str) -> Value {
         Value::Array(items) => Value::Array(items.iter().map(|v| mask(v, token)).collect()),
         other => other.clone(),
     }
+}
+
+fn is_toml(client: Client) -> bool {
+    client == Client::Codex
+}
+
+/// The servers in a client's config, the same shape for JSON and TOML.
+/// `None` when the file does not exist.
+fn load_servers(path: &Path, client: Client) -> Result<Option<Map<String, Value>>, String> {
+    if is_toml(client) {
+        return Ok(read_toml(path)?.map(|doc| toml_servers(&doc)));
+    }
+    Ok(read(path)?.map(|config| servers(&config).cloned().unwrap_or_default()))
+}
+
+fn read_toml(path: &Path) -> Result<Option<toml_edit::DocumentMut>, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => text
+            .parse::<toml_edit::DocumentMut>()
+            .map(Some)
+            .map_err(|e| {
+                let first = e.to_string();
+                let first = first.lines().next().unwrap_or_default().trim().to_owned();
+                format!("{} is geen geldige TOML: {first}", file_name(path))
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{} is niet te lezen: {e}", file_name(path))),
+    }
+}
+
+/// Codex's `[mcp_servers.<name>]` tables as JSON: command and args, or url.
+fn toml_servers(doc: &toml_edit::DocumentMut) -> Map<String, Value> {
+    let Some(table) = doc.get("mcp_servers").and_then(|t| t.as_table_like()) else {
+        return Map::new();
+    };
+    table
+        .iter()
+        .map(|(key, item)| {
+            let mut entry = Map::new();
+            if let Some(server) = item.as_table_like() {
+                if let Some(command) = server.get("command").and_then(|v| v.as_str()) {
+                    entry.insert("command".into(), json!(command));
+                }
+                if let Some(args) = server.get("args").and_then(|v| v.as_array()) {
+                    let args: Vec<Value> = args
+                        .iter()
+                        .map(|a| json!(a.as_str().unwrap_or_default()))
+                        .collect();
+                    entry.insert("args".into(), Value::Array(args));
+                }
+                if let Some(url) = server.get("url").and_then(|v| v.as_str()) {
+                    entry.insert("url".into(), json!(url));
+                }
+            }
+            (key.to_owned(), Value::Object(entry))
+        })
+        .collect()
+}
+
+/// The `[mcp_servers.<name>]` table for a stdio entry (command and args).
+fn toml_table(entry: &Value) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    if let Some(command) = entry.get("command").and_then(Value::as_str) {
+        table.insert("command", toml_edit::value(command));
+    }
+    let mut args = toml_edit::Array::new();
+    for arg in entry
+        .get("args")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        args.push(arg.as_str().unwrap_or_default());
+    }
+    table.insert("args", toml_edit::value(args));
+    table
+}
+
+fn toml_snippet(client: Client, entry: &Value) -> String {
+    let mut doc = toml_edit::DocumentMut::new();
+    let mut servers = toml_edit::Table::new();
+    servers.set_implicit(true);
+    servers.insert(name(client), toml_edit::Item::Table(toml_table(entry)));
+    doc.insert("mcp_servers", toml_edit::Item::Table(servers));
+    doc.to_string()
 }
 
 fn read(path: &Path) -> Result<Option<Value>, String> {
@@ -188,7 +299,7 @@ pub fn backup_path(path: &Path) -> PathBuf {
 /// clients the current token.
 fn is_current(client: Client, entry: &Value, url: &str, token: &str, bridge: &Bridge) -> bool {
     match client {
-        Client::Claude => entry == &self::entry(client, url, token, bridge),
+        Client::Claude | Client::Codex => entry == &self::entry(client, url, token, bridge),
         Client::Cursor | Client::ClaudeCode => {
             entry
                 .pointer("/headers/Authorization")
@@ -206,15 +317,17 @@ pub fn status(
     bridge: &Bridge,
 ) -> ClientStatus {
     let path = paths.config(client);
-    let (state, error) = match read(&path) {
+    let (state, error) = match load_servers(&path, client) {
         Err(e) => (LinkState::Broken, Some(e)),
         Ok(None) => (LinkState::None, None),
-        Ok(Some(config)) => match servers(&config).and_then(|s| s.get(ENTRY)) {
-            None => (LinkState::None, None),
+        Ok(Some(servers)) => match servers.get(name(client)) {
             Some(entry) if is_current(client, entry, url, token, bridge) => {
                 (LinkState::Linked, None)
             }
             Some(_) => (LinkState::Stale, None),
+            // Only the entry under the old name: Koppelen writes it again under the new one.
+            None if servers.contains_key(LEGACY) => (LinkState::Stale, None),
+            None => (LinkState::None, None),
         },
     };
     ClientStatus {
@@ -233,23 +346,23 @@ pub fn preview(
     bridge: &Bridge,
 ) -> Result<Preview, String> {
     let path = paths.config(client);
-    let config = read(&path)?;
-    let others: Vec<String> = config
+    let servers = load_servers(&path, client)?;
+    let ours = |k: &str| k == name(client) || k == LEGACY;
+    let others: Vec<String> = servers
         .as_ref()
-        .and_then(servers)
-        .map(|s| s.keys().filter(|k| *k != ENTRY).cloned().collect())
+        .map(|s| s.keys().filter(|k| !ours(k)).cloned().collect())
         .unwrap_or_default();
-    let replaces = config
-        .as_ref()
-        .and_then(servers)
-        .is_some_and(|s| s.contains_key(ENTRY));
+    let replaces = servers.as_ref().is_some_and(|s| s.keys().any(|k| ours(k)));
+    let entry = mask(&entry(client, url, token, bridge), token);
     Ok(Preview {
         client,
         path: path.to_string_lossy().into_owned(),
-        exists: config.is_some(),
+        exists: servers.is_some(),
         other_servers: others,
         replaces,
-        entry: mask(&entry(client, url, token, bridge), token),
+        legacy: servers.as_ref().is_some_and(|s| s.contains_key(LEGACY)),
+        toml: is_toml(client).then(|| toml_snippet(client, &entry)),
+        entry,
         backup: file_name(&backup_path(&path)),
     })
 }
@@ -263,6 +376,13 @@ pub fn link(
     bridge: &Bridge,
 ) -> Result<(), String> {
     let path = paths.config(client);
+    if is_toml(client) {
+        link_toml(&path, client, &entry(client, url, token, bridge))?;
+        return match status(paths, client, url, token, bridge).state {
+            LinkState::Linked => Ok(()),
+            _ => Err("Het bestand is geschreven, maar EB MCP leest de koppeling niet terug".into()),
+        };
+    }
     let mut config = read(&path)?.unwrap_or_else(|| json!({}));
     let Some(root) = config.as_object_mut() else {
         return Err(format!(
@@ -274,7 +394,8 @@ pub fn link(
     let Some(servers) = servers.as_object_mut() else {
         return Err("mcpServers in het bestand is geen object".into());
     };
-    servers.insert(ENTRY.into(), entry(client, url, token, bridge));
+    servers.remove(LEGACY);
+    servers.insert(name(client).into(), entry(client, url, token, bridge));
     write(&path, &config)?;
     match status(paths, client, url, token, bridge).state {
         LinkState::Linked => Ok(()),
@@ -282,24 +403,59 @@ pub fn link(
     }
 }
 
+/// Codex: replaces our table in `[mcp_servers]`; comments and every other setting stay.
+fn link_toml(path: &Path, client: Client, entry: &Value) -> Result<(), String> {
+    let mut doc = read_toml(path)?.unwrap_or_default();
+    let servers = doc.entry("mcp_servers").or_insert_with(|| {
+        let mut table = toml_edit::Table::new();
+        table.set_implicit(true);
+        toml_edit::Item::Table(table)
+    });
+    let Some(servers) = servers.as_table_like_mut() else {
+        return Err("mcp_servers in het bestand is geen tabel".into());
+    };
+    servers.remove(LEGACY);
+    servers.insert(name(client), toml_edit::Item::Table(toml_table(entry)));
+    write_text(path, &doc.to_string())
+}
+
 pub fn unlink(paths: &Paths, client: Client) -> Result<(), String> {
     let path = paths.config(client);
+    if is_toml(client) {
+        let Some(mut doc) = read_toml(&path)? else {
+            return Ok(());
+        };
+        let removed = doc
+            .get_mut("mcp_servers")
+            .and_then(|s| s.as_table_like_mut())
+            .map(|s| s.remove(name(client)).is_some() | s.remove(LEGACY).is_some())
+            .unwrap_or(false);
+        if removed {
+            write_text(&path, &doc.to_string())?;
+        }
+        return Ok(());
+    }
     let Some(mut config) = read(&path)? else {
         return Ok(());
     };
     let removed = config
         .get_mut("mcpServers")
         .and_then(Value::as_object_mut)
-        .and_then(|s| s.remove(ENTRY))
-        .is_some();
+        .map(|s| s.remove(name(client)).is_some() | s.remove(LEGACY).is_some())
+        .unwrap_or(false);
     if removed {
         write(&path, &config)?;
     }
     Ok(())
 }
 
-/// Backup first, then write next to the file and rename over it.
 fn write(path: &Path, config: &Value) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(config).map_err(|e| e.to_string())? + "\n";
+    write_text(path, &text)
+}
+
+/// Backup first, then write next to the file and rename over it.
+fn write_text(path: &Path, text: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)
             .map_err(|e| format!("Map {} is niet te maken: {e}", dir.display()))?;
@@ -307,8 +463,12 @@ fn write(path: &Path, config: &Value) -> Result<(), String> {
     if path.exists() {
         fs::copy(path, backup_path(path)).map_err(|e| format!("Reservekopie mislukt: {e}"))?;
     }
-    let text = serde_json::to_string_pretty(config).map_err(|e| e.to_string())? + "\n";
-    let tmp = path.with_extension("json.eb-mcp-tmp");
+    let mut tmp_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    tmp_name.push(".eb-mcp-tmp");
+    let tmp = path.with_file_name(tmp_name);
     fs::write(&tmp, text).map_err(|e| format!("Schrijven mislukt: {e}"))?;
     fs::rename(&tmp, path).map_err(|e| format!("Schrijven mislukt: {e}"))
 }
@@ -326,6 +486,7 @@ mod tests {
         Paths {
             home,
             app_data: None,
+            codex_home: None,
         }
     }
 
@@ -355,7 +516,7 @@ mod tests {
         assert_eq!(written["andere"], 1);
         assert_eq!(written["mcpServers"]["agenda"]["url"], "http://x");
         assert_eq!(
-            written["mcpServers"][ENTRY]["headers"]["Authorization"],
+            written["mcpServers"][name(Client::Cursor)]["headers"]["Authorization"],
             format!("Bearer {TOKEN}")
         );
         assert!(backup_path(&file).exists());
@@ -375,7 +536,10 @@ mod tests {
         link(&p, Client::Claude, URL, TOKEN, &bridge()).unwrap();
         let text = fs::read_to_string(p.config(Client::Claude)).unwrap();
         let written: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(written["mcpServers"][ENTRY]["args"], json!(["--url", URL]));
+        assert_eq!(
+            written["mcpServers"]["e-Boekhouden MCP"]["args"],
+            json!(["--url", URL])
+        );
         assert!(
             !text.contains(TOKEN),
             "Claude's config must not hold the token"
@@ -392,7 +556,8 @@ mod tests {
         let p = paths();
         let file = p.config(Client::Claude);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
-        let old = json!({"mcpServers": {ENTRY: {"command": bridge().path, "args": ["--url", URL], "env": {"EB_MCP_TOKEN": TOKEN}}}});
+        let ours = name(Client::Claude);
+        let old = json!({"mcpServers": {ours: {"command": bridge().path, "args": ["--url", URL], "env": {"EB_MCP_TOKEN": TOKEN}}}});
         fs::write(&file, old.to_string()).unwrap();
         assert_eq!(
             status(&p, Client::Claude, URL, TOKEN, &bridge()).state,
@@ -423,9 +588,9 @@ mod tests {
             written["numStartups"], 12,
             "Claude Code's own settings stay"
         );
-        assert_eq!(written["mcpServers"][ENTRY]["type"], "http");
+        assert_eq!(written["mcpServers"]["e-boekhouden"]["type"], "http");
         assert_eq!(
-            written["mcpServers"][ENTRY]["headers"]["Authorization"],
+            written["mcpServers"][name(Client::ClaudeCode)]["headers"]["Authorization"],
             format!("Bearer {TOKEN}")
         );
         assert!(file.ends_with(".claude.json"));
@@ -468,5 +633,114 @@ mod tests {
         let written: Value =
             serde_json::from_str(&fs::read_to_string(p.config(Client::Cursor)).unwrap()).unwrap();
         assert_eq!(written["mcpServers"], json!({}));
+    }
+
+    #[test]
+    fn renames_the_old_eb_mcp_entry() {
+        let p = paths();
+        let file = p.config(Client::Cursor);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            &file,
+            json!({"mcpServers": {LEGACY: {"url": URL}, "agenda": {}}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            status(&p, Client::Cursor, URL, TOKEN, &bridge()).state,
+            LinkState::Stale
+        );
+        let preview = preview(&p, Client::Cursor, URL, TOKEN, &bridge()).unwrap();
+        assert!(preview.replaces);
+        assert!(preview.legacy);
+        assert_eq!(preview.other_servers, vec!["agenda".to_string()]);
+        link(&p, Client::Cursor, URL, TOKEN, &bridge()).unwrap();
+        let written: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert!(written["mcpServers"].get(LEGACY).is_none());
+        assert!(written["mcpServers"].get("e-Boekhouden MCP").is_some());
+        unlink(&p, Client::Cursor).unwrap();
+        let written: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(written["mcpServers"], json!({"agenda": {}}));
+    }
+
+    #[test]
+    fn links_codex_in_toml_with_the_bridge_and_keeps_the_rest() {
+        let p = paths();
+        let file = p.config(Client::Codex);
+        assert!(file.ends_with(".codex/config.toml"));
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let before = "# mijn instellingen\nmodel = \"gpt-5\"\n\n[mcp_servers.agenda]\ncommand = \"agenda\"\n\n[mcp_servers.eb-mcp]\nurl = \"http://old\"\n";
+        fs::write(&file, before).unwrap();
+        assert_eq!(
+            status(&p, Client::Codex, URL, TOKEN, &bridge()).state,
+            LinkState::Stale
+        );
+        let preview = preview(&p, Client::Codex, URL, TOKEN, &bridge()).unwrap();
+        assert_eq!(preview.other_servers, vec!["agenda".to_string()]);
+        assert!(
+            preview
+                .toml
+                .as_deref()
+                .unwrap()
+                .contains("[mcp_servers.e-boekhouden]"),
+            "{:?}",
+            preview.toml
+        );
+        link(&p, Client::Codex, URL, TOKEN, &bridge()).unwrap();
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(
+            text.starts_with("# mijn instellingen\nmodel = \"gpt-5\""),
+            "{text}"
+        );
+        assert!(text.contains("[mcp_servers.agenda]"));
+        assert!(!text.contains("eb-mcp]"), "{text}");
+        assert!(text.contains("[mcp_servers.e-boekhouden]"), "{text}");
+        assert!(
+            !text.contains(TOKEN),
+            "Codex's config must not hold the token"
+        );
+        assert!(backup_path(&file).exists());
+        assert_eq!(
+            status(&p, Client::Codex, URL, "renewed", &bridge()).state,
+            LinkState::Linked
+        );
+        unlink(&p, Client::Codex).unwrap();
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("e-boekhouden"), "{text}");
+        assert!(text.contains("[mcp_servers.agenda]"));
+    }
+
+    #[test]
+    fn creates_codex_config_when_missing_and_refuses_broken_toml() {
+        let p = paths();
+        link(&p, Client::Codex, URL, TOKEN, &bridge()).unwrap();
+        assert_eq!(
+            status(&p, Client::Codex, URL, TOKEN, &bridge()).state,
+            LinkState::Linked
+        );
+        let file = p.config(Client::Codex);
+        fs::write(&file, "[mcp_servers\nbroken").unwrap();
+        assert_eq!(
+            status(&p, Client::Codex, URL, TOKEN, &bridge()).state,
+            LinkState::Broken
+        );
+        assert!(
+            link(&p, Client::Codex, URL, TOKEN, &bridge())
+                .unwrap_err()
+                .contains("geen geldige TOML")
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "[mcp_servers\nbroken");
+    }
+
+    #[test]
+    fn codex_honours_codex_home() {
+        let p = Paths {
+            home: PathBuf::from("/h"),
+            app_data: None,
+            codex_home: Some(PathBuf::from("/elders")),
+        };
+        assert_eq!(
+            p.config(Client::Codex),
+            PathBuf::from("/elders/config.toml")
+        );
     }
 }

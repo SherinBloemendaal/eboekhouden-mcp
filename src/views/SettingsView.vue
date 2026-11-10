@@ -2,13 +2,26 @@
 // Instellingen (Cmd+,): appearance and when sessions end. Changes save at once, as in macOS settings.
 import { onMounted, ref } from 'vue'
 import { getSettings, saveSettings, type Appearance, type Settings } from '../lib/accounts'
+import { autostartGet, autostartSet } from '../lib/server'
 
 const settings = ref<Settings | null>(null)
 const error = ref<string | null>(null)
+const autostart = ref(false)
+const isMac = !navigator.userAgent.includes('Windows')
 
 onMounted(async () => {
   settings.value = await getSettings()
+  autostart.value = await autostartGet().catch(() => false)
 })
+
+async function toggleAutostart() {
+  error.value = null
+  try {
+    autostart.value = await autostartSet(!autostart.value)
+  } catch (e) {
+    error.value = String(e)
+  }
+}
 
 async function save(patch: Partial<Settings>) {
   if (!settings.value) return
@@ -31,6 +44,18 @@ const appearances: { value: Appearance; label: string }[] = [
 
 <template>
   <div v-if="settings" class="page">
+    <h2 class="section">Algemeen</h2>
+    <section class="group card">
+      <div class="row">
+        <span class="text"><strong>Openen bij inloggen</strong><small>EB MCP start dan op de achtergrond, alleen in de menubalk.</small></span>
+        <button type="button" role="switch" class="switch" :aria-checked="autostart" aria-label="Openen bij inloggen" @click="toggleAutostart"><span /></button>
+      </div>
+      <div v-if="isMac" class="row">
+        <span class="text"><strong>Toon in Dock</strong><small>Uit: alleen in de menubalk. Sluit je het venster, dan blijft EB MCP altijd draaien.</small></span>
+        <button type="button" role="switch" class="switch" :aria-checked="settings.showInDock" aria-label="Toon in Dock" @click="save({ showInDock: !settings.showInDock })"><span /></button>
+      </div>
+    </section>
+    <h2 class="section">Weergave en sessies</h2>
     <section class="group card">
       <div class="row">
         <span class="text"><strong>Weergave</strong><small>Systeem volgt de instelling van je Mac.</small></span>
@@ -67,6 +92,17 @@ const appearances: { value: Appearance; label: string }[] = [
 .seg button:hover { background: var(--hover); }
 .seg button.on { background: var(--seg-on); box-shadow: var(--seg-on-shadow); font-weight: 500; }
 .select { height: 24px; padding: 0 8px; border: 0; border-radius: 7px; background: var(--glass-bar); box-shadow: var(--glass-bar-edge); }
+.section { margin: 18px 4px 8px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.section:first-child { margin-top: 0; }
+.group + .section { margin-top: 22px; }
+.switch { position: relative; width: 38px; height: 22px; flex: none; padding: 0; border: 0; border-radius: 999px; background: var(--subtle); box-shadow: inset 0 0 0 0.5px var(--line); transition: background-color 200ms var(--ease), filter 150ms ease; }
+.switch span { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25); transition: transform 200ms var(--ease); }
+.switch[aria-checked='true'] { background: var(--accent); }
+.switch[aria-checked='true'] span { transform: translateX(16px); }
+.switch:hover { filter: brightness(0.97); }
+.switch:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.42); }
+.card .row:last-child { border-bottom: 0; }
+@media (prefers-reduced-motion: reduce) { .switch, .switch span { transition-duration: 1ms; } }
 .hint { margin-top: 12px; font-size: 12px; color: var(--muted); }
 .error { margin-top: 8px; font-size: 12px; color: var(--danger); }
 </style>

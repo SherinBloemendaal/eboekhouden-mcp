@@ -286,6 +286,7 @@ fn clients_status(app: AppHandle, server: Shared<'_, Server>) -> Vec<connect::Cl
         connect::Client::Claude,
         connect::Client::Cursor,
         connect::Client::ClaudeCode,
+        connect::Client::Codex,
     ]
     .into_iter()
     .map(|c| connect::status(&paths, c, &mcp::url(), &token, &bridge))
@@ -313,8 +314,11 @@ fn connect_link(
     server: Shared<'_, Server>,
     client: connect::Client,
 ) -> Result<(), String> {
-    if client == connect::Client::Claude && !bridge_path().is_file() {
-        return Err("De brug voor Claude (eb-mcp-bridge) ontbreekt naast de app. Installeer EB MCP opnieuw.".into());
+    let needs_bridge = matches!(client, connect::Client::Claude | connect::Client::Codex);
+    if needs_bridge && !bridge_path().is_file() {
+        return Err(
+            "De brug (eb-mcp-bridge) ontbreekt naast de app. Installeer EB MCP opnieuw.".into(),
+        );
     }
     connect::link(
         &connect::Paths::system(),
@@ -333,7 +337,7 @@ fn connect_unlink(client: connect::Client) -> Result<(), String> {
 /// Settings to paste into any other MCP client that speaks HTTP. Contains the token: only on request.
 #[tauri::command]
 fn other_client_settings(server: Shared<'_, Server>) -> String {
-    let value = serde_json::json!({ "eb-mcp": { "url": mcp::url(), "headers": { "Authorization": format!("Bearer {}", server.token()) } } });
+    let value = serde_json::json!({ "e-boekhouden": { "url": mcp::url(), "headers": { "Authorization": format!("Bearer {}", server.token()) } } });
     serde_json::to_string_pretty(&value).unwrap_or_default()
 }
 
@@ -379,10 +383,49 @@ fn settings_set(
     settings: Shared<'_, SettingsStore>,
     value: Settings,
 ) -> Result<(), String> {
-    let appearance = value.appearance;
+    let (appearance, dock) = (value.appearance, value.show_in_dock);
     settings.set(value)?;
     apply_appearance(&app, appearance);
+    apply_dock(&app, dock);
     Ok(())
+}
+
+/// macOS: with the Dock icon EB MCP is a regular app (Dock, Cmd+Tab); without it only the menu-bar
+/// icon shows. Either way it keeps running in the background when its window is closed.
+fn apply_dock(app: &AppHandle, show: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        let policy = if show {
+            tauri::ActivationPolicy::Regular
+        } else {
+            tauri::ActivationPolicy::Accessory
+        };
+        let _ = app.set_activation_policy(policy);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, show);
+}
+
+/// Started by the login item: stay in the menu bar instead of opening the window.
+const AUTOSTART_ARG: &str = "--autostart";
+
+#[tauri::command]
+fn autostart_get(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn autostart_set(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    }
+    .map_err(|e| format!("Openen bij inloggen lukte niet: {e}"))?;
+    manager.is_enabled().map_err(|e| e.to_string())
 }
 
 /// Sets EB MCP's own windows to light, dark or the system's choice; the pages follow
@@ -438,6 +481,33 @@ async fn quit(app: AppHandle, app_state: Shared<'_, AppState>) -> Result<(), Str
     Ok(())
 }
 
+/// The panel takes the height of its content (PanelView measures it), between limits that keep it
+/// on screen. On Windows it opens above the tray, so the bottom edge stays where it is.
+#[tauri::command]
+fn panel_fit(app: AppHandle, height: f64) {
+    let Some(panel) = app.get_webview_window(PANEL) else {
+        return;
+    };
+    let height = height.clamp(PANEL_MIN_HEIGHT, PANEL_MAX_HEIGHT);
+    let scale = panel.scale_factor().unwrap_or(1.0);
+    let before = panel.outer_size().ok();
+    if before.is_some_and(|s| (s.height as f64 - height * scale).abs() < 1.0) {
+        return;
+    }
+    let _ = panel.set_size(tauri::LogicalSize::new(PANEL_WIDTH, height));
+    if cfg!(target_os = "windows")
+        && let (Some(before), Ok(pos), Ok(after)) =
+            (before, panel.outer_position(), panel.outer_size())
+    {
+        let shift = before.height as i32 - after.height as i32;
+        let _ = panel.set_position(PhysicalPosition::new(pos.x, pos.y + shift));
+    }
+}
+
+const PANEL_WIDTH: f64 = 336.0;
+const PANEL_MIN_HEIGHT: f64 = 160.0;
+const PANEL_MAX_HEIGHT: f64 = 640.0;
+
 fn toggle_panel(app: &AppHandle, rect: tauri::Rect) {
     let Some(panel) = app.get_webview_window(PANEL) else {
         return;
@@ -481,6 +551,10 @@ pub fn run() {
         )
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![AUTOSTART_ARG]),
+        ))
         .manage(updates::UpdateListener::default())
         // A new page in the main window does not listen for Sparkle's relaunch question until it says so (updates.rs).
         .on_page_load(|webview, payload| {
@@ -491,6 +565,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             server_info,
+            panel_fit,
+            autostart_get,
+            autostart_set,
             accounts_list,
             account_add,
             account_update,
@@ -525,9 +602,6 @@ pub fn run() {
             quit
         ])
         .setup(|app| {
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-
             // macOS updates through Sparkle; Windows through Tauri's updater, only in builds that carry its
             // configuration (release builds, scripts/release-config.mjs).
             #[cfg(target_os = "macos")]
@@ -542,6 +616,12 @@ pub fn run() {
             let accounts = AccountStore::open(&dir).map_err(std::io::Error::other)?;
             let settings = Arc::new(SettingsStore::open(&dir));
             apply_appearance(app.handle(), settings.get().appearance);
+            apply_dock(app.handle(), settings.get().show_in_dock);
+            if std::env::args().any(|a| a == AUTOSTART_ARG)
+                && let Some(main) = app.get_webview_window(MAIN)
+            {
+                let _ = main.hide();
+            }
             let app_state = Arc::new(AppState::new(
                 accounts,
                 EbClient::production(),
@@ -645,6 +725,19 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("EB MCP kon niet starten");
+        .build(tauri::generate_context!())
+        .expect("EB MCP kon niet starten")
+        .run(|app, event| {
+            // A click on the Dock icon (when it shows) opens the window again.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } = event
+            {
+                open_main(app.clone(), None);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }

@@ -134,7 +134,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("\"name\":\"eb-mcp\""), "{text}");
+        assert!(text.contains("\"title\":\"e-Boekhouden MCP\""), "{text}");
     }
 
     #[tokio::test]

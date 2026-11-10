@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import Alert from '../components/Alert.vue'
 import Avatar from '../components/Avatar.vue'
 import Icon from '../components/Icon.vue'
 import SigninSteps from '../components/SigninSteps.vue'
 import { cancelSignIn, clock, connect, dismissSignin, isRunning, signIn, signOut, signOutAll, since, store, type AccountView } from '../lib/accounts'
-import { openMain, quitApp, runningCalls, serverInfo, type ServerInfo } from '../lib/server'
+import { fitPanel, openMain, quitApp, runningCalls, serverInfo, type ServerInfo } from '../lib/server'
 import { checkNow } from '../lib/updates'
 
 const info = ref<ServerInfo | null>(null)
@@ -29,7 +29,7 @@ const items = [
   { icon: 'chart', label: 'Dashboard', route: '/dashboard' },
   { icon: 'list', label: 'Verzoeken', route: '/verzoeken' },
   { icon: 'users', label: 'Accounts beheren', route: '/accounts' },
-  { icon: 'plug', label: 'Koppelen met Claude of Cursor', route: '/koppelen' },
+  { icon: 'plug', label: 'Koppelen met een AI-client', route: '/koppelen' },
 ]
 
 function line(account: AccountView): string {
@@ -71,11 +71,29 @@ function onKey(event: KeyboardEvent) {
   }
 }
 onMounted(() => window.addEventListener('keydown', onKey))
+
+// The window takes the height of what it shows, so there is no empty glass under Afsluiten.
+// The quit alert needs room of its own while it is open.
+const content = ref<HTMLElement | null>(null)
+let frame = 0
+const fit = () => {
+  cancelAnimationFrame(frame)
+  frame = requestAnimationFrame(() => {
+    if (!content.value) return
+    const height = Math.ceil(content.value.getBoundingClientRect().height) + 6
+    void fitPanel(confirmQuit.value ? Math.max(height, 280) : height)
+  })
+}
+const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(fit)
+onMounted(() => content.value && observer?.observe(content.value))
+watch(confirmQuit, fit)
+onBeforeUnmount(() => observer?.disconnect())
 onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 </script>
 
 <template>
   <div class="panel" role="dialog" aria-label="EB MCP">
+    <div ref="content" class="panel-content">
     <div class="head">
       <img src="/app-icon.png" alt="" width="30" height="30" />
       <span class="name">
@@ -145,6 +163,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
       </span>
       <span class="kbd">⌘Q</span>
     </button>
+    </div>
     <Transition name="modal">
       <Alert v-if="confirmQuit" title="Toch afsluiten?" tone="warn" @close="confirmQuit = 0">
         <p>{{ confirmQuit === 1 ? 'Er loopt nog 1 aanroep' : `Er lopen nog ${confirmQuit} aanroepen` }} van een AI-client. Die krijgt dan een fout, en alle sessies worden uitgelogd.</p>
@@ -158,7 +177,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 </template>
 
 <style scoped>
-.panel { height: 100%; box-sizing: border-box; padding: 0 6px 6px; display: flex; flex-direction: column; overflow-y: auto; }
+.panel { height: 100%; box-sizing: border-box; padding: 0 6px 6px; overflow-y: auto; }
+.panel-content { display: flex; flex-direction: column; }
 .head { display: flex; align-items: center; gap: 10px; padding: 12px 8px 8px; }
 .head img { border-radius: 7px; }
 .name { display: flex; flex-direction: column; flex: 1; min-width: 0; }

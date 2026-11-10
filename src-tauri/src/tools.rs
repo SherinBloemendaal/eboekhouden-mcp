@@ -11,7 +11,7 @@ use std::sync::{Arc, LazyLock};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
+    model::{CallToolResult, ContentBlock, Icon, Implementation, ServerCapabilities, ServerConfig},
     schemars::{self, JsonSchema},
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -886,11 +886,30 @@ impl EbMcp {
     }
 }
 
+/// How clients name and picture the server: "e-Boekhouden MCP" with the app icon, sent inline so it
+/// works without network access.
+fn server_info() -> Implementation {
+    use base64::Engine;
+    let png =
+        base64::engine::general_purpose::STANDARD.encode(include_bytes!("../icons/128x128.png"));
+    let icon: Icon = serde_json::from_value(serde_json::json!({
+        "src": format!("data:image/png;base64,{png}"),
+        "mimeType": "image/png",
+        "sizes": ["128x128"],
+    }))
+    .expect("a valid MCP icon");
+    Implementation::new("e-boekhouden", env!("CARGO_PKG_VERSION"))
+        .with_title("e-Boekhouden MCP")
+        .with_description("Leest je boekhouding in e-Boekhouden, alleen lezen.")
+        .with_website_url("https://sherin.dev/eb-mcp/")
+        .with_icons(vec![icon])
+}
+
 #[tool_handler]
 impl ServerHandler for EbMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("eb-mcp", env!("CARGO_PKG_VERSION")).with_title("EB MCP"))
+            .with_server_info(server_info())
             .with_instructions(
                 "Leest de boekhouding in e-Boekhouden van de accounts die in EB MCP zijn ingelogd. Alleen lezen: niets boeken, opslaan of verwijderen. \
                  Zonder account-parameter gebruikt elke tool het standaardaccount; status zegt welke accounts er zijn.",
@@ -901,6 +920,19 @@ impl ServerHandler for EbMcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_itself_e_boekhouden_mcp_with_the_app_icon() {
+        let info = server_info();
+        assert_eq!(info.name, "e-boekhouden");
+        assert_eq!(info.title.as_deref(), Some("e-Boekhouden MCP"));
+        let icon = &info.icons.as_ref().unwrap()[0];
+        assert!(
+            icon.src.starts_with("data:image/png;base64,iVBOR"),
+            "{}",
+            &icon.src[..40]
+        );
+    }
 
     #[test]
     fn allows_reads_from_the_map_only() {
