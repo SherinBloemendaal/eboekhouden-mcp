@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- app.svg simplified for 16 and 32 px: a bigger page with two solid rows and a plain green dot,
+       no shadows, so it stays sharp on so few pixels. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4F7DFF"/>
+      <stop offset="1" stop-color="#1F3FBF"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
+  <rect x="216" y="184" width="480" height="616" rx="80" fill="#FFFFFF"/>
+  <rect x="300" y="300" width="312" height="88" rx="44" fill="#5A7EE8"/>
+  <rect x="300" y="460" width="220" height="88" rx="44" fill="#5A7EE8"/>
+  <circle cx="704" cy="704" r="196" fill="#2448D2"/>
+  <circle cx="704" cy="704" r="160" fill="#22C46F"/>
+</svg>
