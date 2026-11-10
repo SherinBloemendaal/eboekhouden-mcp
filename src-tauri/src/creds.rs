@@ -95,6 +95,130 @@ fn read_1password(reference: &str) -> Result<Credentials, CredError> {
     Ok(Credentials { username, password })
 }
 
+/// A login in 1Password, as the picker shows it. Never carries a password.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpItem {
+    /// `op://<vault id>/<item id>`: ids keep working when the item or vault is renamed.
+    pub reference: String,
+    pub title: String,
+    pub vault: String,
+    pub username: String,
+    /// The item is for e-Boekhouden: its website or title says so.
+    pub suggested: bool,
+}
+
+/// Why the list could not be read. The picker shows a fitting notice per kind.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", content = "message", rename_all = "camelCase")]
+pub enum OpListError {
+    /// No `op` binary on this machine.
+    Missing,
+    /// 1Password is locked, or the user declined the prompt.
+    Locked,
+    Other(String),
+}
+
+/// Lists the Login items through `op item list`. The 1Password app asks the user for consent itself.
+pub async fn op_items() -> Result<Vec<OpItem>, OpListError> {
+    tokio::task::spawn_blocking(|| {
+        let op = op_binary().ok_or(OpListError::Missing)?;
+        let output = Command::new(&op)
+            .args(["item", "list", "--categories", "Login", "--format", "json"])
+            .output()
+            .map_err(|e| OpListError::Other(format!("1Password-CLI start niet: {e}")))?;
+        if !output.status.success() {
+            return Err(list_error(&String::from_utf8_lossy(&output.stderr)));
+        }
+        parse_items(&output.stdout)
+    })
+    .await
+    .map_err(|e| OpListError::Other(e.to_string()))?
+}
+
+fn list_error(stderr: &str) -> OpListError {
+    let lower = stderr.to_lowercase();
+    if lower.contains("locked")
+        || lower.contains("authorization")
+        || lower.contains("signed in")
+        || lower.contains("sign in")
+        || lower.contains("dismissed")
+    {
+        OpListError::Locked
+    } else {
+        // The list's stderr holds no secrets; its first line helps when something odd happens.
+        let line = stderr
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or_default();
+        let line = line.split_once("] ").map_or(line, |(_, rest)| rest).trim();
+        OpListError::Other(if line.is_empty() {
+            "1Password gaf geen lijst met items".into()
+        } else {
+            format!("1Password gaf geen lijst met items: {line}")
+        })
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RawItem {
+    id: String,
+    #[serde(default)]
+    title: String,
+    vault: RawVault,
+    #[serde(default)]
+    additional_information: Option<String>,
+    #[serde(default)]
+    urls: Vec<RawUrl>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawVault {
+    id: String,
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RawUrl {
+    #[serde(default)]
+    href: String,
+}
+
+/// Parses `op item list --format json`, e-Boekhouden items first, then by title.
+pub fn parse_items(json: &[u8]) -> Result<Vec<OpItem>, OpListError> {
+    // `op` prints nothing at all when there are no items.
+    if json.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Vec::new());
+    }
+    let raw: Vec<RawItem> = serde_json::from_slice(json).map_err(|_| {
+        OpListError::Other("1Password gaf een lijst die EB MCP niet kan lezen".into())
+    })?;
+    let mut items: Vec<OpItem> = raw
+        .into_iter()
+        .filter(|r| !r.id.is_empty() && !r.vault.id.is_empty())
+        .map(|r| {
+            let suggested = r.title.to_lowercase().contains("boekhouden")
+                || r.urls
+                    .iter()
+                    .any(|u| u.href.to_lowercase().contains("e-boekhouden.nl"));
+            OpItem {
+                reference: format!("op://{}/{}", r.vault.id, r.id),
+                title: r.title,
+                vault: r.vault.name,
+                username: r.additional_information.unwrap_or_default(),
+                suggested,
+            }
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        b.suggested
+            .cmp(&a.suggested)
+            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+    });
+    Ok(items)
+}
+
 /// Turns `op`'s stderr into one line for the user, without echoing anything secret.
 pub fn op_message(stderr: &str, reference: &str) -> String {
     let lower = stderr.to_lowercase();
@@ -235,7 +359,64 @@ mod win {
 
 #[cfg(test)]
 mod tests {
-    use super::op_message;
+    use super::{OpListError, list_error, op_message, parse_items};
+
+    const LIST: &str = r#"[
+      {"id":"itm1","title":"Zakelijke bank","version":3,"vault":{"id":"vlt1","name":"Werk"},"category":"LOGIN",
+       "additional_information":"jan@studionoord.example","urls":[{"label":"website","primary":true,"href":"https://bank.example"}]},
+      {"id":"itm2","title":"Studio Noord","vault":{"id":"vlt1","name":"Werk"},"category":"LOGIN",
+       "additional_information":"jan@studionoord.example","urls":[{"primary":true,"href":"https://secure.e-Boekhouden.nl/bh/"}]},
+      {"id":"itm3","title":"e-Boekhouden (Praktijk West)","vault":{"id":"vlt2","name":"Privé"},"category":"LOGIN"},
+      {"id":"itm4","title":"agenda","vault":{"id":"vlt2","name":"Privé"},"category":"LOGIN","additional_information":"west"}
+    ]"#;
+
+    #[test]
+    fn lists_e_boekhouden_items_first_by_their_ids() {
+        let items = parse_items(LIST.as_bytes()).unwrap();
+        let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "e-Boekhouden (Praktijk West)",
+                "Studio Noord",
+                "agenda",
+                "Zakelijke bank"
+            ]
+        );
+        assert!(items[0].suggested && items[1].suggested && !items[2].suggested);
+        assert_eq!(items[1].reference, "op://vlt1/itm2");
+        assert_eq!(items[1].vault, "Werk");
+        assert_eq!(items[1].username, "jan@studionoord.example");
+        assert_eq!(items[0].username, "");
+    }
+
+    #[test]
+    fn reads_an_empty_list_and_refuses_garbage() {
+        assert_eq!(parse_items(b"").unwrap(), vec![]);
+        assert_eq!(parse_items(b" \n").unwrap(), vec![]);
+        assert_eq!(parse_items(b"[]").unwrap(), vec![]);
+        assert!(matches!(parse_items(b"{oops"), Err(OpListError::Other(_))));
+    }
+
+    #[test]
+    fn tells_a_locked_1password_from_other_errors() {
+        assert_eq!(
+            list_error("[ERROR] authorization prompt dismissed, please try again"),
+            OpListError::Locked
+        );
+        assert_eq!(
+            list_error("[ERROR] You are not currently signed in."),
+            OpListError::Locked
+        );
+        assert_eq!(
+            list_error("[ERROR] 2026/11/10 12:00:00 something odd\n"),
+            OpListError::Other(
+                "1Password gaf geen lijst met items: 2026/11/10 12:00:00 something odd".into()
+            )
+        );
+        let json = serde_json::to_string(&OpListError::Missing).unwrap();
+        assert_eq!(json, r#"{"kind":"missing"}"#);
+    }
 
     #[test]
     fn explains_1password_errors_without_details() {

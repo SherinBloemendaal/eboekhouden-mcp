@@ -8,7 +8,7 @@ import Icon from '../components/Icon.vue'
 import Sheet from '../components/Sheet.vue'
 import SigninSteps from '../components/SigninSteps.vue'
 import {
-  cancelSignIn, connect, dismissSignin, getSettings, isRunning, removeAccount, setDefault, signIn, signOut, since, store,
+  cancelSignIn, connect, dismissSignin, getSettings, isRunning, opLabel, removeAccount, setDefault, signIn, signOut, since, store,
   type AccountView,
 } from '../lib/accounts'
 
@@ -91,13 +91,13 @@ function sessionText(account: AccountView): { tone: string; text: string } {
           <Avatar :label="account.label" :muted="!account.session" />
           <span class="stack">
             <span class="name">{{ account.label }}<span v-if="account.isDefault" class="chip info">Standaard</span></span>
-            <span class="sub">{{ account.store === 'onePassword' ? account.username || account.opRef : account.username }}</span>
+            <span class="sub">{{ account.store === 'onePassword' ? account.username || opLabel(account) : account.username }}</span>
           </span>
         </span>
         <span :class="{ muted: !account.administration }">{{ account.administration ?? 'Na eerste keer inloggen' }}</span>
         <span class="stack">
           <span class="chip" :class="account.store === 'onePassword' ? 'info' : ''">{{ account.store === 'onePassword' ? '1Password' : 'Sleutelhanger' }}</span>
-          <span class="sub mono">{{ account.store === 'onePassword' ? account.opRef : 'Touch ID bij elk gebruik' }}</span>
+          <span class="sub" :class="{ mono: account.store === 'onePassword' && !account.opTitle }">{{ account.store === 'onePassword' ? opLabel(account) : 'Touch ID bij elk gebruik' }}</span>
         </span>
         <span class="session" :class="sessionText(account).tone">
           <span class="dot" :class="{ on: sessionText(account).tone === 'on', off: sessionText(account).tone === 'off', bad: sessionText(account).tone === 'bad' }" />

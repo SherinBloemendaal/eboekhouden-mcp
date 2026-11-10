@@ -28,6 +28,11 @@ pub struct Account {
     pub store: Store,
     /// `op://vault/item`, for `Store::OnePassword`.
     pub op_ref: Option<String>,
+    /// The 1Password item's title and vault when it was picked from the list, for display only.
+    #[serde(default)]
+    pub op_title: Option<String>,
+    #[serde(default)]
+    pub op_vault: Option<String>,
     /// Filled in from e-Boekhouden after a sign-in.
     pub administration: Option<String>,
     pub is_default: bool,
@@ -41,6 +46,10 @@ pub struct AccountInput {
     pub username: String,
     pub store: Store,
     pub op_ref: Option<String>,
+    #[serde(default)]
+    pub op_title: Option<String>,
+    #[serde(default)]
+    pub op_vault: Option<String>,
     pub is_default: bool,
 }
 
@@ -96,6 +105,8 @@ impl AccountStore {
             username: input.username,
             store: input.store,
             op_ref: input.op_ref,
+            op_title: input.op_title,
+            op_vault: input.op_vault,
             administration: None,
             is_default: input.is_default || accounts.is_empty(),
         };
@@ -118,6 +129,8 @@ impl AccountStore {
         account.username = input.username;
         account.store = input.store;
         account.op_ref = input.op_ref;
+        account.op_title = input.op_title;
+        account.op_vault = input.op_vault;
         let updated = account.clone();
         if input.is_default {
             accounts.iter_mut().for_each(|a| a.is_default = a.id == id);
@@ -194,12 +207,18 @@ fn validate(mut input: AccountInput) -> Result<AccountInput, String> {
                 return Err("Geef een 1Password-item als op://kluis/item".into());
             }
             input.op_ref = Some(reference);
+            let clean =
+                |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+            input.op_title = clean(input.op_title);
+            input.op_vault = clean(input.op_vault);
         }
         Store::System => {
             if input.username.is_empty() {
                 return Err("Vul de gebruikersnaam of het e-mailadres in".into());
             }
             input.op_ref = None;
+            input.op_title = None;
+            input.op_vault = None;
         }
     }
     Ok(input)
@@ -230,6 +249,8 @@ mod tests {
             username: "lisa@atelierzuid.example".into(),
             store: Store::System,
             op_ref: None,
+            op_title: None,
+            op_vault: None,
             is_default: false,
         }
     }
@@ -258,6 +279,8 @@ mod tests {
             username: String::new(),
             store: Store::OnePassword,
             op_ref: Some("op://Werk".into()),
+            op_title: None,
+            op_vault: None,
             is_default: false,
         };
         assert!(store.add(bad_ref).is_err());
@@ -266,12 +289,34 @@ mod tests {
             username: String::new(),
             store: Store::OnePassword,
             op_ref: Some(" op://Werk/e-Boekhouden Studio Noord ".into()),
+            op_title: Some(" e-Boekhouden Studio Noord ".into()),
+            op_vault: Some("  ".into()),
             is_default: false,
         };
+        let added = store.add(good_ref).unwrap();
         assert_eq!(
-            store.add(good_ref).unwrap().op_ref.as_deref(),
+            added.op_ref.as_deref(),
             Some("op://Werk/e-Boekhouden Studio Noord")
         );
+        assert_eq!(added.op_title.as_deref(), Some("e-Boekhouden Studio Noord"));
+        assert_eq!(added.op_vault, None);
+        // A picked item is stored by its ids, which survive a rename in 1Password.
+        let by_id = AccountInput {
+            label: "C".into(),
+            username: String::new(),
+            store: Store::OnePassword,
+            op_ref: Some("op://abcvault123/xyzitem456".into()),
+            op_title: Some("e-Boekhouden".into()),
+            op_vault: Some("Werk".into()),
+            is_default: false,
+        };
+        assert!(store.add(by_id).is_ok());
+        // Accounts written before these fields existed still load.
+        let old: Account = serde_json::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000001","label":"Oud","username":"","store":"onePassword","opRef":"op://Werk/EB","administration":null,"isDefault":false}"#,
+        )
+        .unwrap();
+        assert_eq!(old.op_title, None);
     }
 
     #[test]

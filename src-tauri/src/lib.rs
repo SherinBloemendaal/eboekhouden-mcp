@@ -116,6 +116,12 @@ fn start_sign_in(app: &AppHandle, id: Uuid) {
     tauri::async_runtime::spawn(signin::sign_in(app.clone(), state, signins, id));
 }
 
+/// The Login items in 1Password for the account picker; never a password.
+#[tauri::command]
+async fn op_items() -> Result<Vec<creds::OpItem>, creds::OpListError> {
+    creds::op_items().await
+}
+
 /// Saving checks the account right away by signing in once, out of sight.
 #[tauri::command]
 fn account_add(
@@ -452,6 +458,18 @@ fn open_eboekhouden(app: AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// The 1Password CLI's install guide, for the picker when `op` is missing.
+#[tauri::command]
+fn open_op_install(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(
+            "https://developer.1password.com/docs/cli/get-started/",
+            None::<&str>,
+        )
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn open_main(app: AppHandle, route: Option<String>) {
     if let Some(panel) = app.get_webview_window(PANEL) {
@@ -581,6 +599,8 @@ pub fn run() {
             settings_get,
             settings_set,
             open_eboekhouden,
+            op_items,
+            open_op_install,
             log_list,
             log_get,
             log_clear,
