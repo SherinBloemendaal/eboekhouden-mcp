@@ -176,6 +176,8 @@ impl EbClient {
             .http
             .post(url)
             .header(reqwest::header::ACCEPT, "application/json")
+            // As e-Boekhouden's own app posts it: JSON content type, no body. Without it the API answers 415.
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::CONTENT_LENGTH, "0");
         if !cookies.is_empty() {
             request = request.header(reqwest::header::COOKIE, cookie_header(cookies));
@@ -359,7 +361,19 @@ mod tests {
                     (axum::http::StatusCode::OK, json!({"items": [{"naam": "Bakkerij de Korf"}, {"naam": "Bakkerij Zuidwal"}], "totaal": 2}).to_string())
                 }),
             )
-            .route("/v1/api/kapot", get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }));
+            .route("/v1/api/kapot", get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }))
+            // Like e-Boekhouden: without a JSON content type the API answers 415.
+            .route(
+                "/v1/api/auth",
+                axum::routing::post(|headers: HeaderMap| async move {
+                    let json_type = headers.get("content-type").and_then(|v| v.to_str().ok()) == Some("application/json");
+                    let cookie = headers.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+                    if !json_type {
+                        return (axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE, String::new());
+                    }
+                    (axum::http::StatusCode::OK, json!({"valid": cookie.contains("ISLOGINX")}).to_string())
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -483,5 +497,17 @@ mod tests {
             Some(serde_json::json!({"valid": true}))
         )));
         assert!(!valid_session(&call(200, None)));
+    }
+
+    #[tokio::test]
+    async fn checks_the_session_with_a_json_post() {
+        let client = EbClient::new(&mock().await);
+        let signed_in = client.auth(&[("ISLOGINX".into(), "1".into())]).await;
+        assert_eq!(signed_in.status, 200, "{:?}", signed_in.error);
+        assert!(valid_session(&signed_in));
+        let not_yet = client.auth(&[("SRVRID".into(), "1".into())]).await;
+        assert_eq!(not_yet.status, 200);
+        assert!(!valid_session(&not_yet));
+        assert!(not_yet.error.is_some());
     }
 }

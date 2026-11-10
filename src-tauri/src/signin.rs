@@ -407,6 +407,7 @@ async fn run(
     let mut last_auth: Option<Instant> = None;
     let mut auth_tries = 0u32;
     let mut session_valid = false;
+    let mut last_auth_status = 0u16;
     let outcome = loop {
         if cancel.load(Ordering::SeqCst) {
             break (Step::Cancelled, None);
@@ -466,6 +467,7 @@ async fn run(
             let call = state.client.auth(&cookies_of(&window)).await;
             state.log_signin_call(&call, account_id, &account.label);
             session_valid = crate::ebapi::valid_session(&call);
+            last_auth_status = call.status;
             signins.trace(
                 account_id,
                 format!(
@@ -567,6 +569,17 @@ async fn run(
             }
             Action::Success => break (Step::Done, None),
             Action::Fail(message) => break (Step::Failed, Some(message)),
+            // Signed in on the page, but the API check itself kept failing: say that, not that the page did not load.
+            Action::Unknown(_)
+                if auth_tries > 0 && !matches!(last_auth_status, 200..=299 | 401 | 403) =>
+            {
+                break (
+                    Step::Unknown,
+                    Some(format!(
+                        "Ingelogd op de pagina, maar EB MCP kon de sessie niet controleren: e-Boekhouden gaf status {last_auth_status}"
+                    )),
+                );
+            }
             Action::Unknown(message) => break (Step::Unknown, Some(message)),
         }
     };
