@@ -1,7 +1,73 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 128 128">
-<rect width="128" height="128" rx="29" fill="#3a4677"/>
-<rect x="26" y="34" width="60" height="44" rx="10" fill="none" stroke="#9fb3d9" stroke-width="8"/>
-<rect x="42" y="50" width="60" height="44" rx="10" fill="#3a4677" stroke="#ffffff" stroke-width="8"/>
-<path d="M64 66h16M64 78h10" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
-<circle cx="94" cy="96" r="12" fill="#34c759" stroke="#3a4677" stroke-width="6"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5B86FF"/>
+      <stop offset="0.55" stop-color="#2F5AE6"/>
+      <stop offset="1" stop-color="#1D36A8"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.3" cy="0.12" r="0.75">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.32"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="page" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E6ECFF"/>
+    </linearGradient>
+    <linearGradient id="badge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4BE3A2"/>
+      <stop offset="1" stop-color="#12A866"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#0B1A5C" flood-opacity="0.38"/>
+    </filter>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#06260F" flood-opacity="0.35"/>
+    </filter>
+    <filter id="body" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000000" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+  <!-- macOS icon grid: 824 px body on a 1024 canvas -->
+  <g filter="url(#body)">
+    <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
+  </g>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#glow)"/>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="184.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="3"/>
+
+  <g transform="translate(-34 -22)">
+  <!-- the ledger page -->
+  <clipPath id="pageclip"><rect x="248" y="214" width="452" height="580" rx="58"/></clipPath>
+  <g filter="url(#shadow)">
+    <rect x="248" y="214" width="452" height="580" rx="58" fill="url(#page)"/>
+  </g>
+  <rect x="248" y="214" width="452" height="96" fill="#2F5AE6" fill-opacity="0.12" clip-path="url(#pageclip)"/>
+  <rect x="300" y="250" width="150" height="26" rx="13" fill="#2F5AE6"/>
+  <g fill="#B7C4EE">
+    <rect x="300" y="352" width="170" height="24" rx="12"/>
+    <rect x="300" y="420" width="130" height="24" rx="12"/>
+    <rect x="300" y="488" width="190" height="24" rx="12"/>
+    <rect x="300" y="556" width="110" height="24" rx="12"/>
+  </g>
+  <g fill="#7E93D6">
+    <rect x="548" y="352" width="100" height="24" rx="12"/>
+    <rect x="568" y="420" width="80" height="24" rx="12"/>
+    <rect x="528" y="488" width="120" height="24" rx="12"/>
+    <rect x="578" y="556" width="70" height="24" rx="12"/>
+  </g>
+  <!-- the total, double underlined as in a ledger -->
+  <rect x="300" y="628" width="348" height="8" rx="4" fill="#2F5AE6" fill-opacity="0.55"/>
+  <rect x="300" y="644" width="348" height="8" rx="4" fill="#2F5AE6" fill-opacity="0.55"/>
+  <rect x="508" y="684" width="140" height="30" rx="15" fill="#1D36A8"/>
+
+  </g>
+  <!-- the MCP link: a green connector badge -->
+  <g filter="url(#soft)">
+    <circle cx="736" cy="744" r="124" fill="url(#badge)"/>
+  </g>
+  <circle cx="736" cy="744" r="124" fill="none" stroke="#FFFFFF" stroke-opacity="0.35" stroke-width="4"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="24" stroke-linecap="round" stroke-linejoin="round" transform="translate(736 744)">
+    <path d="M-30 -50v-30M30 -50v-30"/>
+    <path d="M-62 -50h124v28a62 62 0 0 1-62 62a62 62 0 0 1-62-62z"/>
+    <path d="M0 40v46"/>
+  </g>
 </svg>
