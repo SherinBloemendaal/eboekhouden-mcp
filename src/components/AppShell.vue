@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { serverInfo, type ServerInfo } from '../lib/server'
+import Alert from './Alert.vue'
+import { inApp, quitApp, serverInfo, type ServerInfo } from '../lib/server'
 import Icon from './Icon.vue'
 import UpdateUi from './UpdateUi.vue'
 
@@ -23,6 +24,19 @@ function onKey(event: KeyboardEvent) {
   }
 }
 onMounted(() => window.addEventListener('keydown', onKey))
+
+// Stop EB MCP (Cmd+Q) from the menu bar while AI calls still run: the app asks here first (lib.rs, QUIT_REQUESTED).
+const quitCalls = ref(0)
+const quitting = ref(false)
+onMounted(async () => {
+  if (!inApp()) return
+  const { listen } = await import('@tauri-apps/api/event')
+  await listen<number>('quit-requested', (event) => (quitCalls.value = event.payload))
+})
+async function confirmQuit() {
+  quitting.value = true
+  await quitApp()
+}
 onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 const title = computed(() => String(route.meta.title ?? ''))
 const info = ref<ServerInfo | null>(null)
@@ -65,6 +79,15 @@ onMounted(async () => {
       </div>
     </main>
   </div>
+  <Transition name="modal">
+    <Alert v-if="quitCalls" title="Toch afsluiten?" tone="warn" @close="quitCalls = 0">
+      <p>{{ quitCalls === 1 ? 'Er loopt nog 1 aanroep' : `Er lopen nog ${quitCalls} aanroepen` }} van een AI-client. Die krijgt dan een fout, en alle sessies worden uitgelogd.</p>
+      <template #buttons>
+        <button type="button" class="btn" @click="quitCalls = 0">Annuleren</button>
+        <button type="button" class="btn danger-fill" :disabled="quitting" :aria-busy="quitting" @click="confirmQuit"><span class="btn-label">Afsluiten</span></button>
+      </template>
+    </Alert>
+  </Transition>
 </template>
 
 <style scoped>

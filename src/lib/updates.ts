@@ -35,13 +35,23 @@ export async function startUpdates(): Promise<void> {
   started = true
   updates.channel = await invoke<Channel>('update_channel')
   if (updates.channel === 'sparkle') {
-    await listen('update-relaunch-requested', () => (updates.restartAsked = true))
+    await listen('update-relaunch-requested', () => void relaunchAsked())
     // A question asked while this page was away (a reload) still waits for its answer.
-    if (await invoke<boolean>('update_listening')) updates.restartAsked = true
+    if (await invoke<boolean>('update_listening')) void relaunchAsked()
   } else if (updates.channel === 'tauri') {
     await check()
     setInterval(check, SIX_HOURS)
   }
+}
+
+/**
+ * Sparkle wants to restart into the update the user just chose to install in its own window. Asking again would be
+ * the same question twice, so EB MCP restarts right away; it only asks while an AI client still waits on a call.
+ */
+async function relaunchAsked(): Promise<void> {
+  const running = await invoke<number>('running_calls').catch(() => 0)
+  if (running > 0) updates.restartAsked = true
+  else await restartNow()
 }
 
 async function check(): Promise<void> {

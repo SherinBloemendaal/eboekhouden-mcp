@@ -80,7 +80,8 @@ describe('instellingen', () => {
     const wrapper = await mountAt('/instellingen')
     const switches = wrapper.findAll('[role="switch"]').map((s) => s.attributes('aria-label'))
     expect(switches).toEqual(['Openen bij inloggen', 'Toon in Dock'])
-    expect(wrapper.find('[aria-label="Toon in Dock"]').attributes('aria-checked')).toBe('false')
+    // On by default (Sherin, 2026-11-10).
+    expect(wrapper.find('[aria-label="Toon in Dock"]').attributes('aria-checked')).toBe('true')
     wrapper.unmount()
   })
 })

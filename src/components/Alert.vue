@@ -11,7 +11,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKey))
 </script>
 
 <template>
-  <div class="scrim">
+  <div class="scrim" data-tauri-drag-region>
     <div class="alert" role="alertdialog" aria-modal="true" :aria-label="props.title">
       <span class="icon">
         <img src="/app-icon.png" alt="" width="56" height="56" />

@@ -1,15 +1,21 @@
 <script setup lang="ts">
 // Instellingen (Cmd+,): appearance and when sessions end. Changes save at once, as in macOS settings.
 import { onMounted, ref } from 'vue'
-import { getSettings, saveSettings, type Appearance, type Settings } from '../lib/accounts'
-import { autostartGet, autostartSet } from '../lib/server'
+import Icon from '../components/Icon.vue'
+import TraceView from '../components/TraceView.vue'
+import { getSettings, saveSettings, signinTraces, type Appearance, type Settings, type Trace } from '../lib/accounts'
+import { autostartGet, autostartSet, openLogDir } from '../lib/server'
 
 const settings = ref<Settings | null>(null)
 const error = ref<string | null>(null)
 const autostart = ref(false)
 const isMac = !navigator.userAgent.includes('Windows')
 
+const traces = ref<Trace[]>([])
+const openTrace = ref<number | null>(0)
+
 onMounted(async () => {
+  traces.value = await signinTraces().catch(() => [])
   settings.value = await getSettings()
   autostart.value = await autostartGet().catch(() => false)
 })
@@ -78,6 +84,26 @@ const appearances: { value: Appearance; label: string }[] = [
       <p class="hint">Afsluiten logt altijd alle sessies uit bij e-Boekhouden. Na een update log je zelf opnieuw in.</p>
       <p v-if="error" class="error" role="alert">{{ error }}</p>
     </section>
+    <h2 class="section">Diagnose</h2>
+    <section class="group card diagnose">
+      <p class="hint first">De laatste aanmeldingen, stap voor stap: wat EB MCP op de pagina van e-Boekhouden zag en deed. Zonder wachtwoorden, codes of cookies, dus veilig om te delen.</p>
+      <div v-for="(t, i) in traces" :key="t.startedAt + t.accountId" class="trace-row">
+        <button type="button" class="trace-head" :aria-expanded="openTrace === i" @click="openTrace = openTrace === i ? null : i">
+          <Icon name="list" :size="14" />
+          <span class="trace-title">{{ t.label }}</span>
+          <span class="trace-when">{{ new Date(t.startedAt).toLocaleString('nl-NL', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) }}</span>
+          <span class="trace-outcome" :class="{ ok: t.outcome?.startsWith('Done'), bad: t.outcome && !t.outcome.startsWith('Done') }">{{ t.outcome?.split(':')[0] ?? 'Loopt' }}</span>
+        </button>
+        <Transition name="accordion">
+          <div v-if="openTrace === i" class="accordion"><div class="trace-body"><TraceView :trace="t" /></div></div>
+        </Transition>
+      </div>
+      <p v-if="!traces.length" class="hint first">Nog geen aanmeldingen sinds EB MCP startte.</p>
+      <div class="diag-actions">
+        <button type="button" class="btn small" @click="signinTraces().then((t) => (traces = t))"><Icon name="refresh" :size="14" />Vernieuwen</button>
+        <button type="button" class="btn small" @click="openLogDir"><Icon name="external" :size="14" />Open logmap</button>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -103,6 +129,18 @@ const appearances: { value: Appearance; label: string }[] = [
 .switch:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.42); }
 .card .row:last-child { border-bottom: 0; }
 @media (prefers-reduced-motion: reduce) { .switch, .switch span { transition-duration: 1ms; } }
+.diagnose { padding-top: 12px; gap: 6px; }
+.hint.first { margin-top: 0; margin-bottom: 6px; }
+.trace-row { border-bottom: 0.5px solid var(--line-soft); }
+.trace-head { box-sizing: border-box; width: 100%; display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 0 6px; border: 0; border-radius: 8px; background: transparent; text-align: left; transition: background-color 150ms ease; }
+.trace-head:hover { background: var(--hover); }
+.trace-title { flex: 1; min-width: 0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trace-when { font-size: 11px; color: var(--muted); }
+.trace-outcome { font-size: 11px; font-weight: 600; color: var(--muted); }
+.trace-outcome.ok { color: var(--success); }
+.trace-outcome.bad { color: var(--danger); }
+.trace-body { padding: 4px 6px 10px; }
+.diag-actions { display: flex; gap: 8px; margin-top: 10px; }
 .hint { margin-top: 12px; font-size: 12px; color: var(--muted); }
 .error { margin-top: 8px; font-size: 12px; color: var(--danger); }
 </style>

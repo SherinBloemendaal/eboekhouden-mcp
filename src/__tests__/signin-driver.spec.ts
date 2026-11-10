@@ -4,7 +4,7 @@ import hookSource from '../../src-tauri/js/dialog-hook.js?raw'
 import source from '../../src-tauri/js/signin-driver.js?raw'
 
 interface Driver {
-  probe(): { phase: string; message: string | null }
+  probe(): { phase: string; message: string | null; detail?: string }
   fill(user: string, pass: string): string
   code(value: string): string
 }
@@ -57,7 +57,7 @@ describe('sign-in driver', () => {
     page(`${FORM}<div class="foutmelding">Gebruikersnaam of wachtwoord onjuist.</div>`)
     expect(driver().probe().phase).toBe('form')
     ;(window as unknown as Record<string, unknown>).__ebmcpFilled = true
-    expect(driver().probe()).toEqual({ phase: 'error', message: 'Gebruikersnaam of wachtwoord onjuist.' })
+    expect(driver().probe()).toMatchObject({ phase: 'error', message: 'Gebruikersnaam of wachtwoord onjuist.' })
   })
 
   it('asks for the two-step code when a code field shows', () => {
@@ -93,6 +93,25 @@ describe('sign-in driver', () => {
     expect(driver().fill('a', 'b')).toBe('noform')
     expect(driver().code('1')).toBe('nofield')
   })
+
+  it('fills a password field that sits outside e-Boekhouden\'s form', () => {
+    const doc = page(`<form id="frm"><input id="txtEmail" type="text"><input type="submit" value="Inloggen"></form><input id="pw" type="password">`)
+    expect(driver().fill('jan@studionoord.example', 'geheim')).toBe('ok')
+    expect((doc.getElementById('pw') as HTMLInputElement).value).toBe('geheim')
+  })
+
+  it('names a missing password field instead of trying forever', () => {
+    page(`<form id="frm"><input id="txtEmail" type="text"><input type="submit" value="Volgende"></form>`)
+    expect(driver().fill('jan@studionoord.example', 'geheim')).toBe('nopassword')
+  })
+
+  it('tells the diagnosis what it found in each frame, never a value', () => {
+    const doc = page(FORM)
+    ;(doc.getElementById('txtEmail') as HTMLInputElement).value = 'jan@studionoord.example'
+    const detail = driver().probe().detail ?? ''
+    expect(detail).toContain('e-mailveld in formulier, wachtwoordveld')
+    expect(detail).not.toContain('jan@studionoord.example')
+  })
 })
 
 describe('dialogs e-Boekhouden shows', () => {
@@ -107,13 +126,13 @@ describe('dialogs e-Boekhouden shows', () => {
     doc.defaultView!.alert('Gebruikersnaam en/of wachtwoord onjuist.')
     expect(driver().probe().phase).toBe('form')
     ;(window as unknown as Record<string, unknown>).__ebmcpFilled = true
-    expect(driver().probe()).toEqual({ phase: 'error', message: 'Gebruikersnaam en/of wachtwoord onjuist.' })
+    expect(driver().probe()).toMatchObject({ phase: 'error', message: 'Gebruikersnaam en/of wachtwoord onjuist.' })
   })
 
   it('answers confirm with no and stops', () => {
     const doc = page(FORM)
     hook(doc.defaultView!)
     expect(doc.defaultView!.confirm('Je bent elders ingelogd. Doorgaan?')).toBe(false)
-    expect(driver().probe()).toEqual({ phase: 'unknown', message: 'e-Boekhouden vraagt: Je bent elders ingelogd. Doorgaan?' })
+    expect(driver().probe()).toMatchObject({ phase: 'unknown', message: 'e-Boekhouden vraagt: Je bent elders ingelogd. Doorgaan?' })
   })
 })

@@ -40,6 +40,9 @@ export async function fitPanel(height: number): Promise<void> {
 export const autostartGet = (): Promise<boolean> => (inApp() ? invoke<boolean>('autostart_get') : Promise.resolve(false))
 export const autostartSet = (enabled: boolean): Promise<boolean> => invoke<boolean>('autostart_set', { enabled })
 
+/** Opens the folder with EB MCP's log files. */
+export const openLogDir = () => (inApp() ? invoke('open_log_dir') : Promise.resolve())
+
 export async function quitApp(): Promise<void> {
   if (inApp()) await invoke('quit')
 }

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-// A macOS-style sheet: drops from the toolbar, glass, Esc closes. Mount it inside <Transition name="modal">
+// A macOS-style sheet: drops from the toolbar, glass, Esc or its buttons close it; a click beside it does not, as on
+// macOS, so dragging the window by the dimmed area moves the window. Mount it inside <Transition name="modal">
 // so it can leave: a v-if alone takes it out in one frame.
 import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 
@@ -20,7 +21,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKey))
 </script>
 
 <template>
-  <div class="scrim" @mousedown.self="emit('close')">
+  <div class="scrim" data-tauri-drag-region>
     <div ref="panel" class="sheet" role="dialog" aria-modal="true" :aria-label="props.title" :style="{ width: `${props.width ?? 520}px` }">
       <h2>{{ props.title }}</h2>
       <div class="body"><slot /></div>

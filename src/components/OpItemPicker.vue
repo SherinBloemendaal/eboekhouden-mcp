@@ -121,7 +121,7 @@ const errorText = computed(() => {
 </template>
 
 <style scoped>
-.picker { display: flex; flex-direction: column; }
+.picker { display: flex; flex-direction: column; min-width: 0; }
 .state { margin: 0; display: flex; align-items: center; gap: 8px; padding: 12px; border-radius: 12px; background: var(--sunken); font-size: 12px; color: var(--muted); }
 .spinner { box-sizing: border-box; width: 12px; height: 12px; border-radius: 50%; border: 1.5px solid var(--line); border-top-color: var(--label); animation: spin 800ms linear infinite; }
 .notice { display: flex; flex-direction: column; gap: 10px; padding: 12px; border-radius: 12px; background: var(--warn-soft); color: var(--warn); font-size: 12px; line-height: 17px; }

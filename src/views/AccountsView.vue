@@ -90,7 +90,7 @@ function sessionText(account: AccountView): { tone: string; text: string } {
         <span class="who">
           <Avatar :label="account.label" :muted="!account.session" />
           <span class="stack">
-            <span class="name">{{ account.label }}<span v-if="account.isDefault" class="chip info">Standaard</span></span>
+            <span class="name"><span class="name-text" :title="account.label">{{ account.label }}</span><span v-if="account.isDefault" class="chip info">Standaard</span></span>
             <span class="sub">{{ account.store === 'onePassword' ? account.username || opLabel(account) : account.username }}</span>
           </span>
         </span>
@@ -170,14 +170,17 @@ function sessionText(account: AccountView): { tone: string; text: string } {
 .page { padding: 8px 28px 28px; display: flex; flex-direction: column; gap: 16px; }
 .table { overflow: hidden; }
 .row {
-  display: grid; grid-template-columns: minmax(200px, 1.3fr) minmax(130px, 0.9fr) minmax(200px, 1.3fr) 170px 230px; align-items: center; column-gap: 16px;
+  display: grid; grid-template-columns: minmax(170px, 1.5fr) minmax(110px, 0.8fr) minmax(150px, 1.1fr) minmax(120px, 0.8fr) auto; align-items: center; column-gap: 16px;
   min-height: 48px; padding: 0 16px; border-top: 0.5px solid var(--line-soft); transition: background-color 150ms ease;
 }
 .row:not(.head):hover { background: var(--hover); }
 .row.head { min-height: 26px; border-top: 0; background: var(--sunken); font-size: 11px; font-weight: 600; color: var(--label); }
 .who { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .stack { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.name { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.name { display: flex; align-items: center; gap: 6px; min-width: 0; font-weight: 600; }
+/* A long account name stays on one line; the full name is in the tooltip. */
+.name-text { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.name .chip { flex: none; }
 .sub { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .muted { color: var(--muted); }
 .chip { align-self: flex-start; height: 18px; display: inline-flex; align-items: center; padding: 0 7px; border-radius: 999px; background: var(--subtle); color: var(--label); font-size: 11px; font-weight: 500; }

@@ -126,10 +126,28 @@ export const signIn = (id: string) => {
   return invoke('signin_start', { id })
 }
 export const cancelSignIn = (id: string) => invoke('signin_cancel', { id })
+
+/** One sign-in as Instellingen › Diagnose shows it: what EB MCP saw and did. No password, code or cookie. */
+export interface Trace {
+  accountId: string
+  label: string
+  startedAt: number
+  outcome: string | null
+  lines: { ms: number; text: string }[]
+}
+export const signinTraces = () => (inApp() ? invoke<Trace[]>('signin_traces') : Promise.resolve<Trace[]>([]))
+/** Toon e-Boekhouden: the hidden sign-in window comes into view. */
+export const signinShow = (id: string) => invoke('signin_show', { id })
+
+/** A trace as plain text, to paste into a message. */
+export function traceText(trace: Trace): string {
+  const head = `${trace.label}, ${new Date(trace.startedAt).toLocaleString('nl-NL')}: ${trace.outcome ?? 'loopt nog'}`
+  return [head, ...trace.lines.map((l) => `${(l.ms / 1000).toFixed(1).padStart(6)} s  ${l.text}`)].join('\n')
+}
 export const sendCode = (id: string, code: string) => invoke('signin_code', { id, code })
 export const signOut = (id: string) => invoke('sign_out', { id }).finally(refresh)
 export const signOutAll = () => invoke('sign_out_all').finally(refresh)
-export const getSettings = () => (inApp() ? invoke<Settings>('settings_get') : Promise.resolve<Settings>({ idleMinutes: 30, appearance: 'system', showInDock: false }))
+export const getSettings = () => (inApp() ? invoke<Settings>('settings_get') : Promise.resolve<Settings>({ idleMinutes: 30, appearance: 'system', showInDock: true }))
 export const saveSettings = (value: Settings) => invoke('settings_set', { value })
 
 export function dismissSignin(id: string): void {

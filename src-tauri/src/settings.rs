@@ -25,7 +25,7 @@ pub struct Settings {
     /// Minutes without an AI call before an account is signed out.
     pub idle_minutes: u32,
     pub appearance: Appearance,
-    /// macOS: an icon in the Dock as well as in the menu bar. Off by default, like most menu-bar apps.
+    /// macOS: an icon in the Dock as well as in the menu bar. On by default (Sherin, 2026-11-10).
     pub show_in_dock: bool,
 }
 
@@ -34,7 +34,7 @@ impl Default for Settings {
         Self {
             idle_minutes: 30,
             appearance: Appearance::System,
-            show_in_dock: false,
+            show_in_dock: true,
         }
     }
 }
@@ -117,7 +117,7 @@ mod older_files {
             Settings {
                 idle_minutes: 15,
                 appearance: Appearance::System,
-                show_in_dock: false,
+                show_in_dock: true,
             }
         );
     }

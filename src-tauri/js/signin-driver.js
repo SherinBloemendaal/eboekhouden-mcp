@@ -118,8 +118,32 @@
     return out;
   }
 
+  // For the diagnosis: each frame's path and what the driver found in it. Never a value typed in.
+  function detail(docs) {
+    return docs
+      .map((d) => {
+        let path = '?';
+        try {
+          path = d.location.pathname;
+        } catch {
+          path = '?';
+        }
+        const email = d.getElementById('txtEmail');
+        const found = [];
+        if (email) found.push(email.form ? 'e-mailveld in formulier' : 'e-mailveld zonder formulier');
+        if (d.querySelector('input[type="password"]')) found.push('wachtwoordveld');
+        return found.length ? `${path}: ${found.join(', ')}` : path;
+      })
+      .join(' | ')
+      .slice(0, 400);
+  }
+
   function probe() {
     const docs = documents(window);
+    return { ...decideProbe(docs), detail: detail(docs) };
+  }
+
+  function decideProbe(docs) {
     const said = dialogs(docs);
     if (said.confirms.length) return { phase: 'unknown', message: `e-Boekhouden vraagt: ${clean(said.confirms.at(-1))}` };
     if (window.__ebmcpFilled && said.alerts.length) return { phase: 'error', message: clean(said.alerts.at(-1)) };
@@ -147,8 +171,9 @@
     if (!login) return 'noform';
     const user = login.getElementById('txtEmail');
     const form = user.form;
-    const pass = form.querySelector('input[type="password"]');
-    if (!pass) return 'noform';
+    // The password field may sit outside e-Boekhouden's form element; any shown one in the same document will do.
+    const pass = form.querySelector('input[type="password"]') ?? [...login.querySelectorAll('input[type="password"]')].find(shown);
+    if (!pass) return 'nopassword';
     if (!user.readOnly) setValue(user, username);
     setValue(pass, password);
     window.__ebmcpFilled = true;

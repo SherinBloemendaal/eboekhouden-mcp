@@ -1,7 +1,8 @@
 <script setup lang="ts">
 // The steps of a sign-in out of sight, and the code field when e-Boekhouden asks for one.
-import { computed, ref, watch } from 'vue'
-import { sendCode, type AccountView, type SigninEvent } from '../lib/accounts'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { sendCode, signinShow, signinTraces, type AccountView, type SigninEvent, type Trace } from '../lib/accounts'
+import TraceView from './TraceView.vue'
 import { openEboekhouden } from '../lib/server'
 import Icon from './Icon.vue'
 
@@ -63,6 +64,45 @@ async function submitCode() {
   }
 }
 
+// Debugging a sign-in: Details shows the trace (refreshed while it runs), Toon e-Boekhouden the hidden window.
+const running = computed(() => !!props.event && !['done', 'failed', 'unknown', 'cancelled'].includes(props.event.step))
+const ended = computed(() => !!props.event && ['done', 'failed', 'unknown'].includes(props.event.step))
+const showDetails = ref(false)
+const trace = ref<Trace | null>(null)
+const slow = ref(false)
+let slowTimer: ReturnType<typeof setTimeout> | undefined
+let poll: ReturnType<typeof setInterval> | undefined
+
+async function loadTrace() {
+  trace.value = (await signinTraces()).find((t) => t.accountId === props.account.id) ?? null
+}
+watch(showDetails, (open) => {
+  clearInterval(poll)
+  if (!open) return
+  void loadTrace()
+  poll = setInterval(() => running.value && void loadTrace(), 1000)
+})
+watch(() => props.event?.step, () => {
+  if (showDetails.value) void loadTrace()
+  clearTimeout(slowTimer)
+  slow.value = false
+  // Toon e-Boekhouden comes up when a step takes long, which is when you want to look.
+  if (running.value && props.event?.step !== 'code') slowTimer = setTimeout(() => (slow.value = true), 8000)
+})
+onBeforeUnmount(() => {
+  clearInterval(poll)
+  clearTimeout(slowTimer)
+})
+const showError = ref<string | null>(null)
+async function show() {
+  showError.value = null
+  try {
+    await signinShow(props.account.id)
+  } catch (e) {
+    showError.value = String(e)
+  }
+}
+
 function onInput() {
   code.value = code.value.replace(/\D/g, '').slice(0, 8)
   if (code.value.length === 6) void submitCode()
@@ -107,6 +147,22 @@ function onInput() {
           <p class="note bad" role="alert">{{ event.message }}</p>
           <button v-if="event.step === 'unknown'" type="button" class="btn small open-eb" @click="openEboekhouden"><Icon name="external" :size="14" />Open e-Boekhouden in je browser</button>
         </div>
+      </div>
+    </Transition>
+    <div v-if="running || ended" class="debug">
+      <button type="button" class="btn small ghost" :aria-expanded="showDetails" @click="showDetails = !showDetails">
+        <Icon name="list" :size="14" />{{ showDetails ? 'Verberg details' : 'Details' }}
+      </button>
+      <Transition name="fade-in">
+        <button v-if="running && slow" type="button" class="btn small ghost" @click="show"><Icon name="external" :size="14" />Toon e-Boekhouden</button>
+      </Transition>
+    </div>
+    <Transition name="accordion">
+      <div v-if="showError" class="accordion"><div><p class="note bad" role="alert">{{ showError }}</p></div></div>
+    </Transition>
+    <Transition name="accordion">
+      <div v-if="showDetails" class="accordion">
+        <div class="details"><TraceView v-if="trace" :trace="trace" /><p v-else class="hint">Nog niets vastgelegd.</p></div>
       </div>
     </Transition>
     <Transition name="accordion">
@@ -159,6 +215,11 @@ li:not(.wait) .mark::before { opacity: 0; }
 .note { padding: 9px 11px; border-radius: 10px; font-size: 12px; line-height: 16px; }
 .note.bad { background: var(--danger-soft); color: var(--danger); }
 .open-eb { margin-top: 8px; }
+.debug { display: flex; gap: 4px; margin-top: 8px; margin-left: -10px; }
+.details { padding-top: 6px; }
+.fade-in-enter-active { transition: opacity 200ms var(--ease); }
+.fade-in-leave-active { transition: opacity 120ms ease; }
+.fade-in-enter-from, .fade-in-leave-to { opacity: 0; }
 .note.ok { background: var(--success-soft); color: var(--success); }
 @media (prefers-reduced-motion: reduce) {
   .spin { animation-duration: 2400ms; }
