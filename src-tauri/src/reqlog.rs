@@ -3,7 +3,9 @@
 //! The log keeps the last 1000 calls: MCP tool calls and the e-Boekhouden
 //! calls they caused, linked by id. Cookies, the auth-token and passwords are
 //! never stored: request headers are kept masked, and nothing else carries them.
-//! The statistics count from the start of the run and survive Leegmaken.
+//! The statistics count from the start of the run and survive Leegmaken. They
+//! count AI traffic only: the sign-in's own calls show in the log but not in
+//! the statistics, as they are not rate limited and no AI client made them.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
@@ -69,6 +71,8 @@ pub struct EbEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<Value>,
     pub truncated: bool,
+    /// Made by a sign-in (`auth/login`, `auth`, or the sign-in's own line): listed, never counted in the statistics.
+    pub signin: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -276,6 +280,23 @@ impl RequestLog {
         account: Option<(Uuid, String)>,
         had_session: bool,
     ) -> u64 {
+        self.record(call, parent, client, account, had_session, false)
+    }
+
+    /// Records a call of a sign-in: in the log like any other, but left out of the statistics.
+    pub fn add_signin(&self, call: &ApiCall, client: &str, account: (Uuid, String)) -> u64 {
+        self.record(call, None, client, Some(account), true, true)
+    }
+
+    fn record(
+        &self,
+        call: &ApiCall,
+        parent: Option<u64>,
+        client: &str,
+        account: Option<(Uuid, String)>,
+        had_session: bool,
+        signin: bool,
+    ) -> u64 {
         let id = self.next_id();
         let at = now_ms().saturating_sub(call.duration_ms);
         let mut headers = vec![
@@ -315,6 +336,7 @@ impl RequestLog {
             headers,
             response,
             truncated,
+            signin,
         }));
         if let Some(parent) = parent {
             let mut entries = self.entries.lock().unwrap();
@@ -322,7 +344,7 @@ impl RequestLog {
                 e.calls.push(id);
             }
         }
-        if call.status != 0 {
+        if call.status != 0 && !signin {
             let mut s = self.stats.lock().unwrap();
             s.eb += 1;
             s.bytes_in += call.bytes as u64;
@@ -614,6 +636,56 @@ mod tests {
         assert_eq!(stats.endpoints[0].count, 2);
         assert_eq!(stats.endpoints[0].p95_ms, 300);
         assert_eq!(stats.accounts[0].count, 2);
+    }
+
+    #[test]
+    fn lists_sign_in_calls_without_counting_them() {
+        let log = RequestLog::default();
+        let account = (Uuid::nil(), "SN".to_owned());
+        log.add_signin(
+            &call("auth/login", 401, 200),
+            "EB MCP (inloggen)",
+            account.clone(),
+        );
+        log.add_signin(&call("auth", 200, 80), "EB MCP (inloggen)", account.clone());
+        log.add_eb(
+            &call("relatie/gridtable", 500, 300),
+            None,
+            "Claude",
+            Some(account),
+            true,
+        );
+        let list = log.list();
+        assert_eq!(list.len(), 3, "the sign-in's calls stay in Verzoeken");
+        let signins = list
+            .iter()
+            .filter(|e| matches!(e, Entry::Eb(eb) if eb.signin))
+            .count();
+        assert_eq!(signins, 2);
+        let stats = log.stats();
+        assert_eq!((stats.eb, stats.errors), (1, 1));
+        assert_eq!(stats.minutes.len(), 1);
+        assert_eq!((stats.minutes[0].1.eb, stats.minutes[0].1.errors), (1, 1));
+        assert_eq!(stats.endpoints.len(), 1);
+        assert_eq!(stats.endpoints[0].path, "relatie/gridtable");
+        assert_eq!(
+            stats
+                .clients
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Claude"]
+        );
+        assert_eq!(stats.accounts[0].count, 1);
+        assert_eq!(stats.avg_ms, 300);
+        assert_eq!(
+            stats
+                .statuses
+                .iter()
+                .map(|n| n.name.as_str())
+                .collect::<Vec<_>>(),
+            ["500"]
+        );
     }
 
     #[test]

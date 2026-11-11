@@ -3,8 +3,6 @@
 //! `auth-token` among them (signin.rs, SessionJar).
 
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,11 +12,11 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::accounts::AccountStore;
-use crate::ebapi::{ApiCall, EbClient, auth_token};
+use crate::ebapi::{ApiCall, EbClient};
 use crate::reqlog::RequestLog;
 
 /// Holds the cookies of each session, by key, and forgets them at sign-out. The app keeps them in memory
-/// (signin.rs, SessionJar); tests use a fake.
+/// (signin.rs, SessionJar); tests use a fake. Signing out only forgets: e-Boekhouden's API has no sign-out.
 pub trait CookieJar: Send + Sync {
     fn cookies(&self, key: &str) -> Result<Vec<(String, String)>, String>;
     fn put(&self, key: &str, cookies: Vec<(String, String)>);
@@ -30,12 +28,11 @@ pub struct Session {
     pub account_id: Uuid,
     pub label: String,
     pub administration: Option<String>,
-    pub webview: String,
+    /// Where the session's cookies are in the CookieJar.
+    pub key: String,
     pub started_at: u64,
-    pub renewed_at: Option<u64>,
     pub last_used: Instant,
     pub expired: bool,
-    token_hash: Option<u64>,
 }
 
 /// A session as the UI and the `status` tool see it.
@@ -46,7 +43,6 @@ pub struct SessionView {
     pub label: String,
     pub administration: Option<String>,
     pub started_at: u64,
-    pub renewed_at: Option<u64>,
     pub expired: bool,
 }
 
@@ -77,12 +73,6 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn hash(value: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    value.hash(&mut h);
-    h.finish()
-}
-
 impl AppState {
     pub fn new(accounts: AccountStore, client: EbClient, jar: Arc<dyn CookieJar>) -> Self {
         let (events, _) = broadcast::channel(64);
@@ -108,7 +98,6 @@ impl AppState {
                 label: s.label.clone(),
                 administration: s.administration.clone(),
                 started_at: s.started_at,
-                renewed_at: s.renewed_at,
                 expired: s.expired,
             })
             .collect();
@@ -138,28 +127,21 @@ impl AppState {
         self.jar.put(key, cookies);
     }
 
-    /// Called by the sign-in once e-Boekhouden accepted the account.
-    pub fn add_session(&self, account_id: Uuid, label: &str, webview: &str) {
-        let token_hash = self
-            .jar
-            .cookies(webview)
-            .ok()
-            .and_then(|c| auth_token(&c).map(hash));
+    /// Called by the sign-in once e-Boekhouden accepted the account; its cookies are in the jar under `key`.
+    pub fn add_session(&self, account_id: Uuid, label: &str, key: &str) {
         let session = Session {
             account_id,
             label: label.to_owned(),
             administration: None,
-            webview: webview.to_owned(),
+            key: key.to_owned(),
             started_at: now_ms(),
-            renewed_at: None,
             last_used: Instant::now(),
             expired: false,
-            token_hash,
         };
         if let Some(old) = self.sessions.write().unwrap().insert(account_id, session)
-            && old.webview != webview
+            && old.key != key
         {
-            self.jar.sign_out(&old.webview);
+            self.jar.sign_out(&old.key);
         }
         let _ = self.events.send(AppEvent::SessionsChanged);
     }
@@ -172,11 +154,11 @@ impl AppState {
         let _ = self.events.send(AppEvent::SessionsChanged);
     }
 
-    /// Signs out at e-Boekhouden and forgets the session.
+    /// Forgets the session and its token. e-Boekhouden's API has no sign-out; the token ends there when it expires.
     pub fn sign_out(&self, account_id: Uuid) -> bool {
         let removed = self.sessions.write().unwrap().remove(&account_id);
         if let Some(session) = &removed {
-            self.jar.sign_out(&session.webview);
+            self.jar.sign_out(&session.key);
             let _ = self.events.send(AppEvent::SessionsChanged);
         }
         removed.is_some()
@@ -189,7 +171,7 @@ impl AppState {
         }
     }
 
-    /// Signs out sessions no AI client used for `idle`.
+    /// Forgets sessions no AI client used for `idle`.
     pub fn sign_out_idle(&self, idle: Duration) -> Vec<Uuid> {
         let stale: Vec<Uuid> = self
             .sessions
@@ -222,7 +204,7 @@ impl AppState {
             .unwrap_or_else(|| self.label_of(account_id));
         let (call, had_session) = match session.filter(|s| !s.expired) {
             None => (not_signed_in(path, query, &label), false),
-            Some(session) => match self.jar.cookies(&session.webview) {
+            Some(session) => match self.jar.cookies(&session.key) {
                 Err(e) => {
                     let mut call = not_signed_in(path, query, &session.label);
                     call.error = Some(format!(
@@ -232,9 +214,10 @@ impl AppState {
                     (call, false)
                 }
                 Ok(cookies) => {
-                    self.note_use(account_id, auth_token(&cookies).map(hash));
+                    self.note_use(account_id);
                     let call = self.client.get(&cookies, path, query).await;
-                    if matches!(call.status, 300..=399 | 401 | 403) {
+                    // Only these mean "not signed in". A 403 is a part this account may not see.
+                    if matches!(call.status, 300..=399 | 401) {
                         self.mark_expired(account_id);
                     }
                     (call, !cookies.is_empty())
@@ -252,27 +235,17 @@ impl AppState {
         call
     }
 
-    /// A sign-in attempt or one of its checks in Verzoeken, so they show next to the AI calls.
+    /// A sign-in attempt or one of its checks in Verzoeken, so they show next to the AI calls. They stay out
+    /// of the Dashboard's statistics (reqlog.rs, `add_signin`).
     pub fn log_signin_call(&self, call: &ApiCall, account_id: Uuid, label: &str) {
-        self.log.add_eb(
-            call,
-            None,
-            "EB MCP (inloggen)",
-            Some((account_id, label.to_owned())),
-            true,
-        );
+        self.log
+            .add_signin(call, "EB MCP (inloggen)", (account_id, label.to_owned()));
         let _ = self.events.send(AppEvent::LogChanged);
     }
 
-    fn note_use(&self, account_id: Uuid, token_hash: Option<u64>) {
+    fn note_use(&self, account_id: Uuid) {
         if let Some(s) = self.sessions.write().unwrap().get_mut(&account_id) {
             s.last_used = Instant::now();
-            if token_hash.is_some() && s.token_hash.is_some() && token_hash != s.token_hash {
-                s.renewed_at = Some(now_ms());
-            }
-            if token_hash.is_some() {
-                s.token_hash = token_hash;
-            }
         }
     }
 
@@ -323,7 +296,7 @@ pub mod testing {
     use super::*;
     use std::sync::Mutex;
 
-    /// Cookies per webview, and the sign-outs it was asked for.
+    /// Cookies per session key, and the sign-outs it was asked for.
     #[derive(Default)]
     pub struct FakeJar {
         pub cookies: Mutex<HashMap<String, Vec<(String, String)>>>,
@@ -331,12 +304,12 @@ pub mod testing {
     }
 
     impl CookieJar for FakeJar {
-        fn cookies(&self, webview: &str) -> Result<Vec<(String, String)>, String> {
+        fn cookies(&self, key: &str) -> Result<Vec<(String, String)>, String> {
             Ok(self
                 .cookies
                 .lock()
                 .unwrap()
-                .get(webview)
+                .get(key)
                 .cloned()
                 .unwrap_or_default())
         }
@@ -345,8 +318,8 @@ pub mod testing {
             self.cookies.lock().unwrap().insert(key.to_owned(), cookies);
         }
 
-        fn sign_out(&self, webview: &str) {
-            self.signed_out.lock().unwrap().push(webview.to_owned());
+        fn sign_out(&self, key: &str) {
+            self.signed_out.lock().unwrap().push(key.to_owned());
         }
     }
 
@@ -372,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn signing_out_closes_the_webview_and_forgets_the_session() {
+    fn signing_out_forgets_the_session_and_its_cookies() {
         let jar = Arc::new(FakeJar::default());
         let state = state_with(jar.clone(), "http://127.0.0.1:9/v1/api/");
         let id = Uuid::new_v4();
@@ -408,24 +381,47 @@ mod tests {
         );
     }
 
-    #[test]
-    fn notices_a_renewed_token() {
+    #[tokio::test]
+    async fn a_403_leaves_the_session_alone_and_a_401_expires_it() {
+        let app = axum::Router::new()
+            .route(
+                "/v1/api/geen-toegang",
+                axum::routing::get(|| async { axum::http::StatusCode::FORBIDDEN }),
+            )
+            .route(
+                "/v1/api/verlopen",
+                axum::routing::get(|| async { axum::http::StatusCode::UNAUTHORIZED }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let jar = Arc::new(FakeJar::default());
-        jar.cookies
-            .lock()
-            .unwrap()
-            .insert("eb-1".into(), vec![("auth-token".into(), "one".into())]);
-        let state = state_with(jar.clone(), "http://127.0.0.1:9/v1/api/");
+        jar.put("eb-1", vec![("auth-token".into(), "jwt".into())]);
+        let state = state_with(jar, &format!("http://{addr}/v1/api/"));
         let id = Uuid::new_v4();
         state.add_session(id, "A", "eb-1");
-        state.note_use(id, Some(hash("one")));
-        assert_eq!(state.sessions()[0].renewed_at, None);
-        state.note_use(id, Some(hash("two")));
-        assert!(state.sessions()[0].renewed_at.is_some());
+        let mut events = state.events.subscribe();
+
+        let call = state.api_get(id, "geen-toegang", &[], None, "test").await;
+        assert_eq!(call.status, 403);
+        assert!(call.error.unwrap().starts_with("Geen toegang"));
+        assert!(!state.sessions()[0].expired);
+        assert_eq!(state.session_count(), 1);
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, AppEvent::SessionExpired { .. }),
+                "{event:?}"
+            );
+        }
+
+        let call = state.api_get(id, "verlopen", &[], None, "test").await;
+        assert_eq!(call.status, 401);
+        assert!(state.sessions()[0].expired);
+        assert_eq!(state.session_count(), 0);
     }
 
     #[test]
-    fn a_new_sign_in_replaces_the_old_webview() {
+    fn a_new_sign_in_replaces_the_old_session() {
         let jar = Arc::new(FakeJar::default());
         let state = state_with(jar.clone(), "http://127.0.0.1:9/v1/api/");
         let id = Uuid::new_v4();

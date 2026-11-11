@@ -100,9 +100,15 @@ pub fn parse_date(text: &str) -> Result<(i32, u32, u32), String> {
     Ok((y, m, d))
 }
 
-/// Today in the local calendar of a UTC clock, good enough for default periods.
+/// Today on this computer's calendar, so default periods turn over at local midnight, not at UTC's.
 fn today() -> (i32, u32, u32) {
-    let days = (crate::state::now_ms() / 86_400_000) as i64;
+    let now = chrono::Local::now();
+    date_at(now.timestamp_millis(), now.offset().local_minus_utc())
+}
+
+/// The calendar date at `ms` since the epoch, in a zone `offset_secs` ahead of UTC.
+fn date_at(ms: i64, offset_secs: i32) -> (i32, u32, u32) {
+    let days = (ms + i64::from(offset_secs) * 1000).div_euclid(86_400_000);
     // Howard Hinnant's civil_from_days.
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -468,6 +474,11 @@ impl EbMcp {
         let result = self.fetch(&run, path, query).await;
         Ok(self.end(run, path, result))
     }
+}
+
+/// How many tools the server offers, counted on its tool router.
+pub fn tool_count() -> usize {
+    EbMcp::tool_router().list_all().len()
 }
 
 #[tool_router]
@@ -964,6 +975,32 @@ mod tests {
         let (y, m, d) = today();
         assert!(parse_date(&dashed((y, m, d))).is_ok());
         assert!(y >= 2026);
+    }
+
+    #[test]
+    fn the_date_follows_the_local_offset() {
+        const WINTER_EVENING: i64 = 1_794_353_400_000; // 2026-11-10 23:30 UTC
+        assert_eq!(date_at(WINTER_EVENING, 0), (2026, 11, 10));
+        assert_eq!(
+            date_at(WINTER_EVENING, 3600),
+            (2026, 11, 11),
+            "00:30 in Amsterdam"
+        );
+        const SUMMER_EVENING: i64 = 1_782_857_700_000; // 2026-06-30 22:15 UTC
+        assert_eq!(date_at(SUMMER_EVENING, 0), (2026, 6, 30));
+        assert_eq!(
+            date_at(SUMMER_EVENING, 7200),
+            (2026, 7, 1),
+            "00:15 in Amsterdam"
+        );
+        const LEAP_EVENING: i64 = 1_709_161_200_000; // 2024-02-28 23:00 UTC
+        assert_eq!(date_at(LEAP_EVENING, 3600), (2024, 2, 29));
+        assert_eq!(date_at(0, -3600), (1969, 12, 31), "west of UTC");
+    }
+
+    #[test]
+    fn counts_its_tools_on_the_router() {
+        assert_eq!(tool_count(), 12);
     }
 
     #[test]

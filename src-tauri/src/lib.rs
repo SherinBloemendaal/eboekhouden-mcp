@@ -12,7 +12,7 @@ mod tools;
 mod updates;
 
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{
@@ -41,6 +41,8 @@ struct ServerInfo {
     error: Option<String>,
     sessions: usize,
     log_count: usize,
+    /// How many tools the server offers.
+    tool_count: usize,
 }
 
 struct Server {
@@ -67,7 +69,7 @@ struct AccountView {
 
 type Shared<'a, T> = State<'a, Arc<T>>;
 
-/// Events go to EB MCP's own windows only, never to the hidden e-Boekhouden webviews.
+/// Events go to EB MCP's two windows, the main window and the tray panel.
 pub(crate) fn to_our_windows<S: Serialize + Clone>(app: &AppHandle, event: &str, payload: S) {
     for label in [MAIN, PANEL] {
         let _ = app.emit_to(label, event, payload.clone());
@@ -84,7 +86,17 @@ fn server_info(server: Shared<'_, Server>, app_state: Shared<'_, AppState>) -> S
         error,
         sessions: app_state.session_count(),
         log_count: app_state.log.len(),
+        tool_count: tools::tool_count(),
     }
+}
+
+/// Something the user should know from the start of this run (a damaged accounts.json that was kept aside).
+struct StartupNotice(Option<String>);
+
+/// The notice of this start, if any; the UI shows it once it has loaded.
+#[tauri::command]
+fn startup_notice(notice: State<'_, StartupNotice>) -> Option<String> {
+    notice.0.clone()
 }
 
 #[tauri::command]
@@ -126,6 +138,8 @@ async fn op_items(app: AppHandle) -> Result<Vec<creds::OpItem>, creds::OpListErr
 
 /// 1Password's consent prompt and Touch ID take the focus. Without a Dock icon EB MCP then
 /// sits behind other apps and looks gone, so the open main window comes back to the front.
+/// The panel stays open during a sign-in (see the panel's focus handler in `run`); when it is
+/// open, it was where the user started, so it gets the focus last.
 pub(crate) fn refocus_main(app: &AppHandle) {
     if let Some(main) = app.get_webview_window(MAIN)
         && main.is_visible().unwrap_or(false)
@@ -133,9 +147,32 @@ pub(crate) fn refocus_main(app: &AppHandle) {
         let _ = main.unminimize();
         let _ = main.set_focus();
     }
+    if let Some(panel) = app.get_webview_window(PANEL)
+        && panel.is_visible().unwrap_or(false)
+    {
+        let _ = panel.set_focus();
+    }
 }
 
-/// Saving checks the account right away by signing in once, out of sight.
+/// The panel does not hide on focus loss while a sign-in runs (its focus handler in `run`). When the
+/// last sign-in ends and the panel is open without the focus, nothing would close it any more, so it
+/// hides here, as a menu the user has left.
+pub(crate) fn hide_unfocused_panel(app: &AppHandle) {
+    if app
+        .try_state::<Arc<Signins>>()
+        .is_some_and(|signins| signins.any_running())
+    {
+        return;
+    }
+    if let Some(panel) = app.get_webview_window(PANEL)
+        && panel.is_visible().unwrap_or(false)
+        && !panel.is_focused().unwrap_or(true)
+    {
+        let _ = panel.hide();
+    }
+}
+
+/// Saving checks the account right away by signing in once through e-Boekhouden's API (signin.rs).
 #[tauri::command]
 fn account_add(
     app: AppHandle,
@@ -300,13 +337,13 @@ fn bridge_path() -> std::path::PathBuf {
         .unwrap_or_else(|| name.into())
 }
 
-/// The bridge Claude Desktop starts. Development builds pass the dev token file,
-/// since their token is not in the Keychain (secrets::DevFileStore).
+/// The bridge Claude Desktop starts. It finds the token file of the installed app by itself;
+/// development builds keep their own file (secrets::token_file) and pass it.
 fn bridge(app: &AppHandle) -> connect::Bridge {
     let token_file = cfg!(debug_assertions)
         .then(|| app.path().app_config_dir().ok())
         .flatten()
-        .map(|dir| dir.join("dev-token.json"));
+        .map(|dir| secrets::token_file(&dir));
     connect::Bridge {
         path: bridge_path(),
         token_file,
@@ -415,10 +452,17 @@ fn settings_set(
     settings: Shared<'_, SettingsStore>,
     value: Settings,
 ) -> Result<(), String> {
+    let before = settings.get();
     let (appearance, dock) = (value.appearance, value.show_in_dock);
     settings.set(value)?;
-    apply_appearance(&app, appearance);
-    apply_dock(&app, dock);
+    // Only what changed: setting the Dock policy deactivates the app and brings the window back
+    // (apply_dock), which should not happen when only the idle time changed.
+    if appearance != before.appearance {
+        apply_appearance(&app, appearance);
+    }
+    if dock != before.show_in_dock {
+        apply_dock(&app, dock);
+    }
     Ok(())
 }
 
@@ -468,8 +512,8 @@ fn autostart_set(app: AppHandle, enabled: bool) -> Result<bool, String> {
     manager.is_enabled().map_err(|e| e.to_string())
 }
 
-/// Sets EB MCP's own windows to light, dark or the system's choice; the pages follow
-/// through prefers-color-scheme. The hidden e-Boekhouden webviews are left alone.
+/// Sets EB MCP's windows (main and panel) to light, dark or the system's choice; the pages
+/// follow through prefers-color-scheme.
 fn apply_appearance(app: &AppHandle, appearance: settings::Appearance) {
     let theme = match appearance {
         settings::Appearance::System => None,
@@ -667,6 +711,48 @@ fn panel_fit(app: AppHandle, height: f64) {
 const PANEL_WIDTH: f64 = 336.0;
 const PANEL_MIN_HEIGHT: f64 = 160.0;
 const PANEL_MAX_HEIGHT: f64 = 640.0;
+/// Room kept between the panel and the edges of the screen's work area, in logical pixels.
+const PANEL_SCREEN_MARGIN: f64 = 8.0;
+
+/// When the panel last hid because it lost the focus. A click on the tray icon takes the focus
+/// from the open panel before the click's mouse-up arrives, so that click would open it again.
+#[derive(Default)]
+struct PanelHidden(Mutex<Option<Instant>>);
+
+/// A tray click this soon after the panel hid on focus loss is the click that hid it.
+const PANEL_REOPEN_GUARD: Duration = Duration::from_millis(250);
+
+/// Keeps a span (`start`, `len`) inside an area (`area_start`, `area_len`) with `margin` to spare
+/// on both sides. An area too small for it gets the span at its start.
+fn clamp_span(start: f64, len: f64, area_start: f64, area_len: f64, margin: f64) -> f64 {
+    let (min, max) = (area_start + margin, area_start + area_len - margin - len);
+    if max < min {
+        min
+    } else {
+        start.clamp(min, max)
+    }
+}
+
+/// The work area (without menu bar, Dock or taskbar) of the screen holding a point, in physical
+/// pixels: (x, y, width, height).
+fn work_area_at(app: &AppHandle, x: f64, y: f64) -> Option<(f64, f64, f64, f64)> {
+    let monitor = app.monitor_from_point(x, y).ok().flatten().or_else(|| {
+        app.available_monitors().ok()?.into_iter().find(|m| {
+            let (pos, size) = (m.position(), m.size());
+            x >= f64::from(pos.x)
+                && x < f64::from(pos.x) + f64::from(size.width)
+                && y >= f64::from(pos.y)
+                && y < f64::from(pos.y) + f64::from(size.height)
+        })
+    })?;
+    let area = monitor.work_area();
+    Some((
+        f64::from(area.position.x),
+        f64::from(area.position.y),
+        f64::from(area.size.width),
+        f64::from(area.size.height),
+    ))
+}
 
 fn toggle_panel(app: &AppHandle, rect: tauri::Rect) {
     let Some(panel) = app.get_webview_window(PANEL) else {
@@ -674,6 +760,16 @@ fn toggle_panel(app: &AppHandle, rect: tauri::Rect) {
     };
     if panel.is_visible().unwrap_or(false) {
         let _ = panel.hide();
+        return;
+    }
+    if let Some(hidden) = app.try_state::<PanelHidden>()
+        && hidden
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .is_some_and(|at| at.elapsed() < PANEL_REOPEN_GUARD)
+    {
         return;
     }
     let scale = panel.scale_factor().unwrap_or(1.0);
@@ -685,17 +781,28 @@ fn toggle_panel(app: &AppHandle, rect: tauri::Rect) {
         .outer_size()
         .map(|s| s.width as f64)
         .unwrap_or(336.0 * scale);
+    let height = panel
+        .outer_size()
+        .map(|s| s.height as f64)
+        .unwrap_or(540.0 * scale);
     // Centred under the icon on macOS; on Windows the tray sits at the bottom, so open above it.
-    let x = pos.x + size.width / 2.0 - width / 2.0;
-    let y = if cfg!(target_os = "windows") {
-        let height = panel
-            .outer_size()
-            .map(|s| s.height as f64)
-            .unwrap_or(540.0 * scale);
+    let mut x = pos.x + size.width / 2.0 - width / 2.0;
+    let mut y = if cfg!(target_os = "windows") {
         pos.y - height - 8.0 * scale
     } else {
         pos.y + size.height + 6.0 * scale
     };
+    // An icon near the edge of the screen would put part of the panel off it. On macOS the panel
+    // hangs from the menu bar, so only its x moves; the Windows tray can sit on any edge.
+    if let Some((area_x, area_y, area_width, area_height)) =
+        work_area_at(app, pos.x + size.width / 2.0, pos.y + size.height / 2.0)
+    {
+        let margin = PANEL_SCREEN_MARGIN * scale;
+        x = clamp_span(x, width, area_x, area_width, margin);
+        if cfg!(target_os = "windows") {
+            y = clamp_span(y, height, area_y, area_height, margin);
+        }
+    }
     let _ = panel.set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32));
     let _ = panel.show();
     let _ = panel.set_focus();
@@ -704,6 +811,11 @@ fn toggle_panel(app: &AppHandle, rect: tauri::Rect) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // First, so a second start hands over before anything else sets up: it shows the running
+        // app's window and quits.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            open_main(app.clone(), None);
+        }))
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
@@ -716,6 +828,7 @@ pub fn run() {
             Some(vec![AUTOSTART_ARG]),
         ))
         .manage(updates::UpdateListener::default())
+        .manage(PanelHidden::default())
         // A new page in the main window does not listen for Sparkle's relaunch question until it says so (updates.rs).
         .on_page_load(|webview, payload| {
             if webview.label() == MAIN && payload.event() == tauri::webview::PageLoadEvent::Started
@@ -758,6 +871,7 @@ pub fn run() {
             other_client_settings,
             prepare_update_restart,
             running_calls,
+            startup_notice,
             updates::update_channel,
             updates::check_for_updates_natively,
             updates::update_listening,
@@ -777,16 +891,21 @@ pub fn run() {
             }
 
             let dir = app.path().app_config_dir()?;
-            let accounts = AccountStore::open(&dir).map_err(std::io::Error::other)?;
+            let (accounts, notice) =
+                AccountStore::open_or_recover(&dir).map_err(std::io::Error::other)?;
+            app.manage(StartupNotice(notice));
             let settings = Arc::new(SettingsStore::open(&dir));
             apply_appearance(app.handle(), settings.get().appearance);
             apply_dock(app.handle(), settings.get().show_in_dock);
             #[cfg(target_os = "macos")]
             build_menu(app)?;
-            if std::env::args().any(|a| a == AUTOSTART_ARG)
+            // The main window starts hidden (tauri.conf.json), so a start by the login item stays
+            // in the menu bar without a window flashing up; any other start shows it.
+            if !std::env::args().any(|a| a == AUTOSTART_ARG)
                 && let Some(main) = app.get_webview_window(MAIN)
             {
-                let _ = main.hide();
+                let _ = main.show();
+                let _ = main.set_focus();
             }
             let app_state = Arc::new(AppState::new(
                 accounts,
@@ -816,12 +935,12 @@ pub fn run() {
                 }
             });
 
-            // See secrets::DevFileStore: dev builds would ask for Keychain access at every rebuild.
-            #[cfg(debug_assertions)]
-            let token_store: Box<dyn secrets::SecretStore> =
-                Box::new(secrets::DevFileStore(dir.join("dev-token.json")));
+            // The MCP token lives in a file only the user can read (secrets::token_store), where
+            // the bridge reads it too without a Keychain prompt. Release builds move the token of an
+            // older version out of the Keychain once, so clients linked with it keep working.
+            let token_store = secrets::token_store(&dir);
             #[cfg(not(debug_assertions))]
-            let token_store: Box<dyn secrets::SecretStore> = Box::new(secrets::SystemStore);
+            secrets::migrate_token(token_store.as_ref(), &secrets::SystemStore);
             let server = match secrets::load_or_create_token(token_store.as_ref()) {
                 Ok(token) => {
                     let token = Arc::new(RwLock::new(token));
@@ -830,12 +949,16 @@ pub fn run() {
                         store: token_store,
                         error: Mutex::new(None),
                     });
-                    let (state, report) = (app_state.clone(), server.clone());
+                    let (serve_state, report, events) =
+                        (app_state.clone(), server.clone(), app_state.events.clone());
                     tauri::async_runtime::spawn(async move {
-                        if let Err(e) = mcp::serve(state, token).await {
+                        if let Err(e) = mcp::serve(serve_state, token).await {
                             log::error!("MCP server stopped: {e}");
                             *report.error.lock().unwrap() =
                                 Some(format!("Poort {} is niet vrij: {e}", mcp::PORT));
+                            // The windows read server_info again on a state event; without one they
+                            // keep showing the server as running.
+                            let _ = events.send(state::AppEvent::SessionsChanged);
                         }
                     });
                     server
@@ -843,7 +966,10 @@ pub fn run() {
                 Err(e) => Arc::new(Server {
                     token: Arc::new(RwLock::new(String::new())),
                     store: token_store,
-                    error: Mutex::new(Some(format!("Geen token in de sleutelhanger: {e}"))),
+                    error: Mutex::new(Some(format!(
+                        "Het MCP-token in {} kon niet worden gelezen of bewaard: {e}",
+                        secrets::token_file(&dir).display()
+                    ))),
                 }),
             };
             app.manage(server);
@@ -872,11 +998,24 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // The panel closes when it loses the focus, like a menu. Not during a sign-in: Touch ID
+            // and 1Password's prompt take the focus, and the panel shows how the sign-in goes.
             if let Some(panel) = app.get_webview_window(PANEL) {
                 let handle = panel.clone();
                 panel.on_window_event(move |event| {
                     if let WindowEvent::Focused(false) = event {
+                        let app = handle.app_handle();
+                        if app
+                            .try_state::<Arc<Signins>>()
+                            .is_some_and(|signins| signins.any_running())
+                            || !handle.is_visible().unwrap_or(false)
+                        {
+                            return;
+                        }
                         let _ = handle.hide();
+                        if let Some(hidden) = app.try_state::<PanelHidden>() {
+                            *hidden.0.lock().unwrap() = Some(Instant::now());
+                        }
                     }
                 });
             }
@@ -906,4 +1045,22 @@ pub fn run() {
             #[cfg(not(target_os = "macos"))]
             let _ = (app, event);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_panel_stays_on_the_screen() {
+        // A 2560 px wide work area starting at 0, 672 px panel, 16 px margin.
+        let clamp = |x| clamp_span(x, 672.0, 0.0, 2560.0, 16.0);
+        assert_eq!(clamp(1000.0), 1000.0, "room enough: unchanged");
+        assert_eq!(clamp(2300.0), 2560.0 - 16.0 - 672.0, "near the right edge");
+        assert_eq!(clamp(-40.0), 16.0, "near the left edge");
+        // A second screen to the left of the main one has a negative origin.
+        assert_eq!(clamp_span(-100.0, 672.0, -1920.0, 1920.0, 16.0), -688.0);
+        // An area narrower than the panel keeps its start.
+        assert_eq!(clamp_span(50.0, 672.0, 0.0, 600.0, 16.0), 16.0);
+    }
 }

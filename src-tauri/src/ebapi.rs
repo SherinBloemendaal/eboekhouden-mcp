@@ -95,11 +95,12 @@ impl EbClient {
                 return call;
             }
         };
-        let Some(_permit) = self.limiter.acquire().await else {
-            call.error = Some(
-                "Te veel aanroepen tegelijk: EB MCP houdt e-Boekhouden rustig (30 per minuut). Probeer het over een minuut opnieuw.".into(),
-            );
-            return call;
+        let _permit = match self.limiter.acquire().await {
+            Ok(permit) => permit,
+            Err(busy) => {
+                call.error = Some(busy.message());
+                return call;
+            }
         };
         let started = Instant::now();
         let mut request = self
@@ -147,8 +148,14 @@ impl EbClient {
                         }
                         Err(_) => call.error = Some("e-Boekhouden gaf geen JSON terug".into()),
                     },
-                    300..=399 | 401 | 403 => {
+                    300..=399 | 401 => {
                         call.error = Some("Niet (meer) ingelogd bij e-Boekhouden".into())
+                    }
+                    // Signed in, but without rights to this part: the session itself is fine.
+                    403 => {
+                        call.error = Some(
+                            "Geen toegang tot dit onderdeel bij e-Boekhouden: dit account mag het niet inzien".into(),
+                        )
                     }
                     404 => call.error = Some("Dit pad bestaat niet (meer) bij e-Boekhouden".into()),
                     429 => call.error = Some("e-Boekhouden vraagt om rustiger aan te doen".into()),
@@ -222,11 +229,9 @@ impl EbClient {
             }
         };
         call.duration_ms = started.elapsed().as_millis() as u64;
+        // A request for the two-step code is a normal step of the sign-in, not an error.
         if let Login::Refused(m) | Login::Error(m) = &outcome {
             call.error = Some(m.clone());
-        }
-        if matches!(outcome, Login::NeedsCode) {
-            call.error = Some("e-Boekhouden vraagt om een tweestapscode".into());
         }
         (call, outcome)
     }
@@ -424,6 +429,38 @@ pub fn count_rows(json: &Value) -> Option<usize> {
     None
 }
 
+/// Why a call gave up waiting for its turn.
+#[derive(Debug, PartialEq)]
+enum Busy {
+    /// The 30 a minute (or the 2 at a time) are taken.
+    RateLimit,
+    /// EB MCP pauses after errors from e-Boekhouden; this much of the pause is left.
+    Paused(Duration),
+}
+
+impl Busy {
+    fn message(&self) -> String {
+        match self {
+            Busy::RateLimit => "Te veel aanroepen tegelijk: EB MCP houdt e-Boekhouden rustig (30 per minuut). Probeer het over een minuut opnieuw.".into(),
+            Busy::Paused(left) => format!(
+                "e-Boekhouden gaf net fouten, dus EB MCP wacht nog {} met nieuwe aanroepen. Probeer het daarna opnieuw.",
+                wait_text(*left)
+            ),
+        }
+    }
+}
+
+/// "12 seconden", "1 minuut", "5 minuten": rounded up, so the user never retries too early.
+fn wait_text(wait: Duration) -> String {
+    let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    match seconds {
+        0 | 1 => "1 seconde".into(),
+        2..=59 => format!("{seconds} seconden"),
+        60 => "1 minuut".into(),
+        _ => format!("{} minuten", seconds.div_ceil(60)),
+    }
+}
+
 /// 30 starts per minute, 2 at a time, and a growing pause after errors.
 struct Limiter {
     slots: Semaphore,
@@ -448,11 +485,17 @@ impl Limiter {
         }
     }
 
-    /// A place under the limit, or None when none comes free within QUEUE_WAIT.
-    async fn acquire(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
-        tokio::time::timeout(QUEUE_WAIT, self.wait_for_turn())
-            .await
-            .ok()
+    /// A place under the limit, or why none came free within QUEUE_WAIT.
+    async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, Busy> {
+        if let Ok(permit) = tokio::time::timeout(QUEUE_WAIT, self.wait_for_turn()).await {
+            return Ok(permit);
+        }
+        let state = self.state.lock().await;
+        let now = TokioInstant::now();
+        Err(match state.paused_until.filter(|t| *t > now) {
+            Some(until) => Busy::Paused(until - now),
+            None => Busy::RateLimit,
+        })
     }
 
     async fn wait_for_turn(&self) -> tokio::sync::SemaphorePermit<'_> {
@@ -517,6 +560,7 @@ mod tests {
                 }),
             )
             .route("/v1/api/kapot", get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }))
+            .route("/v1/api/verboden", get(|| async { axum::http::StatusCode::FORBIDDEN }))
             .route(
                 "/v1/api/auth/login",
                 axum::routing::post(|body: String| async move {
@@ -603,6 +647,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_403_means_no_rights_not_signed_out() {
+        let client = EbClient::new(&mock().await);
+        let call = client.get(&cookies(), "verboden", &[]).await;
+        assert_eq!(call.status, 403);
+        let error = call.error.unwrap();
+        assert!(
+            error.starts_with("Geen toegang tot dit onderdeel"),
+            "{error}"
+        );
+        assert!(!error.contains("ingelogd"), "{error}");
+    }
+
+    #[tokio::test]
     async fn refuses_paths_that_leave_the_api() {
         let client = EbClient::new(&mock().await);
         for bad in [
@@ -629,11 +686,11 @@ mod tests {
         let limiter = Limiter::new();
         let start = tokio::time::Instant::now();
         for _ in 0..PER_MINUTE {
-            assert!(limiter.acquire().await.is_some());
+            assert!(limiter.acquire().await.is_ok());
         }
         assert!(start.elapsed() < Duration::from_secs(1));
         // The 31st waits at most 10 s for a place, then gives up instead of hanging for the rest of the minute.
-        assert!(limiter.acquire().await.is_none());
+        assert_eq!(limiter.acquire().await.err(), Some(Busy::RateLimit));
         let waited = start.elapsed();
         assert!(
             waited >= Duration::from_secs(10) && waited < Duration::from_secs(11),
@@ -646,15 +703,34 @@ mod tests {
         let limiter = Limiter::new();
         limiter.failed(None).await;
         let start = tokio::time::Instant::now();
-        assert!(limiter.acquire().await.is_some());
+        assert!(limiter.acquire().await.is_ok());
         assert!(start.elapsed() >= Duration::from_secs(2));
         limiter.failed(Some(Duration::from_secs(6))).await;
         let start = tokio::time::Instant::now();
-        assert!(limiter.acquire().await.is_some());
+        assert!(limiter.acquire().await.is_ok());
         assert!(start.elapsed() >= Duration::from_secs(6));
-        // A pause longer than the queue wait fails the call instead of holding it for minutes.
+        // A pause longer than the queue wait fails the call instead of holding it for minutes, and says so.
         limiter.failed(Some(Duration::from_secs(120))).await;
-        assert!(limiter.acquire().await.is_none());
+        let Err(Busy::Paused(left)) = limiter.acquire().await else {
+            panic!("the call should give up because of the pause")
+        };
+        assert!(
+            left > Duration::from_secs(100) && left <= Duration::from_secs(110),
+            "{left:?}"
+        );
+    }
+
+    #[test]
+    fn says_why_a_call_gave_up_waiting() {
+        assert!(Busy::RateLimit.message().contains("30 per minuut"));
+        let paused = Busy::Paused(Duration::from_millis(109_400)).message();
+        assert!(paused.contains("e-Boekhouden gaf net fouten"), "{paused}");
+        assert!(paused.contains("nog 2 minuten"), "{paused}");
+        assert!(!paused.contains("30 per minuut"), "{paused}");
+        assert_eq!(wait_text(Duration::from_millis(300)), "1 seconde");
+        assert_eq!(wait_text(Duration::from_millis(11_200)), "12 seconden");
+        assert_eq!(wait_text(Duration::from_secs(60)), "1 minuut");
+        assert_eq!(wait_text(Duration::from_secs(61)), "2 minuten");
     }
 
     #[test]
@@ -706,10 +782,11 @@ mod tests {
             wrong,
             Login::Refused("Gebruikersnaam of wachtwoord onjuist".into())
         );
-        let (_, needs) = client
+        let (call, needs) = client
             .login("jan@studionoord.example", "geheim", None)
             .await;
         assert_eq!(needs, Login::NeedsCode);
+        assert!(call.error.is_none(), "asking for the code is no error");
         let (call, ok) = client
             .login("jan@studionoord.example", "geheim", Some("123456"))
             .await;

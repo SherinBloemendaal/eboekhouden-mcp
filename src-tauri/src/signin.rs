@@ -170,6 +170,11 @@ impl Signins {
         self.pending.lock().unwrap().contains_key(&id)
     }
 
+    /// Whether any sign-in is still running, for any account.
+    pub fn any_running(&self) -> bool {
+        !self.pending.lock().unwrap().is_empty()
+    }
+
     pub fn cancel(&self, id: Uuid) {
         if let Some(p) = self.pending.lock().unwrap().get(&id) {
             p.cancel.store(true, Ordering::SeqCst);
@@ -177,7 +182,11 @@ impl Signins {
     }
 
     pub fn give_code(&self, id: Uuid, code: String) -> Result<(), String> {
-        let code = code.trim().to_owned();
+        // Apps show the code as "123 456" or "123-456"; e-Boekhouden wants the digits only.
+        let code: String = code
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-')
+            .collect();
         if code.is_empty() || code.len() > 12 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
             return Err("Vul de code uit je authenticator-app in".into());
         }
@@ -234,25 +243,24 @@ pub async fn sign_in(
         .unwrap_or_default();
     signins.trace_start(account_id, &label);
     let started = Instant::now();
-    let (step, message) = run(&app, &state, &signins, account_id, &cancel).await;
-    // The sign-in itself in Verzoeken, also when it failed.
-    let call = crate::ebapi::ApiCall {
-        method: "LOGIN",
-        path: "inloggen".into(),
-        query: Vec::new(),
-        status: match step {
-            Step::Done => 200,
-            Step::Failed => 401,
-            Step::Cancelled => 499,
-            _ => 0,
-        },
-        duration_ms: started.elapsed().as_millis() as u64,
-        bytes: 0,
-        rows: None,
-        json: None,
-        error: (step != Step::Done).then(|| message.clone().unwrap_or_else(|| format!("{step:?}"))),
-    };
-    state.log_signin_call(&call, account_id, &label);
+    let mut called = false;
+    let (step, message) = run(&app, &state, &signins, account_id, &cancel, &mut called).await;
+    // Every HTTP call of the sign-in is in Verzoeken already. A sign-in that ended before the first one
+    // (credentials not read, or cancelled) gets a line of its own, so each sign-in shows there.
+    if !called {
+        let call = crate::ebapi::ApiCall {
+            method: "LOGIN",
+            path: "inloggen".into(),
+            query: Vec::new(),
+            status: if step == Step::Cancelled { 499 } else { 0 },
+            duration_ms: started.elapsed().as_millis() as u64,
+            bytes: 0,
+            rows: None,
+            json: None,
+            error: Some(message.clone().unwrap_or_else(|| format!("{step:?}"))),
+        };
+        state.log_signin_call(&call, account_id, &label);
+    }
     signins.trace_end(
         account_id,
         match &message {
@@ -262,14 +270,18 @@ pub async fn sign_in(
     );
     signins.pending.lock().unwrap().remove(&account_id);
     emit(&app, account_id, step, message);
+    // The panel stayed open for this sign-in; if the user has moved on meanwhile, it closes now.
+    crate::hide_unfocused_panel(&app);
 }
 
+/// The sign-in's steps. Sets `called` before its first HTTP call to e-Boekhouden.
 async fn run(
     app: &AppHandle,
     state: &Arc<AppState>,
     signins: &Signins,
     account_id: Uuid,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
+    called: &mut bool,
 ) -> (Step, Option<String>) {
     let Some(account) = state.accounts.get(account_id) else {
         return (Step::Failed, Some("Dit account bestaat niet meer".into()));
@@ -279,13 +291,15 @@ async fn run(
         account_id,
         format!("Gegevens lezen uit {:?}", account.store),
     );
-    let credentials = creds::read(&account).await;
+    let credentials = creds::read(&account, cancel).await;
     crate::refocus_main(app);
     let credentials = match credentials {
         Ok(c) => {
             signins.trace(account_id, "Gegevens gelezen");
             c
         }
+        // Stopping kills the 1Password read; whatever it reported then, the user stopped it.
+        Err(_) if cancel.load(Ordering::SeqCst) => return (Step::Cancelled, None),
         Err(e) => return (Step::Failed, Some(e.0)),
     };
     if cancel.load(Ordering::SeqCst) {
@@ -304,6 +318,7 @@ async fn run(
                 "Inloggen bij e-Boekhouden (auth/login)"
             },
         );
+        *called = true;
         let (call, outcome) = state
             .client
             .login(
@@ -320,9 +335,13 @@ async fn run(
         if cancel.load(Ordering::SeqCst) {
             return (Step::Cancelled, None);
         }
+        // A 429 is e-Boekhouden asking to wait, not a wrong code: asking for another code would not help.
+        let throttled = call.status == 429;
         match outcome {
             Login::Session(cookies) => break cookies,
-            Login::Refused(message) if code.is_none() => return (Step::Failed, Some(message)),
+            Login::Refused(message) if code.is_none() || throttled => {
+                return (Step::Failed, Some(message));
+            }
             Login::Refused(_) | Login::NeedsCode if code.is_some() && code_tries >= CODE_TRIES => {
                 return (
                     Step::Failed,
@@ -494,21 +513,51 @@ mod tests {
     fn accepts_only_plausible_codes() {
         let signins = Signins::default();
         let id = Uuid::new_v4();
-        assert!(signins.give_code(id, "48 29".into()).is_err());
+        assert!(signins.give_code(id, "48.29".into()).is_err());
+        assert!(signins.give_code(id, " - ".into()).is_err());
+        assert!(signins.give_code(id, "1234 5678 9012 3".into()).is_err());
         assert_eq!(
             signins.give_code(id, "482913".into()),
             Err("Er wordt nu geen code gevraagd".into())
         );
-        let (tx, rx) = oneshot::channel();
+        let pending = |signins: &Signins| {
+            let (tx, rx) = oneshot::channel();
+            signins.pending.lock().unwrap().insert(
+                id,
+                Pending {
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    code: Some(tx),
+                },
+            );
+            rx
+        };
+        for (typed, sent) in [
+            (" 482913 ", "482913"),
+            ("482 913", "482913"),
+            ("482-913", "482913"),
+        ] {
+            let rx = pending(&signins);
+            signins.give_code(id, typed.into()).unwrap();
+            assert_eq!(rx.blocking_recv().unwrap(), sent, "{typed:?}");
+        }
+    }
+
+    #[test]
+    fn knows_whether_any_sign_in_runs() {
+        let signins = Signins::default();
+        assert!(!signins.any_running());
+        let id = Uuid::new_v4();
         signins.pending.lock().unwrap().insert(
             id,
             Pending {
                 cancel: Arc::new(AtomicBool::new(false)),
-                code: Some(tx),
+                code: None,
             },
         );
-        signins.give_code(id, " 482913 ".into()).unwrap();
-        assert_eq!(rx.blocking_recv().unwrap(), "482913");
+        assert!(signins.any_running());
+        assert!(signins.is_running(id));
+        signins.pending.lock().unwrap().remove(&id);
+        assert!(!signins.any_running());
     }
 
     #[test]
@@ -517,10 +566,7 @@ mod tests {
         let id = Uuid::new_v4();
         for n in 0..12 {
             signins.trace_start(id, &format!("Studio {n}"));
-            signins.trace(
-                id,
-                "Pagina: form (/bh/inloggen.asp: e-mailveld in formulier)",
-            );
+            signins.trace(id, "Inloggen bij e-Boekhouden (auth/login)");
             signins.trace_end(id, "Done".into());
         }
         let traces = signins.traces();

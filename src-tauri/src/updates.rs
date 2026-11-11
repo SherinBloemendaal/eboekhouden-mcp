@@ -240,7 +240,7 @@ mod sparkle {
 fn request_relaunch<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
     use tauri::{Emitter, Manager};
 
-    // Only to the main window: never to the hidden e-Boekhouden webviews.
+    // Only to the main window: the tray panel does not answer update questions.
     let asked = app.state::<UpdateListener>().is_listening()
         && app.emit_to("main", UPDATE_RELAUNCH_REQUESTED, ()).is_ok();
     if asked {

@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -58,20 +59,72 @@ pub struct AccountStore {
     accounts: Mutex<Vec<Account>>,
 }
 
+/// What `AccountStore::load` found on disk.
+enum Loaded {
+    Accounts(Vec<Account>),
+    /// The file is there but is not an account list; the parse error.
+    Damaged(String),
+}
+
 impl AccountStore {
+    /// Opens the list, and refuses a damaged file. The app opens with `open_or_recover`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open(dir: &Path) -> Result<Self, String> {
-        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let path = dir.join("accounts.json");
-        let accounts = match fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text)
-                .map_err(|e| format!("accounts.json is beschadigd: {e}"))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e.to_string()),
-        };
-        Ok(Self {
+        match Self::load(dir, &path)? {
+            Loaded::Accounts(accounts) => Ok(Self::with(path, accounts)),
+            Loaded::Damaged(e) => Err(format!("accounts.json is beschadigd: {e}")),
+        }
+    }
+
+    /// Opens the list. A file that cannot be read as an account list is kept aside as
+    /// `accounts.broken-<unix ms>.json` and the app starts with no accounts, so it still opens.
+    /// The second value is the notice for the user that says so.
+    pub fn open_or_recover(dir: &Path) -> Result<(Self, Option<String>), String> {
+        let path = dir.join("accounts.json");
+        match Self::load(dir, &path)? {
+            Loaded::Accounts(accounts) => Ok((Self::with(path, accounts), None)),
+            Loaded::Damaged(e) => {
+                let millis = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let name = format!("accounts.broken-{millis}.json");
+                let kept = dir.join(&name);
+                // Without the rename the next save would overwrite the damaged file, so stop instead.
+                fs::rename(&path, &kept).map_err(|r| {
+                    format!("accounts.json is beschadigd ({e}) en kon niet opzij worden gezet: {r}")
+                })?;
+                log::warn!(
+                    "accounts.json is beschadigd ({e}), bewaard als {}",
+                    kept.display()
+                );
+                let notice = format!(
+                    "Je lijst met accounts (accounts.json) was beschadigd. EB MCP heeft hem bewaard als {name} in {} en begint met een lege lijst. Voeg je accounts opnieuw toe.",
+                    dir.display()
+                );
+                Ok((Self::with(path, Vec::new()), Some(notice)))
+            }
+        }
+    }
+
+    fn load(dir: &Path, path: &Path) -> Result<Loaded, String> {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        match fs::read_to_string(path) {
+            Ok(text) => Ok(match serde_json::from_str(&text) {
+                Ok(accounts) => Loaded::Accounts(accounts),
+                Err(e) => Loaded::Damaged(e.to_string()),
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Loaded::Accounts(Vec::new())),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn with(path: PathBuf, accounts: Vec<Account>) -> Self {
+        Self {
             path,
             accounts: Mutex::new(accounts),
-        })
+        }
     }
 
     pub fn list(&self) -> Vec<Account> {
@@ -334,6 +387,46 @@ mod tests {
             store.get(b.id).unwrap().is_default,
             "removing the default hands it on"
         );
+    }
+
+    #[test]
+    fn a_damaged_file_is_kept_aside_and_the_app_starts_empty() {
+        let dir = dir();
+        fs::write(dir.join("accounts.json"), "[{\"label\": kapot").unwrap();
+        assert!(
+            AccountStore::open(&dir).is_err(),
+            "plain open still refuses it"
+        );
+
+        let (store, notice) = AccountStore::open_or_recover(&dir).unwrap();
+        assert!(store.list().is_empty());
+        let kept: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with("accounts.broken-") && n.ends_with(".json"))
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(
+            fs::read_to_string(dir.join(&kept[0])).unwrap(),
+            "[{\"label\": kapot",
+            "the damaged file is kept as it was"
+        );
+        let notice = notice.expect("the user hears about it");
+        assert!(notice.contains(&kept[0]), "{notice}");
+        assert!(!dir.join("accounts.json").exists());
+
+        // The new list saves and opens again without a notice.
+        let added = store.add(system("Atelier Zuid")).unwrap();
+        let (again, notice) = AccountStore::open_or_recover(&dir).unwrap();
+        assert_eq!(again.list(), vec![added]);
+        assert_eq!(notice, None);
+    }
+
+    #[test]
+    fn a_missing_file_is_an_empty_list_without_a_notice() {
+        let (store, notice) = AccountStore::open_or_recover(&dir()).unwrap();
+        assert!(store.list().is_empty());
+        assert_eq!(notice, None);
     }
 
     #[test]

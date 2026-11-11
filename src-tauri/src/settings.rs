@@ -124,8 +124,17 @@ mod older_files {
 
     #[test]
     fn keeps_the_dock_choice() {
-        let settings: Settings =
-            serde_json::from_str(r#"{"idleMinutes": 30, "showInDock": true}"#).unwrap();
-        assert!(settings.show_in_dock);
+        for show in [true, false] {
+            let text = serde_json::to_string(&Settings {
+                show_in_dock: show,
+                ..Settings::default()
+            })
+            .unwrap();
+            let settings: Settings = serde_json::from_str(&text).unwrap();
+            assert_eq!(settings.show_in_dock, show, "{text}");
+        }
+        let hidden: Settings =
+            serde_json::from_str(r#"{"idleMinutes": 30, "showInDock": false}"#).unwrap();
+        assert!(!hidden.show_in_dock);
     }
 }

@@ -1,12 +1,18 @@
 //! Reading an account's credentials at sign-in, and only then.
 //!
 //! - 1Password: `op read` on the item's username and password fields. The
-//!   1Password app asks the user itself.
+//!   1Password app asks the user itself. Stopping the sign-in kills `op`, and
+//!   so does a 1Password that gives no answer within 2 minutes.
 //! - System store: the password from the Keychain or Credential Manager, after
 //!   Touch ID or Windows Hello confirms it is the user.
 
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
@@ -21,6 +27,11 @@ pub struct Credentials {
 /// Why credentials could not be read; the message is shown as is.
 #[derive(Debug, PartialEq)]
 pub struct CredError(pub String);
+
+/// How long the 1Password read may take, its prompt included.
+const OP_TIMEOUT: Duration = Duration::from_secs(120);
+/// How often a running `op` is checked for an end, a stop or the timeout.
+const OP_POLL: Duration = Duration::from_millis(100);
 
 fn password_key(id: Uuid) -> String {
     format!("account:{id}")
@@ -37,23 +48,22 @@ pub fn delete_password(id: Uuid) -> Result<(), String> {
     SystemStore.delete(&password_key(id))
 }
 
-pub async fn read(account: &Account) -> Result<Credentials, CredError> {
+/// Reads the account's username and password. Setting `cancel` stops a 1Password read: `op` is killed and
+/// the read ends with an error; the caller tells a stop from a failure by `cancel` itself.
+pub async fn read(account: &Account, cancel: &Arc<AtomicBool>) -> Result<Credentials, CredError> {
     match account.store {
         Store::OnePassword => {
             let reference = account
                 .op_ref
                 .clone()
                 .ok_or_else(|| CredError("Geen 1Password-item ingesteld".into()))?;
-            tokio::task::spawn_blocking(move || read_1password(&reference))
+            let cancel = cancel.clone();
+            tokio::task::spawn_blocking(move || read_1password(&reference, &cancel))
                 .await
                 .map_err(|e| CredError(e.to_string()))?
         }
         Store::System => {
-            confirm_user(&format!(
-                "het wachtwoord van {} te gebruiken",
-                account.label
-            ))
-            .await?;
+            confirm_user(&confirm_text(&account.label)).await?;
             let password = SystemStore
                 .get(&password_key(account.id))
                 .map_err(CredError)?
@@ -71,13 +81,32 @@ pub async fn read(account: &Account) -> Result<Credentials, CredError> {
     }
 }
 
-fn read_1password(reference: &str) -> Result<Credentials, CredError> {
+/// What Touch ID and Windows Hello show: "EB MCP wil het wachtwoord van Studio Noord gebruiken".
+fn confirm_text(label: &str) -> String {
+    format!("EB MCP wil het wachtwoord van {label} gebruiken")
+}
+
+fn read_1password(reference: &str, cancel: &AtomicBool) -> Result<Credentials, CredError> {
     let op = op_binary().ok_or_else(|| CredError("De 1Password-CLI (op) is niet gevonden. Installeer hem en zet de koppeling met de 1Password-app aan.".into()))?;
+    // One deadline for both fields: the user answers 1Password's prompt once.
+    let deadline = Instant::now() + OP_TIMEOUT;
     let field = |name: &str| -> Result<String, CredError> {
-        let output = Command::new(&op)
-            .args(["read", "--no-newline", &format!("{reference}/{name}")])
-            .output()
-            .map_err(|e| CredError(format!("1Password-CLI start niet: {e}")))?;
+        let waited = wait_child(
+            Command::new(&op).args(["read", "--no-newline", &format!("{reference}/{name}")]),
+            cancel,
+            deadline,
+        )
+        .map_err(|e| CredError(format!("1Password-CLI start niet: {e}")))?;
+        let output = match waited {
+            Waited::Exited(output) => output,
+            Waited::Cancelled => return Err(CredError("Inloggen gestopt".into())),
+            Waited::TimedOut => {
+                return Err(CredError(
+                    "1Password gaf binnen 2 minuten geen antwoord. Ontgrendel 1Password en probeer opnieuw."
+                        .into(),
+                ));
+            }
+        };
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr);
             return Err(CredError(op_message(&detail, reference)));
@@ -93,6 +122,65 @@ fn read_1password(reference: &str) -> Result<Credentials, CredError> {
         )));
     }
     Ok(Credentials { username, password })
+}
+
+/// How a child process ended under `wait_child`.
+#[derive(Debug)]
+enum Waited {
+    Exited(Output),
+    /// `cancel` was set; the child was killed.
+    Cancelled,
+    /// The deadline passed; the child was killed.
+    TimedOut,
+}
+
+/// Runs `command` to its end, unless `cancel` is set or `deadline` passes first: then the child is killed.
+/// Its output is read on threads meanwhile, so a full pipe never holds the child up.
+fn wait_child(
+    command: &mut Command,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> std::io::Result<Waited> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    loop {
+        let stopped = match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(Waited::Exited(Output {
+                    status,
+                    stdout: stdout.join().unwrap_or_default(),
+                    stderr: stderr.join().unwrap_or_default(),
+                }));
+            }
+            Ok(None) if cancel.load(Ordering::SeqCst) => Ok(Waited::Cancelled),
+            Ok(None) if Instant::now() >= deadline => Ok(Waited::TimedOut),
+            Ok(None) => {
+                std::thread::sleep(OP_POLL);
+                continue;
+            }
+            Err(e) => Err(e),
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        // The reader threads end once the pipes close; whatever they read is dropped unseen.
+        drop((stdout, stderr));
+        return stopped;
+    }
+}
+
+fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buffer);
+        }
+        buffer
+    })
 }
 
 /// A login in 1Password, as the picker shows it. Never carries a password.
@@ -258,7 +346,7 @@ fn op_binary() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
-/// Touch ID (or the account password) on macOS, Windows Hello on Windows.
+/// Touch ID (or the account password) on macOS, Windows Hello on Windows, showing `reason` as is.
 async fn confirm_user(reason: &str) -> Result<(), CredError> {
     #[cfg(target_os = "macos")]
     {
@@ -310,7 +398,7 @@ mod mac {
                 }
                 keep.lock().unwrap().take();
             });
-            let text = NSString::from_str(&format!("EB MCP wil {reason}"));
+            let text = NSString::from_str(reason);
             // DeviceOwnerAuthentication: Touch ID, with the account password as fallback.
             unsafe {
                 context.evaluatePolicy_localizedReason_reply(
@@ -334,7 +422,7 @@ mod win {
     use windows::core::HSTRING;
 
     pub async fn confirm(reason: &str) -> Result<(), CredError> {
-        let message = HSTRING::from(format!("EB MCP wil {reason}"));
+        let message = HSTRING::from(reason);
         let result = tokio::task::spawn_blocking(
             move || -> windows::core::Result<UserConsentVerificationResult> {
                 UserConsentVerifier::RequestVerificationAsync(&message)?.join()
@@ -359,7 +447,7 @@ mod win {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpListError, list_error, op_message, parse_items};
+    use super::{OpListError, confirm_text, list_error, op_message, parse_items};
 
     const LIST: &str = r#"[
       {"id":"itm1","title":"Zakelijke bank","version":3,"vault":{"id":"vlt1","name":"Werk"},"category":"LOGIN",
@@ -416,6 +504,79 @@ mod tests {
         );
         let json = serde_json::to_string(&OpListError::Missing).unwrap();
         assert_eq!(json, r#"{"kind":"missing"}"#);
+    }
+
+    #[test]
+    fn asks_for_touch_id_in_plain_dutch() {
+        assert_eq!(
+            confirm_text("Studio Noord"),
+            "EB MCP wil het wachtwoord van Studio Noord gebruiken"
+        );
+    }
+
+    /// The wait for `op`, tried with harmless commands.
+    #[cfg(unix)]
+    mod children {
+        use crate::creds::{Waited, wait_child};
+        use std::process::Command;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn kills_a_child_on_timeout_and_on_cancel() {
+            let never = AtomicBool::new(false);
+            let started = Instant::now();
+            let waited = wait_child(
+                Command::new("sleep").arg("30"),
+                &never,
+                Instant::now() + Duration::from_millis(300),
+            )
+            .unwrap();
+            assert!(matches!(waited, Waited::TimedOut), "{waited:?}");
+            assert!(started.elapsed() < Duration::from_secs(5));
+
+            let cancel = Arc::new(AtomicBool::new(false));
+            let flag = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                flag.store(true, Ordering::SeqCst);
+            });
+            let started = Instant::now();
+            let waited = wait_child(
+                Command::new("sleep").arg("30"),
+                &cancel,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+            assert!(matches!(waited, Waited::Cancelled), "{waited:?}");
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+
+        #[test]
+        fn returns_the_output_of_a_child_that_ends_in_time() {
+            let never = AtomicBool::new(false);
+            let waited = wait_child(
+                Command::new("sh").args(["-c", "printf hallo; printf oeps >&2; exit 3"]),
+                &never,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let Waited::Exited(output) = waited else {
+                panic!("the child should have ended on its own")
+            };
+            assert_eq!(output.stdout, b"hallo");
+            assert_eq!(output.stderr, b"oeps");
+            assert_eq!(output.status.code(), Some(3));
+            assert!(
+                wait_child(
+                    &mut Command::new("/nonexistent/op"),
+                    &never,
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
