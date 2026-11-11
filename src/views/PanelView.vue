@@ -8,6 +8,7 @@ import {
   askedCode, cancelSignIn, connect, dismissSignin, isRunning, sessionAge, signIn, signingIn, signOut, signOutAll, startedHere, store,
   type AccountView,
 } from '../lib/accounts'
+import { connectApprovals, quitWarning, waitingText } from '../lib/approvals'
 import { fitPanel, isMac, modKey, openMain, quitApp, runningCalls, server, watchServer } from '../lib/server'
 import { checkNow } from '../lib/updates'
 
@@ -21,7 +22,7 @@ let clockTimer: ReturnType<typeof setInterval> | undefined
 onMounted(async () => {
   stopServer = watchServer()
   clockTimer = setInterval(() => (now.value = Date.now()), 30_000)
-  await connect()
+  await Promise.all([connect(), connectApprovals()])
 })
 onBeforeUnmount(() => {
   stopServer?.()
@@ -37,6 +38,7 @@ const subtitle = computed(() => {
 
 const items = [
   { icon: 'chart', label: 'Dashboard', route: '/dashboard' },
+  { icon: 'clipboard-check', label: 'Akkoord', route: '/akkoord' },
   { icon: 'list', label: 'Verzoeken', route: '/verzoeken' },
   { icon: 'users', label: 'Accounts beheren', route: '/accounts' },
   { icon: 'plug', label: 'Koppelen met een AI-client', route: '/koppelen' },
@@ -74,16 +76,17 @@ async function checkForUpdates() {
   if (!isMac) await openMain('/dashboard')
 }
 
-/** Asks first only while an AI client is waiting on a call; otherwise quits at once. */
-const confirmQuit = ref(0)
+/** Asks first while an AI client is waiting on a call or a change waits for approval; otherwise quits at once. */
+const confirmQuit = ref<{ running: number; waiting: number } | null>(null)
 async function quit() {
   if (quitting.value) return
   const running = await runningCalls()
-  if (running > 0 && !confirmQuit.value) {
-    confirmQuit.value = running
+  const waiting = store.approvals.length
+  if ((running > 0 || waiting > 0) && !confirmQuit.value) {
+    confirmQuit.value = { running, waiting }
     return
   }
-  confirmQuit.value = 0
+  confirmQuit.value = null
   quitting.value = true
   await quitApp()
 }
@@ -165,9 +168,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
     <Transition name="accordion">
       <div v-if="store.approvals.length" class="accordion">
         <div>
-          <button type="button" class="item waiting" @click="openMain()">
+          <button type="button" class="item waiting" @click="openMain('/akkoord')">
             <Icon name="alert" :size="15" class="item-icon" />
-            <span>{{ store.approvals.length === 1 ? '1 wijziging wacht op je akkoord' : `${store.approvals.length} wijzigingen wachten op je akkoord` }}</span>
+            <span>{{ waitingText(store.approvals.length) }}</span>
           </button>
         </div>
       </div>
@@ -199,10 +202,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
     </button>
     </div>
     <Transition name="modal">
-      <Alert v-if="confirmQuit" title="Toch afsluiten?" tone="warn" @close="confirmQuit = 0">
-        <p>{{ confirmQuit === 1 ? 'Er loopt nog 1 aanroep' : `Er lopen nog ${confirmQuit} aanroepen` }} van een AI-client. Die krijgt dan een fout, en EB MCP vergeet alle sessies.</p>
+      <Alert v-if="confirmQuit" title="Toch afsluiten?" tone="warn" @close="confirmQuit = null">
+        <p>{{ quitWarning(confirmQuit.running, confirmQuit.waiting) }}</p>
         <template #buttons>
-          <button type="button" class="btn" @click="confirmQuit = 0">Annuleren</button>
+          <button type="button" class="btn" @click="confirmQuit = null">Annuleren</button>
           <button type="button" class="btn danger-fill" @click="quit">Afsluiten</button>
         </template>
       </Alert>

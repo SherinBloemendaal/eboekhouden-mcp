@@ -1,12 +1,13 @@
-//! The read-only MCP tools. Each one resolves the account (the default one
-//! unless the client names another), calls e-Boekhouden's API in that
-//! session, and logs itself with the calls it caused. Nothing here books,
-//! saves or deletes.
+//! The MCP tools. Each one resolves the account (the only one, or the one
+//! the client names), calls e-Boekhouden's API in that session, and logs
+//! itself with the calls it caused. The tools that read are marked read-only;
+//! the ones that book, save or delete all run through `write_tool`.
 //!
 //! Query parameter names come from e-Boekhouden's own Angular app (the public
 //! bundle): grids take offset, limit, orderBy and sortDirection plus filters.
 
-use std::sync::{Arc, LazyLock};
+use std::future::Future;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -21,9 +22,10 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
 
 use crate::accounts::{Account, WriteMode};
-use crate::approvals::{self, Ask, line};
+use crate::approvals::{self, Answer, Ask, Technical, line};
 use crate::reqlog::Outcome;
 use crate::state::{AppEvent, AppState};
 use crate::write::{self, Books, Built};
@@ -241,6 +243,12 @@ pub struct RelatiesArgs {
     pub offset: Option<u32>,
     /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct AkkoordStatusArgs {
+    /// Het voorstel_id uit het antwoord van een tool die iets wijzigt. Zonder: alle voorstellen van de laatste 24 uur.
+    pub voorstel_id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -769,6 +777,143 @@ struct Run {
     id: u64,
     client: String,
     account: Account,
+    /// For a tool that changes the books: what its proposal needs and how its MCP call hears that it went up.
+    write: Option<WriteRun>,
+}
+
+/// The part of a run that only a tool that changes the books has (`write_tool`).
+struct WriteRun {
+    /// The tool's arguments, for the history.
+    args: Value,
+    gate: Arc<Gate>,
+    /// Tells the MCP call that the proposal went up and waits; taken by `approve`.
+    queued: Mutex<Option<oneshot::Sender<u64>>>,
+    /// The change's record in the history (approvals.rs), once `approve` made one.
+    proposal: Mutex<Option<u64>>,
+}
+
+impl Run {
+    fn proposal(&self) -> Option<u64> {
+        self.write
+            .as_ref()
+            .and_then(|w| *w.proposal.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+/// Whether a write tool's change can still be stopped together with its MCP call. Before `approve` the task
+/// only reads, and a call the client abandons stops it. From `approve` on, the change belongs to the queue or
+/// runs, and nothing stops it halfway.
+#[derive(Default)]
+struct Gate(Mutex<GateState>);
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum GateState {
+    #[default]
+    Preparing,
+    Committed,
+    Abandoned,
+}
+
+impl Gate {
+    fn state(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Passed by `approve` before anything is asked or sent. `false` when the MCP call was abandoned already.
+    fn commit(&self) -> bool {
+        let mut state = self.state();
+        if *state == GateState::Abandoned {
+            return false;
+        }
+        *state = GateState::Committed;
+        true
+    }
+
+    /// The MCP call ended without the task's answer. `true` when the change was not committed yet, so the
+    /// task may be stopped: it has only read.
+    fn abandon(&self) -> bool {
+        let mut state = self.state();
+        if *state == GateState::Preparing {
+            *state = GateState::Abandoned;
+            return true;
+        }
+        false
+    }
+
+    fn committed(&self) -> bool {
+        *self.state() == GateState::Committed
+    }
+}
+
+/// The answer of a write tool whose MCP call was abandoned before anything was asked or sent.
+const ABANDONED: &str =
+    "De AI-client heeft de aanroep afgebroken; er is niets gevraagd of gewijzigd.";
+/// The answer of a write tool whose task stopped halfway (a panic, or the app shutting down).
+const CUT_OFF: &str = "De aanroep is afgebroken voordat hij klaar was. Kijk in e-Boekhouden wat er al is doorgevoerd.";
+
+/// Stops a write tool's task when its MCP call ends before the task gave an answer, as long as the change
+/// was not committed (`Gate`). Disarmed once the call has its answer.
+struct StopUnanswered {
+    gate: Arc<Gate>,
+    task: tokio::task::AbortHandle,
+    armed: bool,
+}
+
+impl Drop for StopUnanswered {
+    fn drop(&mut self) {
+        if self.armed && self.gate.abandon() {
+            self.task.abort();
+        }
+    }
+}
+
+/// Inside a write tool's task: ends its log entry and its record when the task is dropped before
+/// `end_write` (stopped by `StopUnanswered`, a panic, or the runtime shutting down).
+struct Unfinished<'a> {
+    mcp: &'a EbMcp,
+    run: &'a Run,
+    armed: bool,
+}
+
+impl Drop for Unfinished<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = &self.mcp.state;
+        let waiting = matches!(
+            state.log.get(self.run.id),
+            Some(crate::reqlog::Entry::Mcp(m)) if m.outcome == Outcome::Waiting
+        );
+        let committed = self.run.write.as_ref().is_some_and(|w| w.gate.committed());
+        if waiting {
+            // Still waiting for the user: the history keeps it waiting, and it lapses at the next start.
+            state.log.finish_mcp(
+                self.run.id,
+                Outcome::Refused,
+                None,
+                Some(crate::reqlog::LAPSED.to_owned()),
+            );
+        } else if committed {
+            state
+                .log
+                .finish_mcp(self.run.id, Outcome::Error, None, Some(CUT_OFF.to_owned()));
+            if let Some(id) = self.run.proposal() {
+                state
+                    .approvals
+                    .finish(id, Err(CUT_OFF.to_owned()), crate::state::now_ms());
+                let _ = state.events.send(AppEvent::ApprovalsChanged);
+            }
+        } else {
+            state.log.finish_mcp(
+                self.run.id,
+                Outcome::Refused,
+                None,
+                Some(ABANDONED.to_owned()),
+            );
+        }
+        let _ = state.events.send(AppEvent::LogChanged);
+    }
 }
 
 fn client_name(context: &RequestContext<RoleServer>) -> String {
@@ -861,6 +1006,7 @@ impl EbMcp {
             id,
             client,
             account,
+            write: None,
         })
     }
 
@@ -948,17 +1094,11 @@ impl From<String> for Halt {
     }
 }
 
-/// Takes a proposal down when its tool call ends without an answer (the AI client gave up, or the wait ran out).
-struct Withdraw<'a> {
-    state: &'a AppState,
-    id: u64,
-}
-
-impl Drop for Withdraw<'_> {
-    fn drop(&mut self) {
-        self.state.approvals.withdraw(self.id);
-        let _ = self.state.events.send(AppEvent::ApprovalsChanged);
-    }
+/// The refusal for an account that is read-only in EB MCP.
+fn read_only(label: &str) -> String {
+    format!(
+        "{label} is alleen-lezen in EB MCP: er is niets gewijzigd. De gebruiker kan schrijven aanzetten in EB MCP onder Accounts, bij het bewerken van het account."
+    )
 }
 
 /// What a tool args struct says about writing, for the user who reads `status`.
@@ -1020,13 +1160,105 @@ impl EbMcp {
     ) -> Result<Run, CallToolResult> {
         let run = self.begin(context, tool, args, account)?;
         if run.account.write == WriteMode::Off {
-            let message = format!(
-                "{} is alleen-lezen in EB MCP: er is niets gewijzigd. De gebruiker kan schrijven aanzetten in EB MCP onder Accounts, bij het bewerken van het account.",
-                run.account.label
-            );
+            let message = read_only(&run.account.label);
             return Err(self.refuse(run, message));
         }
         Ok(run)
+    }
+
+    /// Runs a tool that changes the books: `work` reads what it needs, builds the change, passes `approve`
+    /// and sends it. It runs as a task of its own, so the MCP call can answer before the change is done:
+    ///
+    /// - with the task's own answer when it ends without waiting: bad input, a refusal, or a change that
+    ///   needed no approval and ran;
+    /// - with the "waiting" answer (`waiting_answer`) as soon as `approve` put a proposal up for the user.
+    ///   The task lives on, waits for the answer, sends exactly the requests it would have sent, and ends its
+    ///   log entry and its record in the history with the outcome.
+    ///
+    /// When the MCP call ends before either (the client gave up), a task that has only read is stopped.
+    async fn write_tool<A, F, Fut>(
+        &self,
+        context: &RequestContext<RoleServer>,
+        tool: &'static str,
+        account: Option<&str>,
+        args: A,
+        done: &'static str,
+        work: F,
+    ) -> Result<CallToolResult, McpError>
+    where
+        A: Serialize + Send + 'static,
+        F: FnOnce(EbMcp, Arc<Run>, A) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Value, Halt>> + Send + 'static,
+    {
+        let mut run = match self.begin_write(context, tool, &args, account) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let gate = Arc::new(Gate::default());
+        let (queued, mut proposal) = oneshot::channel();
+        run.write = Some(WriteRun {
+            args: serde_json::to_value(&args).unwrap_or(Value::Null),
+            gate: gate.clone(),
+            queued: Mutex::new(Some(queued)),
+            proposal: Mutex::new(None),
+        });
+        let run = Arc::new(run);
+        let mut task = tokio::spawn({
+            let (this, run) = (self.clone(), run.clone());
+            async move {
+                let mut unfinished = Unfinished {
+                    mcp: &this,
+                    run: &run,
+                    armed: true,
+                };
+                let result = work(this.clone(), run.clone(), args).await;
+                unfinished.armed = false;
+                this.end_write(&run, done, result)
+            }
+        });
+        let mut stop = StopUnanswered {
+            gate,
+            task: task.abort_handle(),
+            armed: true,
+        };
+        let answer = tokio::select! {
+            // A change that was answered and ran before this call looked gives its own outcome.
+            biased;
+            joined = &mut task => match joined {
+                Ok(answer) => answer,
+                Err(e) => {
+                    log::error!("{tool}: the task of the change stopped: {e}");
+                    CallToolResult::error(vec![ContentBlock::text(CUT_OFF.to_owned())])
+                }
+            },
+            Ok(id) = &mut proposal => self.waiting_answer(&run, id),
+        };
+        stop.armed = false;
+        Ok(answer)
+    }
+
+    /// The answer of a tool whose change waits for the user: not an error, and it says how to follow up.
+    fn waiting_answer(&self, run: &Run, id: u64) -> CallToolResult {
+        let title = self
+            .state
+            .approvals
+            .get(id)
+            .map(|d| d.record.proposal.title)
+            .unwrap_or_default();
+        let value = json!({
+            "account": run.account.label,
+            "administratie": run.account.administration,
+            "status": "wacht",
+            "voorstel_id": id,
+            "titel": title,
+            "let_op": format!(
+                "Deze wijziging wacht op het akkoord van de gebruiker in EB MCP; er is nog niets gewijzigd. \
+                 Je hoeft niet te wachten: ga gerust verder met ander werk. Zodra de gebruiker goedkeurt, voert EB MCP \
+                 de wijziging zelf uit. Vraag de uitkomst later op met akkoord_status (voorstel_id {id}), en vertel \
+                 de gebruiker dat er in EB MCP een wijziging op akkoord wacht."
+            ),
+        });
+        CallToolResult::success(vec![ContentBlock::text(value.to_string())])
     }
 
     /// The rekeningschema and btw codes of the account's administration.
@@ -1042,8 +1274,10 @@ impl EbMcp {
         Books::from_api(&grootboek, &btw)
     }
 
-    /// Puts the change in front of the user and waits for the answer. An account that needs no approval skips
-    /// this, except for `danger` (deleting, crediting, invoicing in bulk): those always ask.
+    /// Puts the change in front of the user and waits for the answer; the MCP call has answered already by
+    /// then (`write_tool`). An account that needs no approval skips this, except for `danger` (deleting,
+    /// crediting, invoicing in bulk, where mail goes): those always ask. Either way the change gets a record in
+    /// the history. The account is read again here: writing may have been turned off since the call began.
     async fn approve(
         &self,
         run: &Run,
@@ -1051,35 +1285,85 @@ impl EbMcp {
         built: &Built,
         danger: bool,
     ) -> Result<(), Halt> {
-        if run.account.write == WriteMode::Auto && !danger {
+        let Some(write) = run.write.as_ref() else {
+            return Err(Halt::Error(
+                "EB MCP kon deze wijziging niet voorleggen; er is niets gewijzigd.".into(),
+            ));
+        };
+        if !write.gate.commit() {
+            return Err(Halt::Refused(ABANDONED.into()));
+        }
+        let mode = match self.state.accounts.get(run.account.id) {
+            Some(account) => account.write,
+            None => {
+                return Err(Halt::Refused(
+                    "Dit account staat niet meer in EB MCP. Er is niets gewijzigd.".into(),
+                ));
+            }
+        };
+        if mode == WriteMode::Off {
+            return Err(Halt::Refused(read_only(&run.account.label)));
+        }
+        let ask = Ask {
+            account_id: run.account.id,
+            account: run.account.label.clone(),
+            client: run.client.clone(),
+            tool: tool.to_owned(),
+            title: built.title.clone(),
+            lines: built.lines.clone(),
+            danger,
+        };
+        let technical = Technical {
+            args: write.args.clone(),
+            body: built.body.clone(),
+            log_id: Some(run.id),
+        };
+        let now = crate::state::now_ms();
+        if mode == WriteMode::Auto && !danger {
+            let id = self.state.approvals.record_auto(ask, technical, now);
+            *write.proposal.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+            self.state.log.link_proposal(run.id, id);
+            let _ = self.state.events.send(AppEvent::ApprovalsChanged);
             return Ok(());
         }
-        let (proposal, answer) = self.state.approvals.ask(
-            Ask {
-                account_id: run.account.id,
-                account: run.account.label.clone(),
-                client: run.client.clone(),
-                tool: tool.to_owned(),
-                title: built.title.clone(),
-                lines: built.lines.clone(),
-                danger,
-            },
-            crate::state::now_ms(),
-        );
-        let _ = self.state.events.send(AppEvent::ApprovalsChanged);
-        let _withdraw = Withdraw {
-            state: &self.state,
-            id: proposal.id,
+        let (proposal, answer) = self.state.approvals.ask(ask, technical, now);
+        *write.proposal.lock().unwrap_or_else(|e| e.into_inner()) = Some(proposal.id);
+        self.state.log.link_proposal(run.id, proposal.id);
+        self.state.log.wait_mcp(run.id);
+        // Account removed or writing turned off between the check above and the ask: account_update and
+        // account_remove change the store before they end what waits, so one of the two sees it.
+        let ended = match self.state.accounts.get(run.account.id) {
+            None => self.state.approvals.end(
+                proposal.id,
+                Answer::Refused(approvals::REFUSED_ACCOUNT_GONE.into()),
+                now,
+            ),
+            Some(account) if account.write == WriteMode::Off => self.state.approvals.end(
+                proposal.id,
+                Answer::Refused(approvals::REFUSED_READ_ONLY.into()),
+                now,
+            ),
+            Some(_) => false,
         };
-        match tokio::time::timeout(approvals::WAIT, answer).await {
-            Ok(Ok(true)) => Ok(()),
-            Ok(Ok(false)) => Err(Halt::Refused(
-                "De gebruiker heeft dit geweigerd in EB MCP. Er is niets gewijzigd.".into(),
-            )),
-            Ok(Err(_)) => Err(Halt::Refused("Het voorstel is ingetrokken. Er is niets gewijzigd.".into())),
-            Err(_) => Err(Halt::Refused(
-                "De gebruiker heeft niet binnen 5 minuten gereageerd in EB MCP. Er is niets gewijzigd.".into(),
-            )),
+        let _ = self.state.events.send(AppEvent::ApprovalsChanged);
+        let _ = self.state.events.send(AppEvent::LogChanged);
+        if !ended
+            && let Some(queued) = write
+                .queued
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        {
+            let _ = queued.send(proposal.id);
+        }
+        match answer.await {
+            Ok(Answer::Approved) => {
+                self.state.log.resume_mcp(run.id);
+                let _ = self.state.events.send(AppEvent::LogChanged);
+                Ok(())
+            }
+            Ok(Answer::Refused(message) | Answer::Lapsed(message)) => Err(Halt::Refused(message)),
+            Err(_) => Err(Halt::Refused(approvals::LAPSED_NOBODY_WAITS.into())),
         }
     }
 
@@ -1127,13 +1411,20 @@ impl EbMcp {
         }
     }
 
-    fn end_write(&self, run: Run, done: &str, result: Result<Value, Halt>) -> CallToolResult {
+    /// Ends a write tool: its log entry and, when the change got that far, its record in the history. The
+    /// answer goes to the MCP call when it still waits; a change that waited for approval ends here too.
+    fn end_write(&self, run: &Run, done: &str, result: Result<Value, Halt>) -> CallToolResult {
+        let proposal = run.proposal();
+        let now = crate::state::now_ms();
         let answer = match result {
             Ok(data) => {
                 let value = json!({ "account": run.account.label, "administratie": run.account.administration, "gedaan": done, "data": data });
                 self.state
                     .log
                     .finish_mcp(run.id, Outcome::Ok, Some(&value), None);
+                if let Some(id) = proposal {
+                    self.state.approvals.finish(id, Ok(&value), now);
+                }
                 CallToolResult::success(vec![ContentBlock::text(value.to_string())])
             }
             Err(halt) => {
@@ -1144,10 +1435,16 @@ impl EbMcp {
                 self.state
                     .log
                     .finish_mcp(run.id, outcome, None, Some(message.clone()));
+                if let Some(id) = proposal {
+                    self.state.approvals.finish(id, Err(message.clone()), now);
+                }
                 CallToolResult::error(vec![ContentBlock::text(message)])
             }
         };
         let _ = self.state.events.send(AppEvent::LogChanged);
+        if proposal.is_some() {
+            let _ = self.state.events.send(AppEvent::ApprovalsChanged);
+        }
         answer
     }
 
@@ -1516,6 +1813,40 @@ fn sjabloon_voor(voor: &[SjabloonVoor]) -> Result<(bool, bool), String> {
     ))
 }
 
+/// A moment as the AI client reads it: local time with its offset, to the second.
+fn local_time(ms: u64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(i64::try_from(ms).ok()?).map(|t| {
+        t.with_timezone(&chrono::Local)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+    })
+}
+
+/// One proposal as `akkoord_status` gives it; `full` adds its lines and, once it ran, its result.
+fn proposal_status(detail: &approvals::Detail, full: bool) -> Value {
+    let record = &detail.record;
+    let mut value = json!({
+        "voorstel_id": record.proposal.id,
+        "status": record.status.dutch(),
+        "titel": record.proposal.title,
+        "tool": record.proposal.tool,
+        "account": record.proposal.account,
+        "client": record.proposal.client,
+        "gevraagd_op": local_time(record.proposal.asked_at),
+        "beantwoord_op": record.decided_at.and_then(local_time),
+        "besluit": record.decision.map(approvals::Decision::dutch),
+        "fout": record.error,
+    });
+    if full {
+        value["regels"] = json!(record.proposal.lines);
+        value["klaar_op"] = json!(detail.finished_at.and_then(local_time));
+        value["resultaat"] = detail.result.clone().unwrap_or(Value::Null);
+    }
+    value
+}
+
+/// What the states of `akkoord_status` mean, for the AI client.
+const STATUS_WORDS: &str = "wacht: de gebruiker heeft nog niet geantwoord; bezig: goedgekeurd en de wijziging loopt; uitgevoerd: gedaan, resultaat geeft het antwoord van de tool; mislukt: goedgekeurd maar e-Boekhouden of EB MCP gaf een fout, zie fout; geweigerd: de gebruiker weigerde, of het account ging uit of werd alleen-lezen, er is niets gewijzigd; vervallen: EB MCP startte opnieuw of de inloggegevens van het account veranderden voor er een antwoord was, er is niets gewijzigd.";
+
 /// How many tools the server offers, counted on its tool router.
 pub fn tool_count() -> usize {
     EbMcp::tool_router().list_all().len()
@@ -1566,11 +1897,58 @@ impl EbMcp {
             "let_op": if self.state.session_count() == 0 {
                 "Nog niemand ingelogd. Vraag de gebruiker in te loggen via EB MCP in de menubalk."
             } else if can_write {
-                "Per account staat bij schrijven of er geboekt mag worden: uit (alleen lezen), met akkoord (de gebruiker keurt elke wijziging goed in EB MCP) of zonder akkoord. Verwijderen, crediteren en abonnementen factureren vragen altijd akkoord."
+                "Per account staat bij schrijven of er geboekt mag worden: uit (alleen lezen), met akkoord (de gebruiker keurt elke wijziging goed in EB MCP) of zonder akkoord. Verwijderen, crediteren en abonnementen factureren vragen altijd akkoord. Een wijziging die op akkoord wacht geeft meteen antwoord met een voorstel_id; akkoord_status geeft later de uitkomst."
             } else {
                 "Alleen lezen: schrijven staat voor elk account uit. De gebruiker kan het per account aanzetten in EB MCP onder Accounts."
             },
         });
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            value.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Hoe het staat met wijzigingen die op het akkoord van de gebruiker in EB MCP wachten of wachtten. Met voorstel_id (uit het antwoord van een tool die iets wijzigt): dat ene voorstel met zijn status, wat er gevraagd is en, zodra het is uitgevoerd, het resultaat of de fout. Zonder voorstel_id: alle voorstellen van de laatste 24 uur met hun status, ook wijzigingen die zonder akkoord zijn doorgevoerd. Statussen: wacht, bezig, uitgevoerd, mislukt, geweigerd, vervallen. Leest alleen; vraag niet telkens opnieuw als de status wacht is, de gebruiker beslist in zijn eigen tempo.",
+        annotations(
+            title = "Akkoord status",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn akkoord_status(
+        &self,
+        Parameters(args): Parameters<AkkoordStatusArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = match args.voorstel_id {
+            Some(id) => match self.state.approvals.get(id) {
+                Some(detail) => {
+                    let mut value = proposal_status(&detail, true);
+                    value["uitleg_status"] = json!(STATUS_WORDS);
+                    value
+                }
+                None => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "Er is geen voorstel met id {id} in EB MCP. akkoord_status zonder voorstel_id geeft de voorstellen van de laatste 24 uur."
+                    ))]));
+                }
+            },
+            None => {
+                let since = crate::state::now_ms().saturating_sub(24 * 60 * 60 * 1000);
+                let list: Vec<Value> = self
+                    .state
+                    .approvals
+                    .since(since)
+                    .iter()
+                    .map(|detail| proposal_status(detail, false))
+                    .collect();
+                json!({
+                    "voorstellen": list,
+                    "wachten": self.state.approvals.count(),
+                    "uitleg_status": STATUS_WORDS,
+                    "let_op": "Nieuwste eerst. Geef voorstel_id mee voor de regels en het resultaat van één voorstel.",
+                })
+            }
+        };
         Ok(CallToolResult::success(vec![ContentBlock::text(
             value.to_string(),
         )]))
@@ -2000,7 +2378,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een mutatie boeken, zoals op de schermen Invoeren > Facturen, Afschrift/bonnetjes en Memoriaal: factuur ontvangen of verstuurd, factuurbetaling ontvangen of verstuurd, geld ontvangen of uitgegeven, of memoriaal. Met bankregel_id wordt een onverwerkte bankregel daarmee verwerkt. Rekeningen gaan op code (zie grootboek), btw op code (GEEN, HOOG_VERK_21, HOOG_INK_21, LAAG_VERK_9, ...); e-Boekhouden rekent de btw zelf uit. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de boeking eerst goed in EB MCP.",
+        description = "Een mutatie boeken, zoals op de schermen Invoeren > Facturen, Afschrift/bonnetjes en Memoriaal: factuur ontvangen of verstuurd, factuurbetaling ontvangen of verstuurd, geld ontvangen of uitgegeven, of memoriaal. Met bankregel_id wordt een onverwerkte bankregel daarmee verwerkt. Rekeningen gaan op code (zie grootboek), btw op code (GEEN, HOOG_VERK_21, HOOG_INK_21, LAAG_VERK_9, ...); e-Boekhouden rekent de btw zelf uit. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de boeking eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Mutatie toevoegen",
             read_only_hint = false,
@@ -2014,27 +2392,26 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "mutatie_toevoegen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let books = self.books(&run).await?;
-            let built = write::mutatie_nieuw(&args, &books)?;
-            self.approve(&run, TOOL, &built, false).await?;
-            self.change(&run, "POST", "mutatie", Some(&built.body))
-                .await
-        }
-        .await;
-        Ok(self.end_write(
-            run,
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
             "Mutatie toegevoegd; data.mutNr is het mutatienummer",
-            result,
-        ))
+            move |this, run, args| async move {
+                let books = this.books(&run).await?;
+                let built = write::mutatie_nieuw(&args, &books)?;
+                this.approve(&run, TOOL, &built, false).await?;
+                this.change(&run, "POST", "mutatie", Some(&built.body))
+                    .await
+            },
+        )
+        .await
     }
 
     #[tool(
-        description = "Een bestaande mutatie wijzigen, op mutatienummer. Wat je niet noemt blijft zoals het is; regels of betalingen die je meegeeft vervangen alle bestaande. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP.",
+        description = "Een bestaande mutatie wijzigen, op mutatienummer. Wat je niet noemt blijft zoals het is; regels of betalingen die je meegeeft vervangen alle bestaande. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Mutatie wijzigen",
             read_only_hint = false,
@@ -2048,25 +2425,28 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "mutatie_wijzigen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let model = self
-                .fetch(&run, &format!("mutatie/nr/{}/model", args.nr), Vec::new())
-                .await?;
-            let books = self.books(&run).await?;
-            let built = write::mutatie_gewijzigd(&args, &model, &books)?;
-            self.approve(&run, TOOL, &built, false).await?;
-            self.change(&run, "PUT", "mutatie", Some(&built.body)).await
-        }
-        .await;
-        Ok(self.end_write(run, "Mutatie gewijzigd", result))
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
+            "Mutatie gewijzigd",
+            move |this, run, args| async move {
+                let model = this
+                    .fetch(&run, &format!("mutatie/nr/{}/model", args.nr), Vec::new())
+                    .await?;
+                let books = this.books(&run).await?;
+                let built = write::mutatie_gewijzigd(&args, &model, &books)?;
+                this.approve(&run, TOOL, &built, false).await?;
+                this.change(&run, "PUT", "mutatie", Some(&built.body)).await
+            },
+        )
+        .await
     }
 
     #[tool(
-        description = "Een bestand van deze computer in het digitaal archief zetten, en het naar wens meteen aan een mutatie koppelen (mutatie_nr). Geef het volledige pad; hoogstens 5 MB. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP.",
+        description = "Een bestand van deze computer in het digitaal archief zetten, en het naar wens meteen aan een mutatie koppelen (mutatie_nr). Geef het volledige pad; hoogstens 5 MB. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Bestand uploaden",
             read_only_hint = false,
@@ -2080,11 +2460,8 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "archief_uploaden";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
+        let account = args.account.clone();
+        self.write_tool(&context, TOOL, account.as_deref(), args, "Bestand geüpload", move |this, run, args| async move {
             let (name, data, size) = read_upload(&args.pad, args.naam.as_deref())?;
             let mut lines = vec![
                 line("Bestand", args.pad.trim()),
@@ -2097,13 +2474,13 @@ impl EbMcp {
             }
             if let Some(nr) = args.mutatie_nr {
                 // Before anything is uploaded: a mutatie that does not exist would leave a loose file behind.
-                self.fetch(&run, &format!("mutatie/nr/{nr}/model"), Vec::new()).await?;
+                this.fetch(&run, &format!("mutatie/nr/{nr}/model"), Vec::new()).await?;
                 lines.push(line("Koppelen aan", format!("mutatie {nr}")));
             }
             let built = Built { body: Value::Null, title: format!("Bestand uploaden: {name}"), lines };
-            self.approve(&run, TOOL, &built, false).await?;
+            this.approve(&run, TOOL, &built, false).await?;
             let body = json!({"fileName": name, "data": data, "overwrite": args.overschrijven.unwrap_or(false), "folderId": args.map_id.unwrap_or(0)});
-            let uploaded = self.change(&run, "POST", "folder/upload", Some(&body)).await?;
+            let uploaded = this.change(&run, "POST", "folder/upload", Some(&body)).await?;
             if let Some(error) = uploaded.get("errorMessage").and_then(Value::as_str).filter(|e| !e.is_empty()) {
                 return Err(Halt::Error(format!("e-Boekhouden weigert het bestand: {error}")));
             }
@@ -2115,7 +2492,7 @@ impl EbMcp {
             let mut done = json!({"bestand_id": id, "naam": name, "gekoppeld_aan_mutatie": Value::Null});
             if let Some(nr) = args.mutatie_nr {
                 let link = json!({"koppelId": nr, "folders": [{"id": id, "soort": "F"}], "koppelType": "MUT"});
-                match self.change_done(&run, "POST", "folderkoppel/koppel/item", Some(&link)).await {
+                match this.change_done(&run, "POST", "folderkoppel/koppel/item", Some(&link)).await {
                     Ok(_) => done["gekoppeld_aan_mutatie"] = json!(nr),
                     Err(Halt::Error(message) | Halt::Refused(message)) => {
                         return Err(Halt::Error(format!(
@@ -2125,13 +2502,12 @@ impl EbMcp {
                 }
             }
             Ok(done)
-        }
-        .await;
-        Ok(self.end_write(run, "Bestand geüpload", result))
+        })
+        .await
     }
 
     #[tool(
-        description = "Een bestand dat al in het digitaal archief staat aan een mutatie koppelen. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP.",
+        description = "Een bestand dat al in het digitaal archief staat aan een mutatie koppelen. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Bestand koppelen",
             read_only_hint = false,
@@ -2145,27 +2521,23 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "archief_koppelen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let file = self.fetch(&run, &format!("folder/{}", args.bestand_id), Vec::new()).await?;
+        let account = args.account.clone();
+        self.write_tool(&context, TOOL, account.as_deref(), args, "Bestand gekoppeld aan de mutatie", move |this, run, args| async move {
+            let file = this.fetch(&run, &format!("folder/{}", args.bestand_id), Vec::new()).await?;
             let name = file.get("naam").and_then(Value::as_str).unwrap_or("bestand").to_owned();
             if file.get("soort").and_then(Value::as_str) != Some("F") {
                 return Err(Halt::Error(format!("{name} is een map, geen bestand")));
             }
-            self.fetch(&run, &format!("mutatie/nr/{}/model", args.mutatie_nr), Vec::new()).await?;
+            this.fetch(&run, &format!("mutatie/nr/{}/model", args.mutatie_nr), Vec::new()).await?;
             let built = Built {
                 body: json!({"koppelId": args.mutatie_nr, "folders": [{"id": args.bestand_id, "soort": "F"}], "koppelType": "MUT"}),
                 title: format!("Bestand koppelen: {name}"),
                 lines: vec![line("Bestand", &name), line("Koppelen aan", format!("mutatie {}", args.mutatie_nr))],
             };
-            self.approve(&run, TOOL, &built, false).await?;
-            self.change_done(&run, "POST", "folderkoppel/koppel/item", Some(&built.body)).await
-        }
-        .await;
-        Ok(self.end_write(run, "Bestand gekoppeld aan de mutatie", result))
+            this.approve(&run, TOOL, &built, false).await?;
+            this.change_done(&run, "POST", "folderkoppel/koppel/item", Some(&built.body)).await
+        })
+        .await
     }
 
     #[tool(
@@ -2211,7 +2583,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een verkoopfactuur maken. Prijzen per stuk, incl of excl btw; btw op code (HOOG_VERK_21, LAAG_VERK_9, GEEN, ...), de omzetrekening op code. Zonder nummer krijgt de factuur het volgende nummer van e-Boekhouden. De factuur wordt niet verstuurd. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de factuur eerst goed in EB MCP.",
+        description = "Een verkoopfactuur maken. Prijzen per stuk, incl of excl btw; btw op code (HOOG_VERK_21, LAAG_VERK_9, GEEN, ...), de omzetrekening op code. Zonder nummer krijgt de factuur het volgende nummer van e-Boekhouden. De factuur wordt niet verstuurd. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de factuur eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Factuur toevoegen",
             read_only_hint = false,
@@ -2225,28 +2597,27 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "factuur_toevoegen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let books = self.books(&run).await?;
-            let factuur_context = self.factuur_context(&run).await?;
-            let built = write::factuur_nieuw(&args, &factuur_context, &books)?;
-            self.approve(&run, TOOL, &built, false).await?;
-            self.change(&run, "POST", "factuur/model", Some(&built.body))
-                .await
-        }
-        .await;
-        Ok(self.end_write(
-            run,
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
             "Factuur toegevoegd; data.id is het id en data.nummer het factuurnummer",
-            result,
-        ))
+            move |this, run, args| async move {
+                let books = this.books(&run).await?;
+                let factuur_context = this.factuur_context(&run).await?;
+                let built = write::factuur_nieuw(&args, &factuur_context, &books)?;
+                this.approve(&run, TOOL, &built, false).await?;
+                this.change(&run, "POST", "factuur/model", Some(&built.body))
+                    .await
+            },
+        )
+        .await
     }
 
     #[tool(
-        description = "Een verkoopfactuur wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. De mutatie van een verwerkte factuur volgt vanzelf. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP.",
+        description = "Een verkoopfactuur wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. De mutatie van een verwerkte factuur volgt vanzelf. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Factuur wijzigen",
             read_only_hint = false,
@@ -2260,24 +2631,27 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "factuur_wijzigen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let (now, items) = self.with_items(&run, "factuur", args.id).await?;
-            let books = self.books(&run).await?;
-            let built = write::factuur_gewijzigd(&args, &now, &items, &books)?;
-            self.approve(&run, TOOL, &built, false).await?;
-            self.change_done(&run, "PUT", "factuur/model", Some(&built.body))
-                .await
-        }
-        .await;
-        Ok(self.end_write(run, "Factuur gewijzigd", result))
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
+            "Factuur gewijzigd",
+            move |this, run, args| async move {
+                let (now, items) = this.with_items(&run, "factuur", args.id).await?;
+                let books = this.books(&run).await?;
+                let built = write::factuur_gewijzigd(&args, &now, &items, &books)?;
+                this.approve(&run, TOOL, &built, false).await?;
+                this.change_done(&run, "PUT", "factuur/model", Some(&built.body))
+                    .await
+            },
+        )
+        .await
     }
 
     #[tool(
-        description = "Een verkoopfactuur verwijderen, op id. De mutatie van een verwerkte factuur verdwijnt mee. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        description = "Een verkoopfactuur verwijderen, op id. De mutatie van een verwerkte factuur verdwijnt mee. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Factuur verwijderen",
             read_only_hint = false,
@@ -2291,56 +2665,59 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "factuur_verwijderen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let now = self
-                .fetch(&run, &format!("factuur/{}", args.id), Vec::new())
-                .await?;
-            let nummer = now
-                .get("nummer")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let built = Built {
-                body: Value::Null,
-                title: format!("Factuur {nummer} verwijderen"),
-                lines: vec![
-                    line("Factuur", &nummer),
-                    line(
-                        "Relatie",
-                        format!(
-                            "id {}",
-                            now.get("relatieId").and_then(Value::as_u64).unwrap_or(0)
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
+            "Factuur verwijderd",
+            move |this, run, args| async move {
+                let now = this
+                    .fetch(&run, &format!("factuur/{}", args.id), Vec::new())
+                    .await?;
+                let nummer = now
+                    .get("nummer")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let built = Built {
+                    body: Value::Null,
+                    title: format!("Factuur {nummer} verwijderen"),
+                    lines: vec![
+                        line("Factuur", &nummer),
+                        line(
+                            "Relatie",
+                            format!(
+                                "id {}",
+                                now.get("relatieId").and_then(Value::as_u64).unwrap_or(0)
+                            ),
                         ),
-                    ),
-                    line(
-                        "Totaal incl. btw",
-                        write::euro(now.get("totaal").and_then(Value::as_f64).unwrap_or(0.0)),
-                    ),
-                    line(
-                        "Gevolg",
-                        "de factuur en zijn mutatie verdwijnen; dit is niet terug te draaien",
-                    ),
-                ],
-            };
-            self.approve(&run, TOOL, &built, true).await?;
-            self.change_done(
-                &run,
-                "DELETE",
-                &format!("factuur/normaal/{}", args.id),
-                None,
-            )
-            .await
-        }
-        .await;
-        Ok(self.end_write(run, "Factuur verwijderd", result))
+                        line(
+                            "Totaal incl. btw",
+                            write::euro(now.get("totaal").and_then(Value::as_f64).unwrap_or(0.0)),
+                        ),
+                        line(
+                            "Gevolg",
+                            "de factuur en zijn mutatie verdwijnen; dit is niet terug te draaien",
+                        ),
+                    ],
+                };
+                this.approve(&run, TOOL, &built, true).await?;
+                this.change_done(
+                    &run,
+                    "DELETE",
+                    &format!("factuur/normaal/{}", args.id),
+                    None,
+                )
+                .await
+            },
+        )
+        .await
     }
 
     #[tool(
-        description = "Een verkoopfactuur crediteren, op id: er komt een nieuwe factuur met dezelfde regels in negatieve aantallen, zoals Factuur crediteren in e-Boekhouden doet. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        description = "Een verkoopfactuur crediteren, op id: er komt een nieuwe factuur met dezelfde regels in negatieve aantallen, zoals Factuur crediteren in e-Boekhouden doet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Factuur crediteren",
             read_only_hint = false,
@@ -2354,25 +2731,24 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "factuur_crediteren";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let (now, items) = self.with_items(&run, "factuur", args.id).await?;
-            let books = self.books(&run).await?;
-            let factuur_context = self.factuur_context(&run).await?;
-            let built = write::factuur_credit(&args, &now, &items, &factuur_context, &books)?;
-            self.approve(&run, TOOL, &built, true).await?;
-            self.change(&run, "POST", "factuur/model", Some(&built.body))
-                .await
-        }
-        .await;
-        Ok(self.end_write(
-            run,
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
             "Creditfactuur gemaakt; data.id is het id en data.nummer het factuurnummer",
-            result,
-        ))
+            move |this, run, args| async move {
+                let (now, items) = this.with_items(&run, "factuur", args.id).await?;
+                let books = this.books(&run).await?;
+                let factuur_context = this.factuur_context(&run).await?;
+                let built = write::factuur_credit(&args, &now, &items, &factuur_context, &books)?;
+                this.approve(&run, TOOL, &built, true).await?;
+                this.change(&run, "POST", "factuur/model", Some(&built.body))
+                    .await
+            },
+        )
+        .await
     }
 
     #[tool(
@@ -2422,7 +2798,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een abonnement maken: een terugkerende factuur voor een relatie. Prijzen per stuk, incl of excl btw; btw en omzetrekening op code. Er wordt nog geen factuur gemaakt; dat doet abonnementen_factureren. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP.",
+        description = "Een abonnement maken: een terugkerende factuur voor een relatie. Prijzen per stuk, incl of excl btw; btw en omzetrekening op code. Er wordt nog geen factuur gemaakt; dat doet abonnementen_factureren. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Abonnement toevoegen",
             read_only_hint = false,
@@ -2436,25 +2812,28 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "abonnement_toevoegen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let books = self.books(&run).await?;
-            let factuur_context = self.factuur_context(&run).await?;
-            let built =
-                write::abonnement_nieuw(&args, factuur_context.sjabloon_id, today(), &books)?;
-            self.approve(&run, TOOL, &built, false).await?;
-            self.change(&run, "POST", "abonnement/model", Some(&built.body))
-                .await
-        }
-        .await;
-        Ok(self.end_write(run, "Abonnement toegevoegd; data.id is het id", result))
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
+            "Abonnement toegevoegd; data.id is het id",
+            move |this, run, args| async move {
+                let books = this.books(&run).await?;
+                let factuur_context = this.factuur_context(&run).await?;
+                let built =
+                    write::abonnement_nieuw(&args, factuur_context.sjabloon_id, today(), &books)?;
+                this.approve(&run, TOOL, &built, false).await?;
+                this.change(&run, "POST", "abonnement/model", Some(&built.body))
+                    .await
+            },
+        )
+        .await
     }
 
     #[tool(
-        description = "Een abonnement wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP.",
+        description = "Een abonnement wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Abonnement wijzigen",
             read_only_hint = false,
@@ -2468,27 +2847,30 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "abonnement_wijzigen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let (now, items) = self.with_items(&run, "abonnement", args.id).await?;
-            let extra = self
-                .fetch(&run, &format!("factuurextra/{}", args.id), Vec::new())
-                .await?;
-            let books = self.books(&run).await?;
-            let built = write::abonnement_gewijzigd(&args, &now, &extra, &items, &books)?;
-            self.approve(&run, TOOL, &built, false).await?;
-            self.change_done(&run, "PUT", "abonnement/model", Some(&built.body))
-                .await
-        }
-        .await;
-        Ok(self.end_write(run, "Abonnement gewijzigd", result))
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
+            "Abonnement gewijzigd",
+            move |this, run, args| async move {
+                let (now, items) = this.with_items(&run, "abonnement", args.id).await?;
+                let extra = this
+                    .fetch(&run, &format!("factuurextra/{}", args.id), Vec::new())
+                    .await?;
+                let books = this.books(&run).await?;
+                let built = write::abonnement_gewijzigd(&args, &now, &extra, &items, &books)?;
+                this.approve(&run, TOOL, &built, false).await?;
+                this.change_done(&run, "PUT", "abonnement/model", Some(&built.body))
+                    .await
+            },
+        )
+        .await
     }
 
     #[tool(
-        description = "Een abonnement verwijderen, op id. Facturen die er al van gemaakt zijn blijven staan. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        description = "Een abonnement verwijderen, op id. Facturen die er al van gemaakt zijn blijven staan. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Abonnement verwijderen",
             read_only_hint = false,
@@ -2502,51 +2884,54 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "abonnement_verwijderen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let now = self
-                .fetch(&run, &format!("abonnement/{}", args.id), Vec::new())
-                .await?;
-            let naam = now
-                .get("nummer")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let built = Built {
-                body: Value::Null,
-                title: format!("Abonnement {naam} verwijderen"),
-                lines: vec![
-                    line("Abonnement", &naam),
-                    line(
-                        "Relatie",
-                        format!(
-                            "id {}",
-                            now.get("relatieId").and_then(Value::as_u64).unwrap_or(0)
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
+            "Abonnement verwijderd",
+            move |this, run, args| async move {
+                let now = this
+                    .fetch(&run, &format!("abonnement/{}", args.id), Vec::new())
+                    .await?;
+                let naam = now
+                    .get("nummer")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let built = Built {
+                    body: Value::Null,
+                    title: format!("Abonnement {naam} verwijderen"),
+                    lines: vec![
+                        line("Abonnement", &naam),
+                        line(
+                            "Relatie",
+                            format!(
+                                "id {}",
+                                now.get("relatieId").and_then(Value::as_u64).unwrap_or(0)
+                            ),
                         ),
-                    ),
-                    line(
-                        "Bedrag incl. btw",
-                        write::euro(now.get("totaal").and_then(Value::as_f64).unwrap_or(0.0)),
-                    ),
-                    line(
-                        "Gevolg",
-                        "het abonnement verdwijnt; dit is niet terug te draaien",
-                    ),
-                ],
-            };
-            self.approve(&run, TOOL, &built, true).await?;
-            self.change_done(&run, "DELETE", &format!("abonnement/{}", args.id), None)
-                .await
-        }
-        .await;
-        Ok(self.end_write(run, "Abonnement verwijderd", result))
+                        line(
+                            "Bedrag incl. btw",
+                            write::euro(now.get("totaal").and_then(Value::as_f64).unwrap_or(0.0)),
+                        ),
+                        line(
+                            "Gevolg",
+                            "het abonnement verdwijnt; dit is niet terug te draaien",
+                        ),
+                    ],
+                };
+                this.approve(&run, TOOL, &built, true).await?;
+                this.change_done(&run, "DELETE", &format!("abonnement/{}", args.id), None)
+                    .await
+            },
+        )
+        .await
     }
 
     #[tool(
-        description = "Facturen maken voor abonnementen, zoals Facturen maken in e-Boekhouden: voor ALLE abonnementen waarvan de prolongatiedatum in het gekozen venster valt (standaard: al verlopen) komt er een factuur, en hun prolongatiedatum schuift een periode op. Eén abonnement kiezen kan niet. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        description = "Facturen maken voor abonnementen, zoals Facturen maken in e-Boekhouden: voor ALLE abonnementen waarvan de prolongatiedatum in het gekozen venster valt (standaard: al verlopen) komt er een factuur, en hun prolongatiedatum schuift een periode op. Eén abonnement kiezen kan niet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Abonnementen factureren",
             read_only_hint = false,
@@ -2560,12 +2945,9 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "abonnementen_factureren";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let counts = self
+        let account = args.account.clone();
+        self.write_tool(&context, TOOL, account.as_deref(), args, "Facturen gemaakt; data.createdIds zijn de ids van de nieuwe facturen en data.errorMessages wat niet lukte", move |this, run, args| async move {
+            let counts = this
                 .fetch(&run, "factuur/expiredabonnementencount", Vec::new())
                 .await?;
             let venster = args.venster.unwrap_or(write::Venster::Verlopen);
@@ -2573,10 +2955,10 @@ impl EbMcp {
                 .get(venster.count_key())
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            let books = self.books(&run).await?;
+            let books = this.books(&run).await?;
             let built = write::abonnementen_factureren(&args, aantal, today(), &books)?;
-            self.approve(&run, TOOL, &built, true).await?;
-            let call = self
+            this.approve(&run, TOOL, &built, true).await?;
+            let call = this
                 .state
                 .api_hub(
                     run.account.id,
@@ -2594,13 +2976,12 @@ impl EbMcp {
                 ));
             }
             Ok(call.json.unwrap_or(Value::Null))
-        }
-        .await;
-        Ok(self.end_write(run, "Facturen gemaakt; data.createdIds zijn de ids van de nieuwe facturen en data.errorMessages wat niet lukte", result))
+        })
+        .await
     }
 
     #[tool(
-        description = "Een mutatie verwijderen, op mutatienummer. Boekhoudkundig wordt dit afgeraden: corrigeer liever met een tegenboeking of wijzig de mutatie, zodat zichtbaar blijft wat er is gebeurd. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        description = "Een mutatie verwijderen, op mutatienummer. Boekhoudkundig wordt dit afgeraden: corrigeer liever met een tegenboeking of wijzig de mutatie, zodat zichtbaar blijft wat er is gebeurd. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Mutatie verwijderen",
             read_only_hint = false,
@@ -2614,12 +2995,9 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "mutatie_verwijderen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let model = self.fetch(&run, &format!("mutatie/nr/{}/model", args.nr), Vec::new()).await?;
+        let account = args.account.clone();
+        self.write_tool(&context, TOOL, account.as_deref(), args, "Mutatie verwijderd", move |this, run, args| async move {
+            let model = this.fetch(&run, &format!("mutatie/nr/{}/model", args.nr), Vec::new()).await?;
             let mutatie = model.get("mutatie").cloned().unwrap_or(Value::Null);
             let datum = mutatie
                 .get("datum")
@@ -2635,7 +3013,7 @@ impl EbMcp {
                 let mut query = grid(Some(MAX_ROWS), Some(page * MAX_ROWS)).map_err(Halt::Error)?;
                 query.push(("datumVan".into(), datum.clone()));
                 query.push(("datumTot".into(), datum.clone()));
-                let rows = named_rows(self.fetch(&run, "mutatie/gridtable", query).await?);
+                let rows = named_rows(this.fetch(&run, "mutatie/gridtable", query).await?);
                 let rows = rows.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
                 if let Some(row) = rows.iter().find(|r| r.get("mutatieNr").and_then(Value::as_u64) == Some(args.nr)) {
                     id = row.get("id").and_then(Value::as_u64);
@@ -2661,8 +3039,8 @@ impl EbMcp {
                     line("Let op", "boekhoudkundig wordt verwijderen afgeraden: een tegenboeking laat zien wat er is gebeurd. Dit is niet terug te draaien."),
                 ],
             };
-            self.approve(&run, TOOL, &built, true).await?;
-            let done = self.change(&run, "POST", "mutatie/bulk/delete", Some(&built.body)).await?;
+            this.approve(&run, TOOL, &built, true).await?;
+            let done = this.change(&run, "POST", "mutatie/bulk/delete", Some(&built.body)).await?;
             let removed = done
                 .get("removedIds")
                 .and_then(Value::as_array)
@@ -2677,13 +3055,12 @@ impl EbMcp {
                 return Err(Halt::Error(format!("e-Boekhouden weigert dit: {why}")));
             }
             Ok(done)
-        }
-        .await;
-        Ok(self.end_write(run, "Mutatie verwijderd", result))
+        })
+        .await
     }
 
     #[tool(
-        description = "Een bestand uit het digitaal archief verwijderen; het gaat naar de prullenbak van het archief. Is het bestand nog aan een mutatie of iets anders gekoppeld, dan krijgt de gebruiker een waarschuwing en moet die het altijd goedkeuren. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet.",
+        description = "Een bestand uit het digitaal archief verwijderen; het gaat naar de prullenbak van het archief. Is het bestand nog aan een mutatie of iets anders gekoppeld, dan krijgt de gebruiker een waarschuwing en moet die het altijd goedkeuren. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Bestand verwijderen",
             read_only_hint = false,
@@ -2697,12 +3074,9 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "archief_verwijderen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let file = self
+        let account = args.account.clone();
+        self.write_tool(&context, TOOL, account.as_deref(), args, "Bestand verwijderd (staat in de prullenbak van het archief)", move |this, run, args| async move {
+            let file = this
                 .fetch(&run, &format!("folder/{}", args.bestand_id), Vec::new())
                 .await?;
             let name = file
@@ -2718,7 +3092,7 @@ impl EbMcp {
                     "{name} staat al in de prullenbak van het archief; EB MCP verwijdert het daar niet definitief"
                 )));
             }
-            let links = self
+            let links = this
                 .fetch(&run, &format!("folder/{}/koppel", args.bestand_id), Vec::new())
                 .await?;
             // Anything that is not plainly "no link" counts as a link: an unknown shape must ask, never slip through.
@@ -2772,16 +3146,11 @@ impl EbMcp {
                 title: format!("Bestand verwijderen: {name}"),
                 lines,
             };
-            self.approve(&run, TOOL, &built, !linked.is_empty()).await?;
-            self.change_done(&run, "DELETE", &format!("folder/{}", args.bestand_id), None)
+            this.approve(&run, TOOL, &built, !linked.is_empty()).await?;
+            this.change_done(&run, "DELETE", &format!("folder/{}", args.bestand_id), None)
                 .await
-        }
-        .await;
-        Ok(self.end_write(
-            run,
-            "Bestand verwijderd (staat in de prullenbak van het archief)",
-            result,
-        ))
+        })
+        .await
     }
 
     #[tool(
@@ -2810,7 +3179,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een verkoopfactuur per e-mail versturen vanuit e-Boekhouden, met de factuur als pdf in de bijlage. Onderwerp en bericht komen uit een e-mailsjabloon (sjabloon_id) of geef je zelf mee; zonder ontvanger gaat de mail naar het factuur- of e-mailadres van de relatie. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de ontvanger, het onderwerp en het bericht.",
+        description = "Een verkoopfactuur per e-mail versturen vanuit e-Boekhouden, met de factuur als pdf in de bijlage. Onderwerp en bericht komen uit een e-mailsjabloon (sjabloon_id) of geef je zelf mee; zonder ontvanger gaat de mail naar het factuur- of e-mailadres van de relatie. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de ontvanger, het onderwerp en het bericht. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Factuur mailen",
             read_only_hint = false,
@@ -2825,16 +3194,13 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "factuur_mailen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let factuur = self.fetch(&run, &format!("factuur/{}", args.id), Vec::new()).await?;
+        let account = args.account.clone();
+        self.write_tool(&context, TOOL, account.as_deref(), args, "Factuur verstuurd per e-mail", move |this, run, args| async move {
+            let factuur = this.fetch(&run, &format!("factuur/{}", args.id), Vec::new()).await?;
             let nummer = factuur.get("nummer").and_then(Value::as_str).unwrap_or_default().to_owned();
             let relatie_id = factuur.get("relatieId").and_then(Value::as_u64).unwrap_or(0);
             let sjabloon = match args.sjabloon_id {
-                Some(id) => Some(self.fetch(&run, &format!("EmailSjabloonAb/{id}"), Vec::new()).await?),
+                Some(id) => Some(this.fetch(&run, &format!("EmailSjabloonAb/{id}"), Vec::new()).await?),
                 None => None,
             };
             let from_sjabloon = |name: &str| {
@@ -2850,7 +3216,7 @@ impl EbMcp {
             let aan = match given(&args.aan) {
                 Some(aan) => aan,
                 None => {
-                    let relatie = self.fetch(&run, &format!("relatie/{relatie_id}"), Vec::new()).await?;
+                    let relatie = this.fetch(&run, &format!("relatie/{relatie_id}"), Vec::new()).await?;
                     let field = |name: &str| relatie.get(name).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
                     field("emailFactuur")
                         .or_else(|| field("email"))
@@ -2866,7 +3232,7 @@ impl EbMcp {
             let body = given(&args.bericht)
                 .or_else(|| from_sjabloon("body"))
                 .ok_or_else(|| Halt::Error("Geef een bericht, of een e-mailsjabloon met sjabloon_id".into()))?;
-            let user = self.fetch(&run, "user", Vec::new()).await?;
+            let user = this.fetch(&run, "user", Vec::new()).await?;
             let user_field = |name: &str| user.get(name).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
             let van_naam = from_sjabloon("vanNaam")
                 .or_else(|| run.account.administration.clone())
@@ -2899,17 +3265,16 @@ impl EbMcp {
                 .flatten()
                 .collect(),
             };
-            self.approve(&run, TOOL, &built, true).await?;
-            let sent = self.change(&run, "POST", "factuur/mail", Some(&built.body)).await?;
+            this.approve(&run, TOOL, &built, true).await?;
+            let sent = this.change(&run, "POST", "factuur/mail", Some(&built.body)).await?;
             let failed = sent.get("errorCount").and_then(Value::as_u64).unwrap_or(0) > 0;
             let said = sent.get("errorMessage").and_then(Value::as_str).filter(|m| !m.is_empty());
             if failed || said.is_some() {
                 return Err(Halt::Error(format!("e-Boekhouden kon de mail niet versturen: {}", said.unwrap_or("geen uitleg gegeven"))));
             }
             Ok(json!({"verstuurd_aan": aan, "factuur": nummer}))
-        }
-        .await;
-        Ok(self.end_write(run, "Factuur verstuurd per e-mail", result))
+        })
+        .await
     }
 
     #[tool(
@@ -2933,7 +3298,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een e-mailsjabloon maken voor het mailen van facturen of offertes. Gebruik in onderwerp en bericht de codes van e-Boekhouden, zoals [FACTNUMMER], [RELBEDRIJF] en [ABBEDRIJF] (zie emailsjablonen voor voorbeelden). Het bericht is HTML. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP.",
+        description = "Een e-mailsjabloon maken voor het mailen van facturen of offertes. Gebruik in onderwerp en bericht de codes van e-Boekhouden, zoals [FACTNUMMER], [RELBEDRIJF] en [ABBEDRIJF] (zie emailsjablonen voor voorbeelden). Het bericht is HTML. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "E-mailsjabloon toevoegen",
             read_only_hint = false,
@@ -2947,11 +3312,8 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "emailsjabloon_toevoegen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
+        let account = args.account.clone();
+        self.write_tool(&context, TOOL, account.as_deref(), args, "E-mailsjabloon toegevoegd; data.id is het id", move |this, run, args| async move {
             let naam = args.naam.trim().to_owned();
             let (subject, body) = (args.onderwerp.trim().to_owned(), args.bericht.trim().to_owned());
             if naam.is_empty() || subject.is_empty() || body.is_empty() {
@@ -2959,7 +3321,7 @@ impl EbMcp {
             }
             let (factuur, offerte) = sjabloon_voor(args.voor.as_deref().unwrap_or(&[SjabloonVoor::Factuur]))?;
             let given = |value: &Option<String>| value.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
-            let user = self.fetch(&run, "user", Vec::new()).await?;
+            let user = this.fetch(&run, "user", Vec::new()).await?;
             let van_naam = given(&args.van_naam)
                 .or_else(|| run.account.administration.clone())
                 .ok_or_else(|| Halt::Error("Geef de naam van de afzender met van_naam".into()))?;
@@ -2981,15 +3343,14 @@ impl EbMcp {
                     line("Bericht", plain_text(&body)),
                 ],
             };
-            self.approve(&run, TOOL, &built, false).await?;
-            self.change(&run, "POST", "emailsjabloonab", Some(&built.body)).await
-        }
-        .await;
-        Ok(self.end_write(run, "E-mailsjabloon toegevoegd; data.id is het id", result))
+            this.approve(&run, TOOL, &built, false).await?;
+            this.change(&run, "POST", "emailsjabloonab", Some(&built.body)).await
+        })
+        .await
     }
 
     #[tool(
-        description = "Een e-mailsjabloon wijzigen, op id (uit emailsjablonen). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP.",
+        description = "Een e-mailsjabloon wijzigen, op id (uit emailsjablonen). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "E-mailsjabloon wijzigen",
             read_only_hint = false,
@@ -3003,83 +3364,88 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "emailsjabloon_wijzigen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let mut sjabloon = self
-                .fetch(&run, &format!("EmailSjabloonAb/{}", args.id), Vec::new())
-                .await?;
-            let old_name = sjabloon
-                .get("naam")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let object = sjabloon.as_object_mut().ok_or_else(|| {
-                Halt::Error("e-Boekhouden gaf dit sjabloon in een onbekende vorm terug".into())
-            })?;
-            let mut lines = vec![line("Sjabloon", &old_name)];
-            let mut set = |key: &str,
-                           label: &str,
-                           value: &Option<String>,
-                           shown: fn(&str) -> String|
-             -> Result<(), Halt> {
-                if let Some(value) = value {
-                    let value = value.trim();
-                    if value.is_empty() && matches!(key, "naam" | "subject" | "body" | "vanNaam") {
-                        return Err(Halt::Error(format!("{label} mag niet leeg zijn")));
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
+            "E-mailsjabloon gewijzigd",
+            move |this, run, args| async move {
+                let mut sjabloon = this
+                    .fetch(&run, &format!("EmailSjabloonAb/{}", args.id), Vec::new())
+                    .await?;
+                let old_name = sjabloon
+                    .get("naam")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let object = sjabloon.as_object_mut().ok_or_else(|| {
+                    Halt::Error("e-Boekhouden gaf dit sjabloon in een onbekende vorm terug".into())
+                })?;
+                let mut lines = vec![line("Sjabloon", &old_name)];
+                let mut set = |key: &str,
+                               label: &str,
+                               value: &Option<String>,
+                               shown: fn(&str) -> String|
+                 -> Result<(), Halt> {
+                    if let Some(value) = value {
+                        let value = value.trim();
+                        if value.is_empty()
+                            && matches!(key, "naam" | "subject" | "body" | "vanNaam")
+                        {
+                            return Err(Halt::Error(format!("{label} mag niet leeg zijn")));
+                        }
+                        if matches!(key, "vanEmail" | "cc" | "bcc") && !value.is_empty() {
+                            email(value, label)?;
+                        }
+                        object.insert(key.to_owned(), json!(value));
+                        lines.push(line(&format!("{label} wordt"), shown(value)));
                     }
-                    if matches!(key, "vanEmail" | "cc" | "bcc") && !value.is_empty() {
-                        email(value, label)?;
-                    }
-                    object.insert(key.to_owned(), json!(value));
-                    lines.push(line(&format!("{label} wordt"), shown(value)));
+                    Ok(())
+                };
+                set("naam", "Naam", &args.naam, str::to_owned)?;
+                set("subject", "Onderwerp", &args.onderwerp, str::to_owned)?;
+                set("body", "Bericht", &args.bericht, plain_text)?;
+                set("vanNaam", "Naam afzender", &args.van_naam, str::to_owned)?;
+                set("vanEmail", "Adres afzender", &args.van_email, str::to_owned)?;
+                set("cc", "Cc", &args.cc, str::to_owned)?;
+                set("bcc", "Bcc", &args.bcc, str::to_owned)?;
+                if let Some(voor) = &args.voor {
+                    let (factuur, offerte) = sjabloon_voor(voor)?;
+                    object.insert("useFactuur".into(), json!(factuur));
+                    object.insert("useOfferte".into(), json!(offerte));
+                    lines.push(line(
+                        "Te kiezen bij",
+                        match (factuur, offerte) {
+                            (true, true) => "facturen en offertes",
+                            (true, false) => "facturen",
+                            _ => "offertes",
+                        },
+                    ));
                 }
-                Ok(())
-            };
-            set("naam", "Naam", &args.naam, str::to_owned)?;
-            set("subject", "Onderwerp", &args.onderwerp, str::to_owned)?;
-            set("body", "Bericht", &args.bericht, plain_text)?;
-            set("vanNaam", "Naam afzender", &args.van_naam, str::to_owned)?;
-            set("vanEmail", "Adres afzender", &args.van_email, str::to_owned)?;
-            set("cc", "Cc", &args.cc, str::to_owned)?;
-            set("bcc", "Bcc", &args.bcc, str::to_owned)?;
-            if let Some(voor) = &args.voor {
-                let (factuur, offerte) = sjabloon_voor(voor)?;
-                object.insert("useFactuur".into(), json!(factuur));
-                object.insert("useOfferte".into(), json!(offerte));
-                lines.push(line(
-                    "Te kiezen bij",
-                    match (factuur, offerte) {
-                        (true, true) => "facturen en offertes",
-                        (true, false) => "facturen",
-                        _ => "offertes",
-                    },
-                ));
-            }
-            if lines.len() == 1 {
-                return Err(Halt::Error(
-                    "Er is niets gewijzigd: geef aan wat er anders moet".into(),
-                ));
-            }
-            let built = Built {
-                body: sjabloon,
-                title: format!("E-mailsjabloon wijzigen: {old_name}"),
-                lines,
-            };
-            // Where the mail comes from and who gets a copy decides where customers' invoices go: always asked.
-            let redirects = args.cc.is_some() || args.bcc.is_some() || args.van_email.is_some();
-            self.approve(&run, TOOL, &built, redirects).await?;
-            self.change_done(&run, "PUT", "emailsjabloonab", Some(&built.body))
-                .await
-        }
-        .await;
-        Ok(self.end_write(run, "E-mailsjabloon gewijzigd", result))
+                if lines.len() == 1 {
+                    return Err(Halt::Error(
+                        "Er is niets gewijzigd: geef aan wat er anders moet".into(),
+                    ));
+                }
+                let built = Built {
+                    body: sjabloon,
+                    title: format!("E-mailsjabloon wijzigen: {old_name}"),
+                    lines,
+                };
+                // Where the mail comes from and who gets a copy decides where customers' invoices go: always asked.
+                let redirects = args.cc.is_some() || args.bcc.is_some() || args.van_email.is_some();
+                this.approve(&run, TOOL, &built, redirects).await?;
+                this.change_done(&run, "PUT", "emailsjabloonab", Some(&built.body))
+                    .await
+            },
+        )
+        .await
     }
 
     #[tool(
-        description = "Een e-mailsjabloon verwijderen, op id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        description = "Een e-mailsjabloon verwijderen, op id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "E-mailsjabloon verwijderen",
             read_only_hint = false,
@@ -3093,12 +3459,9 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "emailsjabloon_verwijderen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let sjabloon = self.fetch(&run, &format!("EmailSjabloonAb/{}", args.id), Vec::new()).await?;
+        let account = args.account.clone();
+        self.write_tool(&context, TOOL, account.as_deref(), args, "E-mailsjabloon verwijderd", move |this, run, args| async move {
+            let sjabloon = this.fetch(&run, &format!("EmailSjabloonAb/{}", args.id), Vec::new()).await?;
             let naam = sjabloon.get("naam").and_then(Value::as_str).unwrap_or_default().to_owned();
             let built = Built {
                 body: Value::Null,
@@ -3109,11 +3472,10 @@ impl EbMcp {
                     line("Gevolg", "het sjabloon verdwijnt; facturen en abonnementen die het gebruikten hebben dan geen e-mailsjabloon meer. Niet terug te draaien."),
                 ],
             };
-            self.approve(&run, TOOL, &built, true).await?;
-            self.change_done(&run, "DELETE", &format!("emailsjabloonab/{}", args.id), None).await
-        }
-        .await;
-        Ok(self.end_write(run, "E-mailsjabloon verwijderd", result))
+            this.approve(&run, TOOL, &built, true).await?;
+            this.change_done(&run, "DELETE", &format!("emailsjabloonab/{}", args.id), None).await
+        })
+        .await
     }
 
     #[tool(
@@ -3187,7 +3549,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een offerte maken voor een relatie. Prijzen per stuk, incl of excl btw; btw op code (HOOG_VERK_21, LAAG_VERK_9, GEEN, ...), de omzetrekening op code. Zonder nummer krijgt de offerte het volgende nummer van e-Boekhouden. De offerte wordt niet verstuurd. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de offerte eerst goed in EB MCP.",
+        description = "Een offerte maken voor een relatie. Prijzen per stuk, incl of excl btw; btw op code (HOOG_VERK_21, LAAG_VERK_9, GEEN, ...), de omzetrekening op code. Zonder nummer krijgt de offerte het volgende nummer van e-Boekhouden. De offerte wordt niet verstuurd. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de offerte eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Offerte toevoegen",
             read_only_hint = false,
@@ -3201,24 +3563,21 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "offerte_toevoegen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let books = self.books(&run).await?;
-            let nummer = self.fetch(&run, "offerte/nummer/next", Vec::new()).await?;
-            let user = self.fetch(&run, "user", Vec::new()).await?;
+        let account = args.account.clone();
+        self.write_tool(&context, TOOL, account.as_deref(), args, "Offerte toegevoegd; data.id is het id en data.nummer het offertenummer", move |this, run, args| async move {
+            let books = this.books(&run).await?;
+            let nummer = this.fetch(&run, "offerte/nummer/next", Vec::new()).await?;
+            let user = this.fetch(&run, "user", Vec::new()).await?;
             let sjabloon_id = match args.sjabloon_id {
                 Some(id) => id,
-                None => self
+                None => this
                     .first_active(&run, "offertesjabloon/gridtable")
                     .await?
                     .ok_or_else(|| Halt::Error("Deze administratie heeft geen actief offertesjabloon".into()))?,
             };
             let status_id = match args.status_id {
                 Some(id) => id,
-                None => self
+                None => this
                     .first_active(&run, "offertestatus/gridtable")
                     .await?
                     .ok_or_else(|| Halt::Error("Deze administratie heeft geen offertestatussen".into()))?,
@@ -3234,15 +3593,15 @@ impl EbMcp {
                 vandaag: today(),
             };
             let (built, regels) = write::offerte_nieuw(&args, &offerte_context, &books)?;
-            self.approve(&run, TOOL, &built, false).await?;
-            let made = self.change(&run, "POST", "offerte", Some(&built.body)).await?;
+            this.approve(&run, TOOL, &built, false).await?;
+            let made = this.change(&run, "POST", "offerte", Some(&built.body)).await?;
             let id = made
                 .get("id")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| Halt::Error("e-Boekhouden gaf de nieuwe offerte niet terug".into()))?;
             for (n, mut regel) in regels.into_iter().enumerate() {
                 regel["offerteId"] = json!(id);
-                if let Err(Halt::Error(message) | Halt::Refused(message)) = self.change(&run, "POST", "offerteregel", Some(&regel)).await {
+                if let Err(Halt::Error(message) | Halt::Refused(message)) = this.change(&run, "POST", "offerteregel", Some(&regel)).await {
                     return Err(Halt::Error(format!(
                         "De offerte is aangemaakt (id {id}), maar regel {} is niet opgeslagen: {message}. Vul de regels aan met offerte_wijzigen.",
                         n + 1
@@ -3250,21 +3609,16 @@ impl EbMcp {
                 }
             }
             // The quote exists; a failed read-back must not look like a failed change (a retry would make a second one).
-            Ok(self
+            Ok(this
                 .fetch(&run, &format!("offerte/{id}"), Vec::new())
                 .await
                 .unwrap_or(made))
-        }
-        .await;
-        Ok(self.end_write(
-            run,
-            "Offerte toegevoegd; data.id is het id en data.nummer het offertenummer",
-            result,
-        ))
+        })
+        .await
     }
 
     #[tool(
-        description = "Een offerte wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. De statussen staan bij de tool offerte. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP.",
+        description = "Een offerte wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. De statussen staan bij de tool offerte. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Offerte wijzigen",
             read_only_hint = false,
@@ -3278,22 +3632,19 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "offerte_wijzigen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let now = self.fetch(&run, &format!("offerte/{}", args.id), Vec::new()).await?;
-            let old = self.fetch(&run, &format!("offerteregel/getbyofferteid/{}", args.id), Vec::new()).await?;
-            let books = self.books(&run).await?;
+        let account = args.account.clone();
+        self.write_tool(&context, TOOL, account.as_deref(), args, "Offerte gewijzigd", move |this, run, args| async move {
+            let now = this.fetch(&run, &format!("offerte/{}", args.id), Vec::new()).await?;
+            let old = this.fetch(&run, &format!("offerteregel/getbyofferteid/{}", args.id), Vec::new()).await?;
+            let books = this.books(&run).await?;
             let (built, regels) = write::offerte_gewijzigd(&args, &now, &books)?;
-            self.approve(&run, TOOL, &built, false).await?;
-            self.change_done(&run, "PUT", "offerte", Some(&built.body)).await?;
+            this.approve(&run, TOOL, &built, false).await?;
+            this.change_done(&run, "PUT", "offerte", Some(&built.body)).await?;
             if let Some(regels) = regels {
                 // New lines go in before the old ones go out: a failure halfway leaves too many lines, never none.
                 for (n, mut regel) in regels.into_iter().enumerate() {
                     regel["offerteId"] = json!(args.id);
-                    if let Err(Halt::Error(message) | Halt::Refused(message)) = self.change(&run, "POST", "offerteregel", Some(&regel)).await {
+                    if let Err(Halt::Error(message) | Halt::Refused(message)) = this.change(&run, "POST", "offerteregel", Some(&regel)).await {
                         return Err(Halt::Error(format!(
                             "De offerte is gewijzigd, maar nieuwe regel {} is niet opgeslagen: {message}. De oude regels staan er nog; kijk met offerte wat er nu staat.",
                             n + 1
@@ -3303,7 +3654,7 @@ impl EbMcp {
                 for regel in old.as_array().cloned().unwrap_or_default() {
                     if let Some(id) = regel.get("id").and_then(Value::as_u64)
                         && let Err(Halt::Error(message) | Halt::Refused(message)) =
-                            self.change_done(&run, "DELETE", &format!("offerteregel/{id}"), None).await
+                            this.change_done(&run, "DELETE", &format!("offerteregel/{id}"), None).await
                     {
                         return Err(Halt::Error(format!(
                             "De nieuwe regels staan erin, maar een oude regel (id {id}) is niet verwijderd: {message}. Kijk met offerte wat er nu staat."
@@ -3311,17 +3662,16 @@ impl EbMcp {
                     }
                 }
             }
-            Ok(self
+            Ok(this
                 .fetch(&run, &format!("offerte/{}", args.id), Vec::new())
                 .await
                 .unwrap_or_else(|_| json!({"id": args.id})))
-        }
-        .await;
-        Ok(self.end_write(run, "Offerte gewijzigd", result))
+        })
+        .await
     }
 
     #[tool(
-        description = "Een offerte verwijderen, op id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        description = "Een offerte verwijderen, op id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Offerte verwijderen",
             read_only_hint = false,
@@ -3335,47 +3685,52 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "offerte_verwijderen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let now = self
-                .fetch(&run, &format!("offerte/{}", args.id), Vec::new())
-                .await?;
-            let nummer = now
-                .get("nummer")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let built = Built {
-                body: Value::Null,
-                title: format!("Offerte {nummer} verwijderen"),
-                lines: vec![
-                    line("Offerte", &nummer),
-                    line(
-                        "Relatie",
-                        format!(
-                            "id {}",
-                            now.get("relatieId").and_then(Value::as_u64).unwrap_or(0)
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
+            "Offerte verwijderd",
+            move |this, run, args| async move {
+                let now = this
+                    .fetch(&run, &format!("offerte/{}", args.id), Vec::new())
+                    .await?;
+                let nummer = now
+                    .get("nummer")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let built = Built {
+                    body: Value::Null,
+                    title: format!("Offerte {nummer} verwijderen"),
+                    lines: vec![
+                        line("Offerte", &nummer),
+                        line(
+                            "Relatie",
+                            format!(
+                                "id {}",
+                                now.get("relatieId").and_then(Value::as_u64).unwrap_or(0)
+                            ),
                         ),
-                    ),
-                    line(
-                        "Totaal incl. btw",
-                        write::euro(now.get("totaalIncl").and_then(Value::as_f64).unwrap_or(0.0)),
-                    ),
-                    line(
-                        "Gevolg",
-                        "de offerte en zijn regels verdwijnen; dit is niet terug te draaien",
-                    ),
-                ],
-            };
-            self.approve(&run, TOOL, &built, true).await?;
-            self.change_done(&run, "DELETE", &format!("offerte/{}", args.id), None)
-                .await
-        }
-        .await;
-        Ok(self.end_write(run, "Offerte verwijderd", result))
+                        line(
+                            "Totaal incl. btw",
+                            write::euro(
+                                now.get("totaalIncl").and_then(Value::as_f64).unwrap_or(0.0),
+                            ),
+                        ),
+                        line(
+                            "Gevolg",
+                            "de offerte en zijn regels verdwijnen; dit is niet terug te draaien",
+                        ),
+                    ],
+                };
+                this.approve(&run, TOOL, &built, true).await?;
+                this.change_done(&run, "DELETE", &format!("offerte/{}", args.id), None)
+                    .await
+            },
+        )
+        .await
     }
 
     #[tool(
@@ -3437,7 +3792,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een sjabloon maken. Factuur en offerte: een kopie van een bestaand sjabloon (kopie_van, standaard het eerste actieve); pas de opmaak daarna aan met sjabloon_wijzigen. Aanmaan: een e-mailtekst met onderwerp en bericht. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP.",
+        description = "Een sjabloon maken. Factuur en offerte: een kopie van een bestaand sjabloon (kopie_van, standaard het eerste actieve); pas de opmaak daarna aan met sjabloon_wijzigen. Aanmaan: een e-mailtekst met onderwerp en bericht. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Sjabloon toevoegen",
             read_only_hint = false,
@@ -3451,11 +3806,8 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "sjabloon_toevoegen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
+        let account = args.account.clone();
+        self.write_tool(&context, TOOL, account.as_deref(), args, "Sjabloon toegevoegd; data.id is het id", move |this, run, args| async move {
             let naam = args.naam.trim().to_owned();
             if naam.is_empty() || naam.chars().count() > 50 {
                 return Err(Halt::Error("Geef het sjabloon een naam van hoogstens 50 tekens".into()));
@@ -3478,12 +3830,12 @@ impl EbMcp {
             } else {
                 let from = match args.kopie_van {
                     Some(id) => id,
-                    None => self
+                    None => this
                         .first_active(&run, &format!("{}/gridtable", args.soort.path()))
                         .await?
                         .ok_or_else(|| Halt::Error("Er is geen actief sjabloon om te kopiëren; geef kopie_van".into()))?,
                 };
-                let source = self.fetch(&run, &format!("{}/{from}", args.soort.path()), Vec::new()).await?;
+                let source = this.fetch(&run, &format!("{}/{from}", args.soort.path()), Vec::new()).await?;
                 if source.get("type").and_then(Value::as_str) != Some("E") {
                     return Err(Halt::Error("Het sjabloon om te kopiëren is een RTF-bestand; kies er een dat in de editor is gemaakt".into()));
                 }
@@ -3496,15 +3848,14 @@ impl EbMcp {
                     ],
                 }
             };
-            self.approve(&run, TOOL, &built, false).await?;
-            self.change(&run, "POST", args.soort.path(), Some(&built.body)).await
-        }
-        .await;
-        Ok(self.end_write(run, "Sjabloon toegevoegd; data.id is het id", result))
+            this.approve(&run, TOOL, &built, false).await?;
+            this.change(&run, "POST", args.soort.path(), Some(&built.body)).await
+        })
+        .await
     }
 
     #[tool(
-        description = "Een sjabloon wijzigen, op soort en id. Aanmaan: naam, onderwerp of bericht. Factuur en offerte: naam, actief of inactief, en de opmaak: geef dan het hele document `opmaak` uit de tool sjabloon terug met je wijzigingen (tekst in content, plaats in x en y, grootte in width en height; nieuwe elementen krijgen een nieuw id). De gebruiker ziet per element wat er verandert. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP.",
+        description = "Een sjabloon wijzigen, op soort en id. Aanmaan: naam, onderwerp of bericht. Factuur en offerte: naam, actief of inactief, en de opmaak: geef dan het hele document `opmaak` uit de tool sjabloon terug met je wijzigingen (tekst in content, plaats in x en y, grootte in width en height; nieuwe elementen krijgen een nieuw id). De gebruiker ziet per element wat er verandert. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Sjabloon wijzigen",
             read_only_hint = false,
@@ -3518,13 +3869,10 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "sjabloon_wijzigen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
+        let account = args.account.clone();
         let path = format!("{}/{}", args.soort.path(), args.id);
-        let result = async {
-            let mut sjabloon = self.fetch(&run, &path, Vec::new()).await?;
+        self.write_tool(&context, TOOL, account.as_deref(), args, "Sjabloon gewijzigd", move |this, run, args| async move {
+            let mut sjabloon = this.fetch(&run, &path, Vec::new()).await?;
             let old_name = sjabloon.get("naam").and_then(Value::as_str).unwrap_or_default().to_owned();
             let mut lines = vec![line(args.soort.naam(), &old_name)];
             let mut meta_changed = false;
@@ -3570,10 +3918,10 @@ impl EbMcp {
                 if sjabloon.get("type").and_then(Value::as_str) != Some("E") {
                     return Err(Halt::Error("Dit sjabloon is een geüpload RTF-bestand; de opmaak daarvan is niet te wijzigen via EB MCP".into()));
                 }
-                let (hash, now) = self.editor_session(&run, args.soort, args.id).await?;
+                let (hash, now) = this.editor_session(&run, args.soort, args.id).await?;
                 let checked = write::opmaak_changes(&now, opmaak);
                 // The session that was opened to compare is closed without saving, whatever comes next.
-                self.editor_end(&run, &hash, now.clone(), false).await?;
+                this.editor_end(&run, &hash, now.clone(), false).await?;
                 let changes = checked?;
                 if !changes.is_empty() {
                     lines.extend(changes);
@@ -3591,15 +3939,15 @@ impl EbMcp {
                 return Err(Halt::Error("Er is niets gewijzigd: geef aan wat er anders moet".into()));
             }
             let built = Built { body: sjabloon, title: format!("{} wijzigen: {old_name}", args.soort.naam()), lines };
-            self.approve(&run, TOOL, &built, false).await?;
+            this.approve(&run, TOOL, &built, false).await?;
             if meta_changed {
-                self.change_done(&run, "PUT", args.soort.path(), Some(&built.body)).await?;
+                this.change_done(&run, "PUT", args.soort.path(), Some(&built.body)).await?;
             }
             if let Some(document) = layout {
-                let (hash, _) = self.editor_session(&run, args.soort, args.id).await.map_err(|e| {
+                let (hash, _) = this.editor_session(&run, args.soort, args.id).await.map_err(|e| {
                     Halt::Error(if meta_changed { format!("Naam of status is gewijzigd, maar de opmaak niet: {e}") } else { e })
                 })?;
-                self.editor_end(&run, &hash, document, true).await.map_err(|e| {
+                this.editor_end(&run, &hash, document, true).await.map_err(|e| {
                     Halt::Error(if meta_changed {
                         format!("Naam of status is gewijzigd, maar de opmaak niet: {e}")
                     } else {
@@ -3608,13 +3956,12 @@ impl EbMcp {
                 })?;
             }
             Ok(json!(true))
-        }
-        .await;
-        Ok(self.end_write(run, "Sjabloon gewijzigd", result))
+        })
+        .await
     }
 
     #[tool(
-        description = "Een sjabloon verwijderen, op soort en id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        description = "Een sjabloon verwijderen, op soort en id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Sjabloon verwijderen",
             read_only_hint = false,
@@ -3628,13 +3975,10 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "sjabloon_verwijderen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
+        let account = args.account.clone();
         let path = format!("{}/{}", args.soort.path(), args.id);
-        let result = async {
-            let sjabloon = self.fetch(&run, &path, Vec::new()).await?;
+        self.write_tool(&context, TOOL, account.as_deref(), args, "Sjabloon verwijderd", move |this, run, args| async move {
+            let sjabloon = this.fetch(&run, &path, Vec::new()).await?;
             let naam = sjabloon.get("naam").and_then(Value::as_str).unwrap_or_default().to_owned();
             let built = Built {
                 body: Value::Null,
@@ -3644,11 +3988,10 @@ impl EbMcp {
                     line("Gevolg", "het sjabloon verdwijnt; wat het gebruikte heeft dan geen sjabloon meer. Niet terug te draaien."),
                 ],
             };
-            self.approve(&run, TOOL, &built, true).await?;
-            self.change_done(&run, "DELETE", &path, None).await
-        }
-        .await;
-        Ok(self.end_write(run, "Sjabloon verwijderd", result))
+            this.approve(&run, TOOL, &built, true).await?;
+            this.change_done(&run, "DELETE", &path, None).await
+        })
+        .await
     }
 
     #[tool(
@@ -3715,7 +4058,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een relatie (klant of leverancier) aanmaken. Naam en code zijn nodig; de code is uniek binnen de administratie. Zoek de gegevens van een bedrijf eerst op met kvk_zoeken en kvk_adres. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de relatie eerst goed in EB MCP.",
+        description = "Een relatie (klant of leverancier) aanmaken. Naam en code zijn nodig; de code is uniek binnen de administratie. Zoek de gegevens van een bedrijf eerst op met kvk_zoeken en kvk_adres. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de relatie eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Relatie toevoegen",
             read_only_hint = false,
@@ -3729,67 +4072,70 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "relatie_toevoegen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let given = args.velden.given()?;
-            let has = |key: &str| given.iter().any(|(k, _, v, _)| *k == key && !v.is_empty());
-            if !has("bedrijf") || !has("code") {
-                return Err(Halt::Error(
-                    "Een relatie heeft een naam (bedrijf) en een code nodig".into(),
-                ));
-            }
-            let particulier = args.velden.particulier.unwrap_or(false);
-            // The fields e-Boekhouden's form always sends along, with the values of an untouched form.
-            let mut relatie = serde_json::Map::new();
-            relatie.insert("bp".into(), json!(if particulier { "P" } else { "B" }));
-            let mut lines = vec![line(
-                "Soort",
-                if particulier {
-                    "particulier"
-                } else {
-                    "bedrijf"
-                },
-            )];
-            for (key, label, value, _) in &given {
-                if !value.is_empty() {
-                    relatie.insert((*key).into(), json!(value));
-                    lines.push(line(label, value));
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
+            "Relatie toegevoegd; data.id is het id",
+            move |this, run, args| async move {
+                let given = args.velden.given()?;
+                let has = |key: &str| given.iter().any(|(k, _, v, _)| *k == key && !v.is_empty());
+                if !has("bedrijf") || !has("code") {
+                    return Err(Halt::Error(
+                        "Een relatie heeft een naam (bedrijf) en een code nodig".into(),
+                    ));
                 }
-            }
-            for key in [
-                "sepaMachtiging",
-                "menHAllowMail",
-                "menHAllowHerken",
-                "geenEmail",
-                "la",
-            ] {
-                relatie.insert(key.into(), json!(0));
-            }
-            let naam = args
-                .velden
-                .bedrijf
-                .as_deref()
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
-            let built = Built {
-                body: json!({"relatie": relatie}),
-                title: format!("Relatie toevoegen: {naam}"),
-                lines,
-            };
-            self.approve(&run, TOOL, &built, false).await?;
-            self.change(&run, "POST", "relatie/model", Some(&built.body))
-                .await
-        }
-        .await;
-        Ok(self.end_write(run, "Relatie toegevoegd; data.id is het id", result))
+                let particulier = args.velden.particulier.unwrap_or(false);
+                // The fields e-Boekhouden's form always sends along, with the values of an untouched form.
+                let mut relatie = serde_json::Map::new();
+                relatie.insert("bp".into(), json!(if particulier { "P" } else { "B" }));
+                let mut lines = vec![line(
+                    "Soort",
+                    if particulier {
+                        "particulier"
+                    } else {
+                        "bedrijf"
+                    },
+                )];
+                for (key, label, value, _) in &given {
+                    if !value.is_empty() {
+                        relatie.insert((*key).into(), json!(value));
+                        lines.push(line(label, value));
+                    }
+                }
+                for key in [
+                    "sepaMachtiging",
+                    "menHAllowMail",
+                    "menHAllowHerken",
+                    "geenEmail",
+                    "la",
+                ] {
+                    relatie.insert(key.into(), json!(0));
+                }
+                let naam = args
+                    .velden
+                    .bedrijf
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                let built = Built {
+                    body: json!({"relatie": relatie}),
+                    title: format!("Relatie toevoegen: {naam}"),
+                    lines,
+                };
+                this.approve(&run, TOOL, &built, false).await?;
+                this.change(&run, "POST", "relatie/model", Some(&built.body))
+                    .await
+            },
+        )
+        .await
     }
 
     #[tool(
-        description = "Een relatie wijzigen, op id. Wat je niet noemt blijft zoals het is; een leeg veld maakt het leeg. Een wijziging van het IBAN, de BIC of een e-mailadres bepaalt waar geld en facturen heen gaan en vraagt daarom altijd het akkoord van de gebruiker. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet.",
+        description = "Een relatie wijzigen, op id. Wat je niet noemt blijft zoals het is; een leeg veld maakt het leeg. Een wijziging van het IBAN, de BIC of een e-mailadres bepaalt waar geld en facturen heen gaan en vraagt daarom altijd het akkoord van de gebruiker. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Relatie wijzigen",
             read_only_hint = false,
@@ -3803,79 +4149,82 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "relatie_wijzigen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let mut relatie = self
-                .fetch(&run, &format!("relatie/{}", args.id), Vec::new())
-                .await?;
-            let naam = relatie
-                .get("bedrijf")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let object = relatie.as_object_mut().ok_or_else(|| {
-                Halt::Error("e-Boekhouden gaf deze relatie in een onbekende vorm terug".into())
-            })?;
-            let mut lines = vec![line("Relatie", &naam)];
-            let mut sensitive = false;
-            for (key, label, value, decides) in args.velden.given()? {
-                let before = object
-                    .get(key)
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
+            "Relatie gewijzigd",
+            move |this, run, args| async move {
+                let mut relatie = this
+                    .fetch(&run, &format!("relatie/{}", args.id), Vec::new())
+                    .await?;
+                let naam = relatie
+                    .get("bedrijf")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                if before == value {
-                    continue;
-                }
-                sensitive |= decides;
-                lines.push(line(&format!("{label} was"), known(before)));
-                lines.push(line(
-                    &format!("{label} wordt"),
-                    if value.is_empty() {
-                        "(leeg)".to_owned()
-                    } else {
-                        value.clone()
-                    },
-                ));
-                object.insert(key.into(), json!(value));
-            }
-            if let Some(particulier) = args.velden.particulier {
-                let bp = if particulier { "P" } else { "B" };
-                if object.get("bp").and_then(Value::as_str) != Some(bp) {
-                    object.insert("bp".into(), json!(bp));
+                let object = relatie.as_object_mut().ok_or_else(|| {
+                    Halt::Error("e-Boekhouden gaf deze relatie in een onbekende vorm terug".into())
+                })?;
+                let mut lines = vec![line("Relatie", &naam)];
+                let mut sensitive = false;
+                for (key, label, value, decides) in args.velden.given()? {
+                    let before = object
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    if before == value {
+                        continue;
+                    }
+                    sensitive |= decides;
+                    lines.push(line(&format!("{label} was"), known(before)));
                     lines.push(line(
-                        "Soort wordt",
-                        if particulier {
-                            "particulier"
+                        &format!("{label} wordt"),
+                        if value.is_empty() {
+                            "(leeg)".to_owned()
                         } else {
-                            "bedrijf"
+                            value.clone()
                         },
                     ));
+                    object.insert(key.into(), json!(value));
                 }
-            }
-            if lines.len() == 1 {
-                return Err(Halt::Error(
-                    "Er is niets gewijzigd: geef aan wat er anders moet".into(),
-                ));
-            }
-            let built = Built {
-                body: json!({"relatie": relatie}),
-                title: format!("Relatie wijzigen: {naam}"),
-                lines,
-            };
-            self.approve(&run, TOOL, &built, sensitive).await?;
-            self.change_done(&run, "PUT", "relatie/model", Some(&built.body))
-                .await
-        }
-        .await;
-        Ok(self.end_write(run, "Relatie gewijzigd", result))
+                if let Some(particulier) = args.velden.particulier {
+                    let bp = if particulier { "P" } else { "B" };
+                    if object.get("bp").and_then(Value::as_str) != Some(bp) {
+                        object.insert("bp".into(), json!(bp));
+                        lines.push(line(
+                            "Soort wordt",
+                            if particulier {
+                                "particulier"
+                            } else {
+                                "bedrijf"
+                            },
+                        ));
+                    }
+                }
+                if lines.len() == 1 {
+                    return Err(Halt::Error(
+                        "Er is niets gewijzigd: geef aan wat er anders moet".into(),
+                    ));
+                }
+                let built = Built {
+                    body: json!({"relatie": relatie}),
+                    title: format!("Relatie wijzigen: {naam}"),
+                    lines,
+                };
+                this.approve(&run, TOOL, &built, sensitive).await?;
+                this.change_done(&run, "PUT", "relatie/model", Some(&built.body))
+                    .await
+            },
+        )
+        .await
     }
 
     #[tool(
-        description = "Een relatie verwijderen, op id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        description = "Een relatie verwijderen, op id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Relatie verwijderen",
             read_only_hint = false,
@@ -3889,12 +4238,9 @@ impl EbMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "relatie_verwijderen";
-        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
-            Ok(run) => run,
-            Err(answer) => return Ok(answer),
-        };
-        let result = async {
-            let relatie = self.fetch(&run, &format!("relatie/{}", args.id), Vec::new()).await?;
+        let account = args.account.clone();
+        self.write_tool(&context, TOOL, account.as_deref(), args, "Relatie verwijderd", move |this, run, args| async move {
+            let relatie = this.fetch(&run, &format!("relatie/{}", args.id), Vec::new()).await?;
             let text = |key: &str| relatie.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
             let naam = text("bedrijf");
             let built = Built {
@@ -3907,11 +4253,10 @@ impl EbMcp {
                     line("Gevolg", "de relatie verdwijnt uit de administratie; dit is niet terug te draaien. e-Boekhouden kan weigeren als er nog boekingen aan hangen."),
                 ],
             };
-            self.approve(&run, TOOL, &built, true).await?;
-            self.change_done(&run, "DELETE", &format!("relatie/{}", args.id), None).await
-        }
-        .await;
-        Ok(self.end_write(run, "Relatie verwijderd", result))
+            this.approve(&run, TOOL, &built, true).await?;
+            this.change_done(&run, "DELETE", &format!("relatie/{}", args.id), None).await
+        })
+        .await
     }
 }
 
@@ -3944,8 +4289,11 @@ impl ServerHandler for EbMcp {
             .with_instructions(
                 "Leest de boekhouding in e-Boekhouden van de accounts die in EB MCP zijn ingelogd. \
                  Wijzigen (relaties, mutaties, bestanden, facturen, offertes, abonnementen, sjablonen) en facturen mailen kan alleen voor accounts waar de gebruiker schrijven heeft aangezet; \
-                 status zegt per account of dat uit staat, met akkoord of zonder akkoord. Met akkoord toont EB MCP elke wijziging eerst aan de gebruiker, \
-                 en de tool wacht tot die is goedgekeurd of geweigerd: vertel de gebruiker dat er in EB MCP iets klaarstaat. \
+                 status zegt per account of dat uit staat, met akkoord of zonder akkoord. Met akkoord toont EB MCP elke wijziging eerst aan de gebruiker; \
+                 verwijderen, crediteren, facturen mailen en abonnementen factureren vragen altijd akkoord. Zo'n tool wacht niet op de gebruiker: \
+                 hij antwoordt meteen met status wacht en een voorstel_id, en voert de wijziging zelf uit zodra de gebruiker goedkeurt. \
+                 Vertel de gebruiker dat er in EB MCP een wijziging op akkoord wacht, ga gerust verder met ander werk, \
+                 en vraag de uitkomst later op met akkoord_status (met voorstel_id voor één voorstel en zijn resultaat; zonder voor alles van de laatste 24 uur). \
                  Staat er meer dan één account in EB MCP, dan moet elke tool de account-parameter meekrijgen; status zegt welke accounts er zijn.",
             )
     }
@@ -4078,8 +4426,25 @@ mod tests {
     }
 
     #[test]
+    fn a_call_given_up_stops_its_change_only_before_approval() {
+        let gate = Gate::default();
+        assert!(gate.abandon(), "only read so far: stopped");
+        assert!(!gate.commit(), "approve refuses once the call was given up");
+        assert!(!gate.committed());
+
+        let gate = Gate::default();
+        assert!(gate.commit());
+        assert!(gate.committed());
+        assert!(
+            !gate.abandon(),
+            "once committed the change belongs to the queue and is not stopped halfway"
+        );
+        assert!(gate.committed());
+    }
+
+    #[test]
     fn counts_its_tools_on_the_router() {
-        assert_eq!(tool_count(), 54);
+        assert_eq!(tool_count(), 55);
     }
 
     #[test]

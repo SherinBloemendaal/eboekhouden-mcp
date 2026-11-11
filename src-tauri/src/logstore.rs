@@ -17,6 +17,7 @@ use chrono::{DateTime, Local};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -37,6 +38,21 @@ pub fn log_file(dir: &Path) -> PathBuf {
 /// The saved log, `None` when there is no file yet. An error for a file that is damaged or has
 /// another format; the caller starts empty then.
 pub fn read(path: &Path) -> Result<Option<Snapshot>, String> {
+    let snapshot: Option<Snapshot> = read_versioned(path, reqlog::FORMAT)?;
+    debug_assert!(
+        snapshot
+            .as_ref()
+            .is_none_or(|s| s.format() == reqlog::FORMAT)
+    );
+    Ok(snapshot)
+}
+
+/// A gzip file holding one JSON object with a `format` number, `None` when there is no file yet.
+/// An error for a file that is damaged or has another format than `format`.
+pub(crate) fn read_versioned<T: DeserializeOwned>(
+    path: &Path,
+    format: u32,
+) -> Result<Option<T>, String> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -53,24 +69,34 @@ pub fn read(path: &Path) -> Result<Option<Snapshot>, String> {
     }
     let header: Header = serde_json::from_slice(&json).map_err(|e| format!("damaged JSON: {e}"))?;
     match header.format {
-        Some(reqlog::FORMAT) => {}
+        Some(found) if found == format => {}
         Some(other) => {
             return Err(format!(
-                "format {other}, this version reads format {}",
-                reqlog::FORMAT
+                "format {other}, this version reads format {format}"
             ));
         }
         None => return Err("no format number".into()),
     }
-    let snapshot: Snapshot =
-        serde_json::from_slice(&json).map_err(|e| format!("damaged JSON: {e}"))?;
-    debug_assert_eq!(snapshot.format(), reqlog::FORMAT);
-    Ok(Some(snapshot))
+    serde_json::from_slice(&json)
+        .map(Some)
+        .map_err(|e| format!("damaged JSON: {e}"))
+}
+
+/// Sets an unreadable file aside as `<name>.damaged` instead of overwriting it: it may still be worth a look.
+pub(crate) fn set_aside(file: &Path) -> PathBuf {
+    let aside = file.with_extension("gz.damaged");
+    let _ = fs::rename(file, &aside);
+    aside
 }
 
 /// Saves the log, compressed, atomically and readable by the user only.
 pub fn write(path: &Path, snapshot: &Snapshot) -> Result<(), String> {
-    let bytes = gzip_json(snapshot)?;
+    write_gz(path, snapshot)
+}
+
+/// Saves any value as gzipped JSON, atomically and readable by the user only.
+pub(crate) fn write_gz<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {
+    let bytes = gzip_json(value)?;
     write_private(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -177,8 +203,13 @@ pub fn export_lines(log: &RequestLog, input: &ExportInput<'_>) -> Result<Vec<Str
     for entry in &entries {
         lines.push(tagged("entry", entry)?);
     }
-    let hidden: Vec<String> = input
-        .hidden
+    masked_lines(&lines, input.hidden)
+}
+
+/// Each JSON value as one line of text, with every value in `hidden` (usernames, 1Password
+/// references) replaced by the mask wherever it shows up.
+pub(crate) fn masked_lines(lines: &[Value], hidden: &[String]) -> Result<Vec<String>, String> {
+    let hidden: Vec<String> = hidden
         .iter()
         .map(|h| h.trim())
         .filter(|h| h.chars().count() >= HIDDEN_MIN_LEN)
@@ -202,7 +233,7 @@ pub fn export_lines(log: &RequestLog, input: &ExportInput<'_>) -> Result<Vec<Str
 }
 
 /// A JSON object with `"type": kind` added.
-fn tagged<T: Serialize>(kind: &str, value: &T) -> Result<Value, String> {
+pub(crate) fn tagged<T: Serialize>(kind: &str, value: &T) -> Result<Value, String> {
     let mut value = serde_json::to_value(value).map_err(|e| e.to_string())?;
     match &mut value {
         Value::Object(map) => {
@@ -217,16 +248,32 @@ fn tagged<T: Serialize>(kind: &str, value: &T) -> Result<Value, String> {
 /// `-3` and so on when that name is taken) and returns its path.
 pub fn export(dir: &Path, log: &RequestLog, input: &ExportInput<'_>) -> Result<PathBuf, String> {
     let lines = export_lines(log, input)?;
+    write_export(dir, DEBUG_PREFIX, &input.exported_at, &lines)
+}
+
+/// The name every debug export starts with.
+const DEBUG_PREFIX: &str = "eb-mcp-debug-";
+/// The name every export of the approval history starts with (approvals.rs).
+pub(crate) const APPROVALS_PREFIX: &str = "eb-mcp-akkoord-";
+
+/// Writes `lines` as one gzipped JSON Lines file `<prefix><YYYYMMDD-HHMMSS>.jsonl.gz` into `dir`
+/// (with `-2`, `-3` and so on when that name is taken), readable by the user only, and returns its path.
+pub(crate) fn write_export(
+    dir: &Path,
+    prefix: &str,
+    exported_at: &DateTime<Local>,
+    lines: &[String],
+) -> Result<PathBuf, String> {
     let mut text = lines.join("\n");
     text.push('\n');
     let bytes = gzip_json_lines(&text)?;
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let stamp = input.exported_at.format("%Y%m%d-%H%M%S");
+    let stamp = exported_at.format("%Y%m%d-%H%M%S");
     for n in 1..=99 {
         let name = if n == 1 {
-            format!("eb-mcp-debug-{stamp}.jsonl.gz")
+            format!("{prefix}{stamp}.jsonl.gz")
         } else {
-            format!("eb-mcp-debug-{stamp}-{n}.jsonl.gz")
+            format!("{prefix}{stamp}-{n}.jsonl.gz")
         };
         let path = dir.join(name);
         if path.exists() {
@@ -236,7 +283,7 @@ pub fn export(dir: &Path, log: &RequestLog, input: &ExportInput<'_>) -> Result<P
         return Ok(path);
     }
     Err(format!(
-        "{}: no free name for eb-mcp-debug-{stamp}",
+        "{}: no free name for {prefix}{stamp}",
         dir.display()
     ))
 }
@@ -249,14 +296,15 @@ fn gzip_json_lines(text: &str) -> Result<Vec<u8>, String> {
     encoder.finish().map_err(|e| e.to_string())
 }
 
-/// Whether `path` is a debug export: the only files `log_export_reveal` shows.
+/// Whether `path` is a debug export or an export of the approval history: the only files
+/// `log_export_reveal` shows.
 pub fn is_export(path: &Path) -> bool {
     path.is_absolute()
         && path.is_file()
-        && path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("eb-mcp-debug-") && n.ends_with(".jsonl.gz"))
+        && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            (n.starts_with(DEBUG_PREFIX) || n.starts_with(APPROVALS_PREFIX))
+                && n.ends_with(".jsonl.gz")
+        })
 }
 
 #[cfg(test)]
@@ -498,6 +546,29 @@ mod tests {
     }
 
     #[test]
+    fn a_change_waiting_at_the_stop_comes_back_refused() {
+        let dir = TempDir::new();
+        let file = log_file(&dir.0);
+        let log = RequestLog::default();
+        log.open(file.clone());
+        let waiting = log.start_mcp("Claude", "mutatie_toevoegen", json!({}), None);
+        log.link_proposal(waiting, 3);
+        log.wait_mcp(waiting);
+        assert_eq!(log.running(), 0);
+        log.save().unwrap();
+
+        let again = RequestLog::default();
+        again.open(file);
+        let Some(Entry::Mcp(m)) = again.get(waiting) else {
+            panic!()
+        };
+        assert_eq!(m.outcome, Outcome::Refused);
+        assert_eq!(m.error.as_deref(), Some(reqlog::LAPSED));
+        assert_eq!(m.proposal, Some(3));
+        assert_eq!((again.stats().mcp, again.stats().errors), (1, 1));
+    }
+
+    #[test]
     fn clearing_clears_the_file_but_not_the_statistics() {
         let dir = TempDir::new();
         let file = log_file(&dir.0);
@@ -721,5 +792,11 @@ mod tests {
         assert!(!is_export(&other));
         assert!(!is_export(&dir.0.join("eb-mcp-debug-missing.jsonl.gz")));
         assert!(!is_export(Path::new("eb-mcp-debug-1.jsonl.gz")));
+        let history = dir.0.join("eb-mcp-akkoord-20261111-140322.jsonl.gz");
+        fs::write(&history, b"x").unwrap();
+        assert!(is_export(&history));
+        let other = dir.0.join("eb-mcp-akkoord-20261111-140322.json");
+        fs::write(&other, b"x").unwrap();
+        assert!(!is_export(&other));
     }
 }

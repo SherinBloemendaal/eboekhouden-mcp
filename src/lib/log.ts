@@ -3,7 +3,8 @@ import { listen } from '@tauri-apps/api/event'
 import { reactive } from 'vue'
 import { inApp } from './server'
 
-export type Outcome = 'running' | 'ok' | 'error' | 'refused'
+/** `waiting`: the call has answered, its change waits for the user's approval in EB MCP (Akkoord). */
+export type Outcome = 'running' | 'waiting' | 'ok' | 'error' | 'refused'
 
 export interface McpEntry {
   kind: 'mcp'
@@ -19,6 +20,8 @@ export interface McpEntry {
   error: string | null
   calls: number[]
   result?: unknown
+  /** The proposal on Akkoord of the change this call asked for, if it asked for one. */
+  proposal?: number
   /** The EB MCP version that made the entry; empty for entries from before versions were recorded. */
   version: string
 }
@@ -141,7 +144,7 @@ export function isError(entry: Entry): boolean {
 
 export function statusLabel(entry: Entry): string {
   if (entry.kind === 'mcp') {
-    return { running: 'Bezig', ok: 'OK', error: 'Fout', refused: 'Geweigerd' }[entry.outcome]
+    return { running: 'Bezig', waiting: 'Wacht op akkoord', ok: 'OK', error: 'Fout', refused: 'Geweigerd' }[entry.outcome]
   }
   return entry.status ? String(entry.status) : 'Niet verstuurd'
 }

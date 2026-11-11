@@ -26,10 +26,10 @@ afterEach(() => {
 })
 
 describe('views', () => {
-  it('shows the four pages in the sidebar, Dashboard first, and Instellingen at the foot', async () => {
+  it('shows the five pages in the sidebar, Dashboard first, and Instellingen at the foot', async () => {
     const wrapper = await mountAt('/dashboard')
     const labels = wrapper.findAll('nav a').map((a) => a.text())
-    expect(labels).toEqual(['Dashboard', 'Accounts', 'Verzoeken', 'Koppelen', 'Instellingen⌘,'])
+    expect(labels).toEqual(['Dashboard', 'Accounts', 'Akkoord', 'Verzoeken', 'Koppelen', 'Instellingen⌘,'])
     expect(wrapper.find('header h1').text()).toBe('Dashboard')
   })
 

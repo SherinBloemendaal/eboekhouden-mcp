@@ -12,6 +12,14 @@
 //! changed. The statistics therefore count since `started_at`, the start of the
 //! first run that this file knows: the first start with persistence, or the
 //! first start after the file was missing, damaged or of an unknown format.
+//!
+//! A tool that changes the books on an account that asks for approval returns at once while its
+//! proposal waits in EB MCP (approvals.rs). Its MCP entry is then `Waiting`, with the proposal's
+//! id in `proposal`: it holds up neither a quit nor an update restart, as `running` leaves it out.
+//! Once the user approves, the entry is `Running` again while the change goes out, and the
+//! e-Boekhouden calls it makes are linked to it like any other; it ends `Ok` or `Error` when the
+//! change ran, or `Refused` when the user refused it or the proposal lapsed. An entry still
+//! waiting when EB MCP stopped comes back `Refused` with `LAPSED`.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -39,11 +47,15 @@ pub const FORMAT: u32 = 1;
 /// The error of an MCP call that still ran when EB MCP stopped.
 pub const RESTARTED: &str =
     "EB MCP is opnieuw gestart terwijl deze aanroep liep, dus hij is niet afgemaakt.";
+/// The error of an MCP call whose change still waited for the user's approval when EB MCP stopped.
+pub const LAPSED: &str = "EB MCP is opnieuw gestart voordat de gebruiker antwoordde; het voorstel is vervallen en er is niets gewijzigd.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Outcome {
     Running,
+    /// The change waits for the user's approval in EB MCP; the tool call has answered already.
+    Waiting,
     Ok,
     Error,
     Refused,
@@ -68,6 +80,9 @@ pub struct McpEntry {
     pub calls: Vec<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    /// The proposal (approvals.rs) of a change this call asked for, once it went up for approval or ran without.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -294,8 +309,7 @@ impl RequestLog {
             ),
             Err(e) => {
                 // The unreadable file is set aside, not overwritten: it may still be worth a look.
-                let aside = file.with_extension("gz.damaged");
-                let _ = std::fs::rename(&file, &aside);
+                let aside = logstore::set_aside(&file);
                 log::warn!(
                     "request log: {} not read ({e}), set aside as {}, starting empty",
                     file.display(),
@@ -308,8 +322,9 @@ impl RequestLog {
         }
     }
 
-    /// Takes over a saved log. An MCP call that still ran when the app stopped becomes an error,
-    /// counted in the statistics as `finish_mcp` would have. Returns how many entries were loaded.
+    /// Takes over a saved log. An MCP call that still ran when the app stopped becomes an error, one
+    /// whose change still waited for approval is refused; both are counted in the statistics as
+    /// `finish_mcp` would have. Returns how many entries were loaded.
     fn restore(&self, snapshot: Snapshot) -> usize {
         let Snapshot {
             next,
@@ -321,12 +336,20 @@ impl RequestLog {
         let mut restored: VecDeque<Entry> = saved
             .into_iter()
             .map(|mut entry| {
-                if let Entry::Mcp(e) = &mut entry
-                    && e.outcome == Outcome::Running
-                {
-                    e.outcome = Outcome::Error;
-                    e.error = Some(RESTARTED.to_owned());
-                    interrupted.push(e.clone());
+                if let Entry::Mcp(e) = &mut entry {
+                    match e.outcome {
+                        Outcome::Running => {
+                            e.outcome = Outcome::Error;
+                            e.error = Some(RESTARTED.to_owned());
+                            interrupted.push(e.clone());
+                        }
+                        Outcome::Waiting => {
+                            e.outcome = Outcome::Refused;
+                            e.error = Some(LAPSED.to_owned());
+                            interrupted.push(e.clone());
+                        }
+                        Outcome::Ok | Outcome::Error | Outcome::Refused => {}
+                    }
                 }
                 entry
             })
@@ -412,8 +435,48 @@ impl RequestLog {
             error: None,
             calls: Vec::new(),
             result: None,
+            proposal: None,
         }));
         id
+    }
+
+    /// Links an MCP call to the proposal of the change it asked for (approvals.rs).
+    pub fn link_proposal(&self, id: u64, proposal: u64) {
+        self.set_mcp(id, |e| e.proposal = Some(proposal));
+    }
+
+    /// The call's change waits for the user's approval: the call no longer counts as running.
+    pub fn wait_mcp(&self, id: u64) {
+        self.set_mcp(id, |e| {
+            if e.outcome == Outcome::Running {
+                e.outcome = Outcome::Waiting;
+            }
+        });
+    }
+
+    /// The user approved: the call runs again until its change is done.
+    pub fn resume_mcp(&self, id: u64) {
+        self.set_mcp(id, |e| {
+            if e.outcome == Outcome::Waiting {
+                e.outcome = Outcome::Running;
+            }
+        });
+    }
+
+    fn set_mcp(&self, id: u64, change: impl FnOnce(&mut McpEntry)) {
+        let found = {
+            let mut entries = self.entries.lock().unwrap();
+            match entries.iter_mut().find(|e| e.id() == id) {
+                Some(Entry::Mcp(e)) => {
+                    change(e);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if found {
+            self.changed();
+        }
     }
 
     pub fn finish_mcp(
@@ -426,7 +489,10 @@ impl RequestLog {
         let mut done = None;
         {
             let mut entries = self.entries.lock().unwrap();
-            if let Some(Entry::Mcp(e)) = entries.iter_mut().find(|e| e.id() == id) {
+            // Once only: a call that ended already keeps its outcome and is not counted twice.
+            if let Some(Entry::Mcp(e)) = entries.iter_mut().find(|e| e.id() == id)
+                && matches!(e.outcome, Outcome::Running | Outcome::Waiting)
+            {
                 e.outcome = outcome;
                 e.duration_ms = now_ms().saturating_sub(e.at);
                 e.bytes = result.map(|r| r.to_string().len()).unwrap_or(0);
@@ -570,7 +636,8 @@ impl RequestLog {
             .cloned()
     }
 
-    /// MCP calls still running, which an update restart waits for.
+    /// MCP calls still running, which an update restart and a quit wait for. A call whose change
+    /// waits for the user's approval does not count: it has answered its client already.
     pub fn running(&self) -> usize {
         self.entries
             .lock()
@@ -726,7 +793,7 @@ pub fn normalize(path: &str) -> String {
 }
 
 /// A copy small enough to keep: long lists keep their first 50 items and say how many were cut.
-fn shorten(value: &Value) -> (Value, bool) {
+pub(crate) fn shorten(value: &Value) -> (Value, bool) {
     if value.to_string().len() <= BODY_LIMIT {
         return (value.clone(), false);
     }
@@ -901,6 +968,36 @@ mod tests {
         let stats = log.stats();
         assert_eq!((stats.mcp, stats.errors), (1, 1));
         assert_eq!(stats.statuses[0].name, "Geweigerd");
+    }
+
+    #[test]
+    fn a_waiting_change_is_not_running_and_ends_once() {
+        let log = RequestLog::default();
+        let id = log.start_mcp("Claude", "mutatie_toevoegen", json!({}), Some("SN".into()));
+        assert_eq!(log.running(), 1);
+        log.link_proposal(id, 7);
+        log.wait_mcp(id);
+        assert_eq!(
+            log.running(),
+            0,
+            "a waiting change holds up no quit or restart"
+        );
+        let Some(Entry::Mcp(m)) = log.get(id) else {
+            panic!()
+        };
+        assert_eq!((m.outcome, m.proposal), (Outcome::Waiting, Some(7)));
+        assert_eq!(log.stats().mcp, 0, "not counted before it ends");
+        log.resume_mcp(id);
+        assert_eq!(log.running(), 1);
+        log.finish_mcp(id, Outcome::Ok, Some(&json!({"mutNr": 1})), None);
+        log.finish_mcp(id, Outcome::Error, None, Some("later".into()));
+        let Some(Entry::Mcp(m)) = log.get(id) else {
+            panic!()
+        };
+        assert_eq!(m.outcome, Outcome::Ok, "the first end stays");
+        assert_eq!(log.stats().mcp, 1);
+        let listed = serde_json::to_value(log.list()).unwrap();
+        assert_eq!(listed[0]["proposal"], 7);
     }
 
     #[test]

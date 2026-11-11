@@ -58,6 +58,23 @@ button, input, select { font: inherit; color: inherit; }
 .accordion-enter-from, .accordion-leave-to { grid-template-rows: 0fr; }
 .accordion-enter-from > *, .accordion-leave-to > * { opacity: 0; }
 
+/* <Transition name="fade" mode="out-in">: one block gives way to another in the same place, such as a tab's content. */
+.fade-enter-active { transition: opacity 150ms var(--ease); }
+.fade-leave-active { transition: opacity 100ms cubic-bezier(0.4, 0, 1, 1); }
+.fade-enter-from, .fade-leave-to { opacity: 0; }
+
+/* <Transition name="pop">: a small count badge grows in from its centre and shrinks away. */
+.pop-enter-active { transition: opacity 160ms var(--ease), transform 240ms var(--ease); }
+.pop-leave-active { transition: opacity 120ms cubic-bezier(0.4, 0, 1, 1), transform 120ms cubic-bezier(0.4, 0, 1, 1); }
+.pop-enter-from, .pop-leave-to { opacity: 0; transform: scale(0.5); }
+
+/* <TransitionGroup name="toast"> in a positioned stack: a toast slides in from the right edge and leaves the same way;
+   the leaving one is taken out of the flow so the others move up into its place. */
+.toast-enter-active { transition: opacity 200ms var(--ease), transform 280ms var(--ease); }
+.toast-leave-active { position: absolute; left: 0; right: 0; transition: opacity 150ms cubic-bezier(0.4, 0, 1, 1), transform 150ms cubic-bezier(0.4, 0, 1, 1); }
+.toast-enter-from, .toast-leave-to { opacity: 0; transform: translateX(24px); }
+.toast-move { transition: transform 240ms var(--ease); }
+
 .group { border-radius: 12px; background: var(--group); box-shadow: var(--group-edge); }
 .section-label { font-size: 11px; font-weight: 600; color: var(--muted); }
 
@@ -83,4 +100,6 @@ button, input, select { font: inherit; color: inherit; }
   .btn[aria-busy='true']::after { animation-duration: 2400ms; }
   .accordion-enter-active, .accordion-leave-active { transition: opacity 150ms ease; }
   .accordion-enter-from, .accordion-leave-to { grid-template-rows: 1fr; opacity: 0; }
+  .pop-enter-from, .pop-leave-to, .toast-enter-from, .toast-leave-to { transform: none; }
+  .toast-move { transition: none; }
 }

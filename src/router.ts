@@ -1,6 +1,7 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 import AppShell from './components/AppShell.vue'
 import AccountsView from './views/AccountsView.vue'
+import ApprovalsView from './views/ApprovalsView.vue'
 import ConnectView from './views/ConnectView.vue'
 import DashboardView from './views/DashboardView.vue'
 import PanelView from './views/PanelView.vue'
@@ -19,6 +20,7 @@ export const router = createRouter({
       children: [
         { path: 'dashboard', component: DashboardView, meta: { title: 'Dashboard' } },
         { path: 'accounts', component: AccountsView, meta: { title: 'Accounts' } },
+        { path: 'akkoord', component: ApprovalsView, meta: { title: 'Akkoord' } },
         { path: 'verzoeken', component: RequestsView, meta: { title: 'Verzoeken' } },
         { path: 'koppelen', component: ConnectView, meta: { title: 'Koppelen' } },
         { path: 'instellingen', component: SettingsView, meta: { title: 'Instellingen' } },

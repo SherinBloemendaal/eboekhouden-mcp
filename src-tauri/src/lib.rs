@@ -223,8 +223,26 @@ fn account_update(
         return Err("Vul het wachtwoord in voor de sleutelhanger".into());
     }
     let account = app_state.accounts.update(id, input)?;
-    // Writing turned off: whatever this account still had waiting for approval is refused.
-    if account.write == accounts::WriteMode::Off && app_state.approvals.refuse_account(id) > 0 {
+    // Writing turned off: whatever this account still had waiting for approval is refused. Other sign-in
+    // details: what waits was asked for the old ones, so it lapses. The store changed first (approve in
+    // tools.rs reads it again after it put a proposal up, so none slips through in between).
+    let now = state::now_ms();
+    let ended = if account.write == accounts::WriteMode::Off {
+        app_state.approvals.end_account(
+            id,
+            approvals::Answer::Refused(approvals::REFUSED_READ_ONLY.into()),
+            now,
+        )
+    } else if account.username != before.username || account.op_ref != before.op_ref {
+        app_state.approvals.end_account(
+            id,
+            approvals::Answer::Lapsed(approvals::LAPSED_ACCOUNT_CHANGED.into()),
+            now,
+        )
+    } else {
+        0
+    };
+    if ended > 0 {
         let _ = app_state.events.send(state::AppEvent::ApprovalsChanged);
     }
     match account.store {
@@ -247,11 +265,17 @@ fn account_remove(
 ) -> Result<(), String> {
     signins.cancel(id);
     app_state.sign_out(id, "account verwijderd");
-    if app_state.approvals.refuse_account(id) > 0 {
-        let _ = app_state.events.send(state::AppEvent::ApprovalsChanged);
-    }
     creds::delete_password(id)?;
     app_state.accounts.remove(id)?;
+    // After the store: approve (tools.rs) reads it again once its proposal is up.
+    if app_state.approvals.end_account(
+        id,
+        approvals::Answer::Refused(approvals::REFUSED_ACCOUNT_GONE.into()),
+        state::now_ms(),
+    ) > 0
+    {
+        let _ = app_state.events.send(state::AppEvent::ApprovalsChanged);
+    }
     signins.forget(id);
     let _ = app_state.events.send(state::AppEvent::SessionsChanged);
     Ok(())
@@ -263,16 +287,103 @@ fn approvals_list(app_state: Shared<'_, AppState>) -> Vec<approvals::Proposal> {
     app_state.approvals.list()
 }
 
-/// The user's answer to one of them. Only Goedkeuren (`approve`) lets the request go to e-Boekhouden.
+/// The user's answer to one of them. Only Goedkeuren (`approve`) lets the request go to e-Boekhouden; the change
+/// then runs in the background, in the task of the tool that asked (tools.rs, `write_tool`).
 #[tauri::command]
 fn approval_decide(app_state: Shared<'_, AppState>, id: u64, approve: bool) -> Result<(), String> {
-    let answered = app_state.approvals.decide(id, approve);
+    let answered = app_state.approvals.decide(id, approve, state::now_ms());
     let _ = app_state.events.send(state::AppEvent::ApprovalsChanged);
     if answered {
         Ok(())
     } else {
-        Err("Dit voorstel wacht niet meer: het is al beantwoord of verlopen".into())
+        Err("Dit voorstel wacht niet meer: het is al beantwoord of vervallen".into())
     }
+}
+
+/// One answer for several proposals: exactly the ids the user saw, so one that came up meanwhile is never
+/// approved unseen. Says which were answered now and which were not waiting any more.
+#[tauri::command]
+fn approvals_decide_all(
+    app_state: Shared<'_, AppState>,
+    ids: Vec<u64>,
+    approve: bool,
+) -> approvals::DecideAll {
+    let done = app_state
+        .approvals
+        .decide_all(&ids, approve, state::now_ms());
+    let _ = app_state.events.send(state::AppEvent::ApprovalsChanged);
+    done
+}
+
+/// What AI clients changed or asked to change, newest first, without the technical data.
+#[tauri::command]
+fn approvals_history(
+    app_state: Shared<'_, AppState>,
+    limit: Option<usize>,
+) -> Vec<approvals::Record> {
+    app_state.approvals.history(limit)
+}
+
+/// One proposal with its technical data: the tool's arguments, the request body and the result.
+#[tauri::command]
+fn approval_get(app_state: Shared<'_, AppState>, id: u64) -> Result<approvals::Detail, String> {
+    app_state
+        .approvals
+        .get(id)
+        .ok_or_else(|| "Dit voorstel staat niet meer in de geschiedenis".into())
+}
+
+/// The usernames and 1Password references of the accounts: an export masks them wherever they show up.
+fn hidden_account_values(app_state: &AppState) -> Vec<String> {
+    let mut hidden = Vec::new();
+    for account in app_state.accounts.list() {
+        hidden.push(account.username);
+        hidden.extend(account.op_ref);
+    }
+    hidden
+}
+
+/// Where an export goes: Downloads, or the app's config folder when that fails.
+fn export_dirs(app: &AppHandle) -> Result<Vec<std::path::PathBuf>, String> {
+    let dirs: Vec<std::path::PathBuf> = [app.path().download_dir(), app.path().app_config_dir()]
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect();
+    if dirs.is_empty() {
+        return Err("Er is geen map gevonden om de export in te bewaren.".into());
+    }
+    Ok(dirs)
+}
+
+/// The whole approval history with its technical data, as one gzip file in Downloads (or the app's config
+/// folder): a header line, then one record per line, oldest first. Returns its absolute path.
+#[tauri::command]
+async fn approvals_export(
+    app: AppHandle,
+    app_state: Shared<'_, AppState>,
+) -> Result<String, String> {
+    let hidden = hidden_account_values(&app_state);
+    let dirs = export_dirs(&app)?;
+    let state = app_state.inner().clone();
+    let written = tauri::async_runtime::spawn_blocking(move || {
+        let exported_at = chrono::Local::now();
+        let mut failures = Vec::new();
+        for dir in &dirs {
+            match state.approvals.export(dir, &hidden, &exported_at) {
+                Ok(path) => return Ok(path),
+                Err(e) => {
+                    log::warn!("approval history export not written: {e}");
+                    failures.push(e);
+                }
+            }
+        }
+        Err(failures.join("; "))
+    })
+    .await
+    .map_err(|e| format!("De export kon niet worden gemaakt: {e}"))?;
+    written
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|e| format!("De export kon niet worden bewaard: {e}"))
 }
 
 #[tauri::command]
@@ -342,16 +453,132 @@ async fn log_clear(app_state: Shared<'_, AppState>) -> Result<(), String> {
 /// How often the request log is saved at most, when it changed.
 const LOG_SAVE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Saves the request log when it changed, compressing it off the async runtime's threads.
+/// Saves the request log and the approval history when they changed, compressing them off the async
+/// runtime's threads.
 async fn save_log(app_state: &Arc<AppState>) {
-    if !app_state.log.dirty() {
+    if app_state.log.dirty() {
+        let state = Arc::clone(app_state);
+        match tauri::async_runtime::spawn_blocking(move || state.log.save()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => log::warn!("request log not saved: {e}"),
+            Err(e) => log::warn!("request log not saved: {e}"),
+        }
+    }
+    save_approvals(app_state).await;
+}
+
+/// Saves the approval history when it changed: after every change of the queue or the history, and with the
+/// request log.
+async fn save_approvals(app_state: &Arc<AppState>) {
+    if !app_state.approvals.dirty() {
         return;
     }
     let state = Arc::clone(app_state);
-    match tauri::async_runtime::spawn_blocking(move || state.log.save()).await {
+    match tauri::async_runtime::spawn_blocking(move || state.approvals.save()).await {
         Ok(Ok(_)) => {}
-        Ok(Err(e)) => log::warn!("request log not saved: {e}"),
-        Err(e) => log::warn!("request log not saved: {e}"),
+        Ok(Err(e)) => log::warn!("approval history not saved: {e}"),
+        Err(e) => log::warn!("approval history not saved: {e}"),
+    }
+}
+
+/// The menu-bar icon's count of changes that wait for the user: the title next to the icon (macOS) and
+/// the tooltip. Nothing next to the icon when none wait.
+fn tray_badge(waiting: usize) -> (Option<String>, String) {
+    match waiting {
+        0 => (None, "EB MCP".to_owned()),
+        1 => (
+            Some("1".to_owned()),
+            "EB MCP: 1 wijziging wacht op je akkoord".to_owned(),
+        ),
+        n => (
+            Some(n.to_string()),
+            format!("EB MCP: {n} wijzigingen wachten op je akkoord"),
+        ),
+    }
+}
+
+const TRAY_ID: &str = "eb-mcp";
+
+fn update_tray(app: &AppHandle, waiting: usize) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    let (title, tooltip) = tray_badge(waiting);
+    #[cfg(target_os = "macos")]
+    let _ = tray.set_title(title);
+    #[cfg(not(target_os = "macos"))]
+    let _ = title;
+    let _ = tray.set_tooltip(Some(tooltip));
+}
+
+/// The main window's page with the proposals (src/router.ts).
+const APPROVALS_ROUTE: &str = "/akkoord";
+
+/// How long proposals that come up close together are gathered into one notification.
+const NOTIFY_GATHER: Duration = Duration::from_secs(2);
+
+/// Remembers the highest proposal id that was considered for a notification, so each proposal is
+/// announced at most once.
+struct Arrivals {
+    seen: u64,
+}
+
+impl Arrivals {
+    /// The waiting proposals that came up since the last look; `last_id` is the highest id given out now.
+    fn fresh(&mut self, waiting: &[approvals::Proposal], last_id: u64) -> Vec<approvals::Proposal> {
+        let fresh = waiting
+            .iter()
+            .filter(|p| p.id > self.seen)
+            .cloned()
+            .collect();
+        self.seen = self.seen.max(last_id);
+        fresh
+    }
+}
+
+/// The notification for proposals that came up together: its title and its text.
+fn notification_text(fresh: &[approvals::Proposal]) -> (String, String) {
+    const SHOWN: usize = 3;
+    let title = match fresh.len() {
+        1 => "EB MCP: 1 wijziging wacht op je akkoord".to_owned(),
+        n => format!("EB MCP: {n} wijzigingen wachten op je akkoord"),
+    };
+    let mut lines: Vec<String> = fresh.iter().take(SHOWN).map(|p| p.title.clone()).collect();
+    if fresh.len() > SHOWN {
+        lines.push(format!("en nog {}", fresh.len() - SHOWN));
+    }
+    (title, lines.join("\n"))
+}
+
+/// Whether one of EB MCP's windows has the focus: then the user sees the proposal in the app already.
+fn any_window_focused(app: &AppHandle) -> bool {
+    [MAIN, PANEL].into_iter().any(|label| {
+        app.get_webview_window(label)
+            .is_some_and(|w| w.is_visible().unwrap_or(false) && w.is_focused().unwrap_or(false))
+    })
+}
+
+/// A system notification for proposals that came up. When notifications are not allowed or not available,
+/// nothing happens: the count in the menu bar and the app itself show what waits.
+fn notify_waiting(app: &AppHandle, fresh: &[approvals::Proposal]) {
+    use tauri::plugin::PermissionState;
+    use tauri_plugin_notification::NotificationExt;
+    let notification = app.notification();
+    let allowed = match notification.permission_state() {
+        Ok(PermissionState::Granted) => true,
+        Ok(PermissionState::Prompt | PermissionState::PromptWithRationale) => matches!(
+            notification.request_permission(),
+            Ok(PermissionState::Granted)
+        ),
+        Ok(PermissionState::Denied) | Err(_) => false,
+    };
+    if !allowed {
+        log::info!("no notification for a waiting change: notifications are not allowed");
+        return;
+    }
+    let (title, body) = notification_text(fresh);
+    if let Err(e) = notification.builder().title(title).body(body).show() {
+        log::info!("no notification for a waiting change: {e}");
     }
 }
 
@@ -365,35 +592,25 @@ async fn log_export(
     signins: Shared<'_, Signins>,
 ) -> Result<String, String> {
     let sessions = app_state.sessions();
-    let mut hidden = Vec::new();
+    let hidden = hidden_account_values(&app_state);
     let accounts: Vec<logstore::ExportAccount> = app_state
         .accounts
         .list()
         .into_iter()
-        .map(|account| {
-            hidden.push(account.username.clone());
-            hidden.extend(account.op_ref.clone());
-            logstore::ExportAccount {
-                signed_in: sessions
-                    .iter()
-                    .any(|s| s.account_id == account.id && !s.expired),
-                label: account.label,
-                administration: account.administration,
-                store: account.store,
-                write: account.write,
-            }
+        .map(|account| logstore::ExportAccount {
+            signed_in: sessions
+                .iter()
+                .any(|s| s.account_id == account.id && !s.expired),
+            label: account.label,
+            administration: account.administration,
+            store: account.store,
+            write: account.write,
         })
         .collect();
     // Oldest first, like the entries.
     let mut traces = signins.traces();
     traces.reverse();
-    let dirs: Vec<std::path::PathBuf> = [app.path().download_dir(), app.path().app_config_dir()]
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect();
-    if dirs.is_empty() {
-        return Err("Er is geen map gevonden om de export in te bewaren.".into());
-    }
+    let dirs = export_dirs(&app)?;
     let state = app_state.inner().clone();
     let written = tauri::async_runtime::spawn_blocking(move || {
         let input = logstore::ExportInput {
@@ -421,7 +638,8 @@ async fn log_export(
         .map_err(|e| format!("De export kon niet worden bewaard: {e}"))
 }
 
-/// Shows a debug export from `log_export` in Finder or Explorer. Only those files: any other path is refused.
+/// Shows an export from `log_export` or `approvals_export` in Finder or Explorer. Only those files: any other
+/// path is refused.
 #[tauri::command]
 fn log_export_reveal(app: AppHandle, path: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
@@ -800,7 +1018,8 @@ fn build_menu(app: &tauri::App) -> tauri::Result<()> {
         MENU_UPDATES | MENU_UPDATES_FILE => updates::check_for_updates_natively(app.clone()),
         MENU_QUIT => {
             let state = app.state::<Arc<AppState>>();
-            if state.log.running() > 0 {
+            // Calls that still run would fail, and changes that wait for approval would lapse: ask first.
+            if state.log.running() > 0 || state.approvals.count() > 0 {
                 open_main(app.clone(), None);
                 let _ = app.emit_to(MAIN, QUIT_REQUESTED, state.log.running());
             } else {
@@ -955,6 +1174,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             open_main(app.clone(), None);
         }))
+        .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
@@ -996,6 +1216,10 @@ pub fn run() {
             signin_traces,
             approvals_list,
             approval_decide,
+            approvals_decide_all,
+            approvals_history,
+            approval_get,
+            approvals_export,
             open_log_dir,
             open_op_install,
             log_list,
@@ -1054,8 +1278,10 @@ pub fn run() {
                 EbClient::production(),
                 Arc::new(SessionJar::default()),
             ));
-            // The request log and its statistics of earlier runs, before the server takes its first call.
+            // The request log and its statistics of earlier runs, and the approval history, before the
+            // server takes its first call. What still waited for an answer when EB MCP stopped lapses.
             app_state.log.open(logstore::log_file(&dir));
+            app_state.approvals.open(approvals::history_file(&dir));
             app.manage(app_state.clone());
             app.manage(settings.clone());
             app.manage(Arc::new(Signins::default()));
@@ -1069,21 +1295,56 @@ pub fn run() {
                 }
             });
 
-            // Forward state changes to every window.
+            // A click on a notification of a waiting change opens the main window at Akkoord.
+            {
+                use tauri_plugin_notification::NotificationExt;
+                let handle = app.handle().clone();
+                let _ = app
+                    .notification()
+                    .on_action(move |_| open_main(handle.clone(), Some(APPROVALS_ROUTE.into())));
+            }
+
+            // Proposals that came up while no EB MCP window had the focus get a notification; those close
+            // together share one.
+            let (arrived, mut arrivals) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let (handle, notifying) = (app.handle().clone(), app_state.clone());
+            tauri::async_runtime::spawn(async move {
+                let mut seen = Arrivals {
+                    seen: notifying.approvals.last_id(),
+                };
+                while arrivals.recv().await.is_some() {
+                    tokio::time::sleep(NOTIFY_GATHER).await;
+                    while arrivals.try_recv().is_ok() {}
+                    let fresh =
+                        seen.fresh(&notifying.approvals.list(), notifying.approvals.last_id());
+                    if !fresh.is_empty() && !any_window_focused(&handle) {
+                        notify_waiting(&handle, &fresh);
+                    }
+                }
+            });
+
+            // Forward state changes to every window. A change of the queue or the history also updates the
+            // count in the menu bar, may lead to a notification and is saved. The app never takes the focus
+            // for it: the AI client does not wait for the answer.
             let mut events = app_state.events.subscribe();
             let handle = app.handle().clone();
-            let waiting = app_state.clone();
+            let watching = app_state.clone();
             tauri::async_runtime::spawn(async move {
-                while let Ok(event) = events.recv().await {
-                    // A change waits for the user's word: the main window comes up, where the proposal is shown.
-                    // The AI client is waiting meanwhile, so this may take the focus.
-                    if matches!(event, state::AppEvent::ApprovalsChanged)
-                        && waiting.approvals.count() > 0
-                        && let Some(main) = handle.get_webview_window(MAIN)
-                    {
-                        let _ = main.show();
-                        let _ = main.unminimize();
-                        let _ = main.set_focus();
+                loop {
+                    let event = match events.recv().await {
+                        Ok(event) => event,
+                        // Events were dropped while this loop was busy: one of them may have been about
+                        // the queue, so the count and the windows catch up as if it was.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            state::AppEvent::ApprovalsChanged
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
+                    if matches!(event, state::AppEvent::ApprovalsChanged) {
+                        update_tray(&handle, watching.approvals.count());
+                        let _ = arrived.send(());
+                        let saving = watching.clone();
+                        tauri::async_runtime::spawn(async move { save_approvals(&saving).await });
                     }
                     to_our_windows(&handle, "state", event);
                 }
@@ -1144,7 +1405,7 @@ pub fn run() {
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray@2x.png"))?;
             #[cfg(not(target_os = "macos"))]
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
-            TrayIconBuilder::with_id("eb-mcp")
+            TrayIconBuilder::with_id(TRAY_ID)
                 .icon(icon)
                 .icon_as_template(cfg!(target_os = "macos"))
                 .tooltip("EB MCP")
@@ -1200,10 +1461,13 @@ pub fn run() {
             // Any other way out (an updater's relaunch, the system ending the app): the request log
             // is saved once more when it changed since the last save.
             tauri::RunEvent::Exit => {
-                if let Some(state) = app.try_state::<Arc<AppState>>()
-                    && let Err(e) = state.log.save()
-                {
-                    log::warn!("request log not saved at exit: {e}");
+                if let Some(state) = app.try_state::<Arc<AppState>>() {
+                    if let Err(e) = state.log.save() {
+                        log::warn!("request log not saved at exit: {e}");
+                    }
+                    if let Err(e) = state.approvals.save() {
+                        log::warn!("approval history not saved at exit: {e}");
+                    }
                 }
             }
             // A click on the Dock icon (when it shows) opens the window again.
@@ -1219,6 +1483,70 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn proposal(id: u64, title: &str) -> approvals::Proposal {
+        approvals::Proposal {
+            id,
+            account_id: Uuid::nil(),
+            account: "Studio Noord".into(),
+            client: "Claude".into(),
+            tool: "mutatie_toevoegen".into(),
+            title: title.into(),
+            lines: Vec::new(),
+            danger: false,
+            asked_at: 1,
+        }
+    }
+
+    #[test]
+    fn the_menu_bar_counts_what_waits() {
+        assert_eq!(tray_badge(0), (None, "EB MCP".to_owned()));
+        assert_eq!(
+            tray_badge(1),
+            (
+                Some("1".to_owned()),
+                "EB MCP: 1 wijziging wacht op je akkoord".to_owned()
+            )
+        );
+        assert_eq!(
+            tray_badge(12),
+            (
+                Some("12".to_owned()),
+                "EB MCP: 12 wijzigingen wachten op je akkoord".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn proposals_that_come_up_together_share_one_notification() {
+        let mut seen = Arrivals { seen: 4 };
+        // 3 was there before EB MCP started looking; 5 was answered before the look.
+        let waiting = [
+            proposal(3, "Oud"),
+            proposal(6, "Eerste"),
+            proposal(7, "Tweede"),
+        ];
+        let fresh = seen.fresh(&waiting, 7);
+        assert_eq!(fresh.iter().map(|p| p.id).collect::<Vec<_>>(), vec![6, 7]);
+        assert_eq!(
+            notification_text(&fresh),
+            (
+                "EB MCP: 2 wijzigingen wachten op je akkoord".to_owned(),
+                "Eerste\nTweede".to_owned()
+            )
+        );
+        assert!(seen.fresh(&waiting, 7).is_empty(), "announced once");
+        let one = seen.fresh(&[proposal(6, "Eerste"), proposal(8, "Derde")], 8);
+        assert_eq!(
+            notification_text(&one),
+            (
+                "EB MCP: 1 wijziging wacht op je akkoord".to_owned(),
+                "Derde".to_owned()
+            )
+        );
+        let many: Vec<_> = (10..15).map(|n| proposal(n, &format!("Nr {n}"))).collect();
+        assert_eq!(notification_text(&many).1, "Nr 10\nNr 11\nNr 12\nen nog 2");
+    }
 
     #[test]
     fn the_panel_stays_on_the_screen() {

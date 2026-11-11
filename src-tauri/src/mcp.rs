@@ -1,6 +1,6 @@
 //! The local MCP server: Streamable HTTP on 127.0.0.1, a bearer token per
 //! installation, loopback Host only and no browser Origin, so no website can
-//! reach it. Every tool is read-only.
+//! reach it. Tools that read are marked read-only; the ones that change the books go through tools.rs's `write_tool`.
 
 use std::sync::{Arc, RwLock};
 
@@ -276,6 +276,7 @@ mod tests {
             "sjabloon",
             "kvk_zoeken",
             "kvk_adres",
+            "akkoord_status",
         ] {
             assert!(names.contains(&want), "{want} missing from {names:?}");
         }
@@ -334,7 +335,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(names.len(), 27 + writes.len());
+        assert_eq!(names.len(), 28 + writes.len());
         assert_eq!(crate::tools::tool_count(), names.len());
 
         let call = message(
@@ -504,61 +505,246 @@ mod tests {
                 )
             }
         };
-        // The user's answer in the app, given once the proposal is up.
-        let answer_with = |approve: bool| {
-            let state = state.clone();
-            async move {
-                for _ in 0..200 {
-                    if let Some(proposal) = state.approvals.list().into_iter().next() {
-                        assert_eq!(proposal.title, "Mutatie toevoegen: Geld uitgegeven");
-                        assert_eq!(proposal.client, "Claude");
-                        assert!(!proposal.danger);
-                        assert!(
-                            proposal.lines.iter().any(|l| l.label == "Regel 1"
-                                && l.value == "4550 Bankkosten: 2,00 (Geen btw)"),
-                            "{:?}",
-                            proposal.lines
-                        );
-                        assert!(state.approvals.decide(proposal.id, approve));
-                        return;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                panic!("no proposal came up");
-            }
+        let ask_status = |id: u64| {
+            let call = post(
+                serde_json::json!({"jsonrpc": "2.0", "id": 90, "method": "tools/call", "params": {"name": "akkoord_status", "arguments": {"voorstel_id": id}}}),
+                session.clone(),
+            );
+            async move { answer_of(call.await.unwrap().text().await.unwrap()) }
         };
+        // The one proposal that is up, checked against what the tool asked for.
+        let proposal_up = || {
+            let list = state.approvals.list();
+            assert_eq!(list.len(), 1, "{list:?}");
+            let proposal = list.into_iter().next().unwrap();
+            assert_eq!(proposal.title, "Mutatie toevoegen: Geld uitgegeven");
+            assert_eq!(proposal.client, "Claude");
+            assert!(!proposal.danger);
+            assert!(
+                proposal
+                    .lines
+                    .iter()
+                    .any(|l| l.label == "Regel 1" && l.value == "4550 Bankkosten: 2,00 (Geen btw)"),
+                "{:?}",
+                proposal.lines
+            );
+            proposal
+        };
+        let request = serde_json::json!({
+            "mutatie": {"rekening": 11, "datum": "2026-11-06", "soort": 6, "inEx": "IN", "omschrijving": "Parkeergarage"},
+            "mutatieRegels": [{"index": 0, "tegenRekening": 45, "btwCode": "GEEN", "bedrag": 2.0}],
+            "importId": 465233844u64
+        });
 
         // Writing is off: refused, and nothing was even read from e-Boekhouden.
         let (is_error, text) = book(2).await;
         assert!(is_error && text.contains("alleen-lezen"), "{text}");
         assert_eq!(state.approvals.count(), 0);
-
-        // With approval, and the user says no: nothing goes out.
-        set_write(WriteMode::Ask);
-        let ((is_error, text), ()) = tokio::join!(book(3), answer_with(false));
-        assert!(is_error && text.contains("geweigerd"), "{text}");
-        assert!(seen.lock().unwrap().is_empty());
-
-        // The user approves: exactly the request e-Boekhouden's own screen sends.
-        let ((is_error, text), ()) = tokio::join!(book(4), answer_with(true));
-        assert!(!is_error, "{text}");
-        assert!(text.contains("\"mutNr\":3908"), "{text}");
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![serde_json::json!({
-                "mutatie": {"rekening": 11, "datum": "2026-11-06", "soort": 6, "inEx": "IN", "omschrijving": "Parkeergarage"},
-                "mutatieRegels": [{"index": 0, "tegenRekening": 45, "btwCode": "GEEN", "bedrag": 2.0}],
-                "importId": 465233844u64
-            })]
+        assert!(
+            state.approvals.history(None).is_empty(),
+            "nothing was asked"
         );
-        assert_eq!(state.approvals.count(), 0, "an answered proposal is gone");
 
-        // Without approval the booking goes straight through.
+        // With approval the call answers at once that the change waits; the user says no: nothing goes out.
+        set_write(WriteMode::Ask);
+        let (is_error, text) = book(3).await;
+        assert!(!is_error, "waiting is not an error: {text}");
+        let id = waiting_id(&text);
+        assert!(text.contains("akkoord_status"), "{text}");
+        assert_eq!(proposal_up().id, id);
+        assert_eq!(state.log.running(), 0, "a waiting change holds up no quit");
+        let entry = mcp_entry(&state, id);
+        assert_eq!(entry.outcome, crate::reqlog::Outcome::Waiting);
+        assert!(state.approvals.decide(id, false, 1));
+        let record = settled(&state, id).await;
+        assert_eq!(record.status, crate::approvals::Status::Refused);
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(
+            mcp_entry(&state, id).outcome,
+            crate::reqlog::Outcome::Refused
+        );
+        let (_, status) = ask_status(id).await;
+        assert!(status.contains("\"status\":\"geweigerd\""), "{status}");
+
+        // The user approves: exactly the request e-Boekhouden's own screen sends, made in the background.
+        let (is_error, text) = book(4).await;
+        assert!(!is_error, "{text}");
+        let id = waiting_id(&text);
+        assert_eq!(proposal_up().id, id);
+        let (_, status) = ask_status(id).await;
+        assert!(status.contains("\"status\":\"wacht\""), "{status}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing goes out before the answer"
+        );
+        assert!(state.approvals.decide(id, true, 2));
+        let record = settled(&state, id).await;
+        assert_eq!(record.status, crate::approvals::Status::Done, "{record:?}");
+        assert_eq!(*seen.lock().unwrap(), vec![request.clone()]);
+        assert_eq!(state.approvals.count(), 0, "an answered proposal is gone");
+        let (is_error, status) = ask_status(id).await;
+        assert!(!is_error, "{status}");
+        let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(status["status"], "uitgevoerd");
+        assert_eq!(status["besluit"], "goedgekeurd");
+        assert_eq!(status["resultaat"]["data"]["mutNr"], 3908);
+        // The log links the e-Boekhouden calls to the MCP call and shows how it ended.
+        let entry = mcp_entry(&state, id);
+        assert_eq!(entry.outcome, crate::reqlog::Outcome::Ok);
+        assert!(entry.result.unwrap().to_string().contains("3908"));
+        let posted = entry.calls.iter().any(|call| {
+            matches!(state.log.get(*call), Some(crate::reqlog::Entry::Eb(e)) if e.method == "POST" && e.path == "mutatie")
+        });
+        assert!(posted, "the POST is linked to the MCP call");
+        let detail = state.approvals.get(id).unwrap();
+        assert_eq!(detail.body, request);
+        assert_eq!(detail.args["omschrijving"], "Parkeergarage");
+
+        // Without approval the booking goes straight through, and the history says so.
         set_write(WriteMode::Auto);
         let (is_error, text) = book(5).await;
         assert!(!is_error, "{text}");
+        assert!(text.contains("\"mutNr\":3908"), "{text}");
         assert_eq!(seen.lock().unwrap().len(), 2);
         assert_eq!(state.approvals.count(), 0);
+        let auto = &state.approvals.history(Some(1))[0];
+        assert_eq!(auto.decision, Some(crate::approvals::Decision::Auto));
+        assert_eq!(auto.status, crate::approvals::Status::Done);
+
+        // Approved after the account signed out: it fails as "Niet ingelogd", and nothing went out.
+        set_write(WriteMode::Ask);
+        let (_, text) = book(6).await;
+        let id = waiting_id(&text);
+        state.sign_out(account.id, "test");
+        assert!(state.approvals.decide(id, true, 3));
+        let record = settled(&state, id).await;
+        assert_eq!(record.status, crate::approvals::Status::Failed);
+        assert!(
+            record
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("Niet ingelogd"),
+            "{record:?}"
+        );
+        assert_eq!(mcp_entry(&state, id).outcome, crate::reqlog::Outcome::Error);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        let (_, status) = ask_status(id).await;
+        assert!(status.contains("\"status\":\"mislukt\""), "{status}");
+
+        // Writing turned off while a change waits: it is refused, and can no longer be approved.
+        state.add_session(account.id, &account.label, "sessie");
+        let (_, text) = book(7).await;
+        let id = waiting_id(&text);
+        set_write(WriteMode::Off);
+        assert_eq!(
+            state.approvals.end_account(
+                account.id,
+                crate::approvals::Answer::Refused(crate::approvals::REFUSED_READ_ONLY.into()),
+                4
+            ),
+            1
+        );
+        assert!(!state.approvals.decide(id, true, 5));
+        assert_eq!(
+            settled(&state, id).await.status,
+            crate::approvals::Status::Refused
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2);
+
+        // Without an id: the proposals of the last day, newest first.
+        let (is_error, list) = message_text(
+            post(
+                serde_json::json!({"jsonrpc": "2.0", "id": 91, "method": "tools/call", "params": {"name": "akkoord_status", "arguments": {}}}),
+                session.clone(),
+            )
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        );
+        assert!(!is_error, "{list}");
+        let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+        let states: Vec<&str> = list["voorstellen"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            states,
+            [
+                "geweigerd",
+                "mislukt",
+                "uitgevoerd",
+                "uitgevoerd",
+                "geweigerd"
+            ]
+        );
+    }
+
+    /// The JSON-RPC answer in a body that is plain JSON or server-sent events: whether it is an error, and its text.
+    fn message_text(body: String) -> (bool, String) {
+        answer_of(body)
+    }
+
+    fn answer_of(body: String) -> (bool, String) {
+        let answer = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .unwrap_or_else(|| {
+                body.lines()
+                    .filter_map(|l| l.strip_prefix("data:"))
+                    .filter_map(|d| serde_json::from_str::<serde_json::Value>(d.trim()).ok())
+                    .find(|v| v.get("id").is_some())
+                    .unwrap_or_else(|| panic!("no JSON-RPC answer in {body}"))
+            });
+        (
+            answer["result"]["isError"] == true,
+            answer["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        )
+    }
+
+    /// The proposal id of a "waiting" answer.
+    fn waiting_id(text: &str) -> u64 {
+        let value: serde_json::Value =
+            serde_json::from_str(text).unwrap_or_else(|_| panic!("not JSON: {text}"));
+        assert_eq!(value["status"], "wacht", "{text}");
+        value["voorstel_id"].as_u64().unwrap()
+    }
+
+    /// The MCP entry in the request log that asked for proposal `id`.
+    fn mcp_entry(state: &AppState, id: u64) -> crate::reqlog::McpEntry {
+        let log_id = state.approvals.get(id).unwrap().log_id.unwrap();
+        match state.log.get(log_id) {
+            Some(crate::reqlog::Entry::Mcp(entry)) => {
+                assert_eq!(entry.proposal, Some(id));
+                entry
+            }
+            other => panic!("no MCP entry for proposal {id}: {other:?}"),
+        }
+    }
+
+    /// Waits for the background run of an answered proposal to end (its record and its MCP entry in the
+    /// request log), and gives its record.
+    async fn settled(state: &AppState, id: u64) -> crate::approvals::Record {
+        use crate::approvals::Status;
+        use crate::reqlog::Outcome;
+        for _ in 0..500 {
+            if let Some(detail) = state.approvals.get(id)
+                && !matches!(detail.record.status, Status::Waiting | Status::Running)
+                && let Some(crate::reqlog::Entry::Mcp(entry)) =
+                    detail.log_id.and_then(|log_id| state.log.get(log_id))
+                && !matches!(entry.outcome, Outcome::Waiting | Outcome::Running)
+            {
+                return detail.record;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("proposal {id} did not settle");
     }
 
     /// What the stand-in for e-Boekhouden below was asked to change, in order.
@@ -725,20 +911,19 @@ mod tests {
                 )
             }
         };
-        // Answers the one proposal that comes up, after checking it is marked as not undoable.
+        // Answers the one proposal that is up, after checking it is marked as not undoable, and waits for its
+        // background run to end.
         let decide = |approve: bool, title: &'static str| {
             let state = state.clone();
             async move {
-                for _ in 0..300 {
-                    if let Some(proposal) = state.approvals.list().into_iter().next() {
-                        assert_eq!(proposal.title, title);
-                        assert!(proposal.danger, "{title} must be shown as not undoable");
-                        assert!(state.approvals.decide(proposal.id, approve));
-                        return proposal;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                panic!("no proposal came up for {title}");
+                let list = state.approvals.list();
+                assert_eq!(list.len(), 1, "{list:?}");
+                let proposal = list.into_iter().next().unwrap();
+                assert_eq!(proposal.title, title);
+                assert!(proposal.danger, "{title} must be shown as not undoable");
+                assert!(state.approvals.decide(proposal.id, approve, 1));
+                settled(&state, proposal.id).await;
+                proposal
             }
         };
         let made = || changes.lock().unwrap().clone();
@@ -768,26 +953,45 @@ mod tests {
             .accounts
             .update(account.id, input(WriteMode::Auto))
             .unwrap();
-        let ((is_error, text), proposal) = tokio::join!(
-            call("mutatie_verwijderen", serde_json::json!({"nr": 16})),
-            decide(false, "Mutatie 16 verwijderen")
+        let (is_error, text) = call("mutatie_verwijderen", serde_json::json!({"nr": 16})).await;
+        assert!(!is_error, "{text}");
+        let id = waiting_id(&text);
+        assert!(made().is_empty(), "nothing is deleted before the answer");
+        let proposal = decide(false, "Mutatie 16 verwijderen").await;
+        assert_eq!(proposal.id, id);
+        assert_eq!(
+            settled(&state, id).await.status,
+            crate::approvals::Status::Refused
         );
-        assert!(is_error && text.contains("geweigerd"), "{text}");
         assert!(
             proposal.lines.iter().any(|l| l.value.contains("afgeraden")),
             "{:?}",
             proposal.lines
         );
         assert!(made().is_empty(), "refused: nothing was deleted");
-        let ((is_error, text), _) = tokio::join!(
-            call("mutatie_verwijderen", serde_json::json!({"nr": 16})),
-            decide(true, "Mutatie 16 verwijderen")
-        );
+        let (is_error, text) = call("mutatie_verwijderen", serde_json::json!({"nr": 16})).await;
         assert!(!is_error, "{text}");
+        let id = waiting_id(&text);
+        assert!(made().is_empty(), "nothing is deleted before the answer");
+        decide(true, "Mutatie 16 verwijderen").await;
         assert_eq!(
             made(),
             vec!["delete mutaties [777]"],
             "by the id the list gives for that number"
+        );
+        let (is_error, status) =
+            call("akkoord_status", serde_json::json!({"voorstel_id": id})).await;
+        assert!(!is_error, "{status}");
+        let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(status["status"], "uitgevoerd");
+        assert_eq!(status["resultaat"]["gedaan"], "Mutatie verwijderd");
+        assert!(
+            status["regels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l["value"].as_str().unwrap().contains("afgeraden")),
+            "{status}"
         );
 
         // A file nothing hangs on goes without asking on this account; a linked one always asks, with a warning.
@@ -795,11 +999,14 @@ mod tests {
             call("archief_verwijderen", serde_json::json!({"bestand_id": 1})).await;
         assert!(!is_error, "{text}");
         assert_eq!(made().last().unwrap(), "delete file 1");
-        let ((is_error, text), proposal) = tokio::join!(
-            call("archief_verwijderen", serde_json::json!({"bestand_id": 2})),
-            decide(false, "Bestand verwijderen: bon-2.pdf")
-        );
-        assert!(is_error && text.contains("geweigerd"), "{text}");
+        let (is_error, text) =
+            call("archief_verwijderen", serde_json::json!({"bestand_id": 2})).await;
+        assert!(!is_error, "{text}");
+        let id = waiting_id(&text);
+        let proposal = decide(false, "Bestand verwijderen: bon-2.pdf").await;
+        assert_eq!(proposal.id, id);
+        let (_, status) = call("akkoord_status", serde_json::json!({"voorstel_id": id})).await;
+        assert!(status.contains("\"status\":\"geweigerd\""), "{status}");
         assert!(
             proposal.lines.iter().any(|l| l.value.contains("1 mutatie")),
             "{:?}",
@@ -851,49 +1058,57 @@ mod tests {
             .update(account.id, input(WriteMode::Ask))
             .unwrap();
         let opmaak = serde_json::json!({"elements": [{"id": 1, "tag": "text", "x": 1, "y": 2, "width": 3, "height": 4, "content": "<h1>FACTUUR 2</h1>"}]});
-        let answer = async {
-            for _ in 0..300 {
-                if let Some(proposal) = state.approvals.list().into_iter().next() {
-                    assert!(
-                        proposal
-                            .lines
-                            .iter()
-                            .any(|l| l.label == "Tekst van text 1 was" && l.value == "FACTUUR"),
-                        "{:?}",
-                        proposal.lines
-                    );
-                    assert!(
-                        proposal
-                            .lines
-                            .iter()
-                            .any(|l| l.label == "Tekst van text 1 wordt" && l.value == "FACTUUR 2"),
-                        "{:?}",
-                        proposal.lines
-                    );
-                    assert_eq!(
-                        made().last().unwrap(),
-                        "editor end save=false hash=\"abc123\"",
-                        "nothing saved before the answer"
-                    );
-                    assert!(state.approvals.decide(proposal.id, true));
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            panic!("no proposal for the layout");
-        };
-        let ((is_error, text), ()) = tokio::join!(
-            call(
-                "sjabloon_wijzigen",
-                serde_json::json!({"soort": "factuur", "id": 9, "opmaak": opmaak})
-            ),
-            answer
-        );
+        let (is_error, text) = call(
+            "sjabloon_wijzigen",
+            serde_json::json!({"soort": "factuur", "id": 9, "opmaak": opmaak}),
+        )
+        .await;
         assert!(!is_error, "{text}");
+        let id = waiting_id(&text);
+        let list = state.approvals.list();
+        assert_eq!(list.len(), 1);
+        let proposal = &list[0];
+        assert_eq!(proposal.id, id);
+        assert!(!proposal.danger);
+        assert!(
+            proposal
+                .lines
+                .iter()
+                .any(|l| l.label == "Tekst van text 1 was" && l.value == "FACTUUR"),
+            "{:?}",
+            proposal.lines
+        );
+        assert!(
+            proposal
+                .lines
+                .iter()
+                .any(|l| l.label == "Tekst van text 1 wordt" && l.value == "FACTUUR 2"),
+            "{:?}",
+            proposal.lines
+        );
+        assert_eq!(
+            made().last().unwrap(),
+            "editor end save=false hash=\"abc123\"",
+            "nothing saved before the answer"
+        );
+        assert!(state.approvals.decide(id, true, 1));
+        assert_eq!(
+            settled(&state, id).await.status,
+            crate::approvals::Status::Done
+        );
         assert_eq!(
             made().last().unwrap(),
             "editor end save=true hash=\"abc123\""
         );
+        // The history keeps the layout the tool was given, without the editor's session keys.
+        let kept = serde_json::to_string(&state.approvals.get(id).unwrap()).unwrap();
+        assert!(kept.contains("FACTUUR 2"), "{kept}");
+        assert!(
+            !kept.contains("abc123") && !kept.contains("geheim"),
+            "{kept}"
+        );
+        let (_, status) = call("akkoord_status", serde_json::json!({"voorstel_id": id})).await;
+        assert!(status.contains("\"status\":\"uitgevoerd\""), "{status}");
     }
 
     #[test]

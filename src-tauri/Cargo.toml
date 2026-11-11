@@ -44,6 +44,8 @@ tokio-tungstenite = { version = "0.28", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 # The request log on disk and the debug export are gzip files (logstore.rs).
 flate2 = "1"
+# A system notification when a change waits for the user's approval and no EB MCP window has the focus (lib.rs).
+tauri-plugin-notification = "2.7.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Touch ID (creds.rs) and Sparkle, the macOS updater (updates.rs).

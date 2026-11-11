@@ -2,13 +2,14 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import Alert from '../components/Alert.vue'
 import EmptyState from '../components/EmptyState.vue'
+import ExportNotice from '../components/ExportNotice.vue'
 import Icon from '../components/Icon.vue'
 import JsonView from '../components/JsonView.vue'
 import {
   clearLog, connectLog, duration, entryDetail, exportLog, isError, log, setPaused, size, statusLabel, time, timeline,
   type EbEntry, type Entry,
 } from '../lib/log'
-import { revealExport, revealName } from '../lib/server'
+import { useExport } from '../lib/exporting'
 
 type Tab = 'all' | 'mcp' | 'eb'
 
@@ -23,12 +24,8 @@ const toggled = ref<number | null>(null)
 const selectedId = ref<number | null>(null)
 const detail = ref<Entry | null>(null)
 const clearing = ref(false)
-// Exporteer: the file it wrote, or why it could not; and why showing that file failed, if it did.
-const exporting = ref(false)
-const exported = ref<string | null>(null)
-const exportError = ref<string | null>(null)
-const revealing = ref(false)
-const revealError = ref<string | null>(null)
+// Exporteer: the file it wrote or why it could not, shown by ExportNotice (shared with Akkoord).
+const exported = useExport(exportLog)
 
 onMounted(() => connectLog())
 
@@ -117,39 +114,6 @@ async function confirmClear() {
   detail.value = null
 }
 
-async function runExport() {
-  exporting.value = true
-  revealError.value = null
-  try {
-    exported.value = await exportLog()
-    exportError.value = null
-  } catch (error) {
-    exported.value = null
-    exportError.value = String(error)
-  } finally {
-    exporting.value = false
-  }
-}
-
-async function reveal() {
-  if (!exported.value) return
-  revealing.value = true
-  revealError.value = null
-  try {
-    await revealExport(exported.value)
-  } catch (error) {
-    revealError.value = String(error)
-  } finally {
-    revealing.value = false
-  }
-}
-
-function closeExport() {
-  exported.value = null
-  exportError.value = null
-  revealError.value = null
-}
-
 function calls(n: number): string {
   return n === 1 ? '1 aanroep' : `${n} aanroepen`
 }
@@ -167,41 +131,12 @@ function initials(text: string | null): string {
 
 <template>
   <Teleport to="#toolbar-actions" defer>
-    <button type="button" class="btn small export" :disabled="exporting" :aria-busy="exporting" @click="runExport"><span class="btn-label">Exporteer</span></button>
+    <button type="button" class="btn small export" :disabled="exported.exporting" :aria-busy="exported.exporting" @click="exported.run()"><span class="btn-label">Exporteer</span></button>
     <button type="button" class="btn small danger-text" :disabled="!log.entries.length" @click="clearing = true"><Icon name="trash" :size="14" />Leegmaken</button>
   </Teleport>
 
   <div class="page">
-    <Transition name="accordion">
-      <div v-if="exported" class="accordion">
-        <div>
-          <div class="export-slot">
-            <div class="note ok export-note" role="status">
-              <Icon name="check" :size="14" class="note-icon" />
-              <p class="export-text">Export opgeslagen in <span class="mono selectable export-path">{{ exported }}</span>. Het bestand bevat je verzoeken met de antwoorden van e-Boekhouden, dus ook boekhoudgegevens: deel het alleen met wie dat mag zien.</p>
-              <button type="button" class="btn small reveal" :disabled="revealing" :aria-busy="revealing" @click="reveal"><span class="btn-label">{{ revealName }}</span></button>
-              <button type="button" class="btn small ghost" @click="closeExport">Sluiten</button>
-            </div>
-            <Transition name="accordion">
-              <div v-if="revealError" class="accordion"><div><p class="note bad reveal-error" role="alert">{{ revealError }}</p></div></div>
-            </Transition>
-          </div>
-        </div>
-      </div>
-    </Transition>
-    <Transition name="accordion">
-      <div v-if="exportError" class="accordion">
-        <div>
-          <div class="export-slot">
-            <div class="note bad export-note" role="alert">
-              <Icon name="alert" :size="14" class="note-icon" />
-              <p class="export-text selectable">{{ exportError }}</p>
-              <button type="button" class="btn small ghost" @click="closeExport">Sluiten</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    </Transition>
+    <ExportNotice :state="exported">Het bestand bevat je verzoeken met de antwoorden van e-Boekhouden, dus ook boekhoudgegevens: deel het alleen met wie dat mag zien.</ExportNotice>
     <div class="filters">
       <div class="tabs" role="tablist" aria-label="Bron">
         <button v-for="t in (['all', 'mcp', 'eb'] as Tab[])" :key="t" type="button" role="tab" :aria-selected="tab === t" class="tab" :class="{ on: tab === t }" @click="tab = t">
@@ -343,13 +278,6 @@ function initials(text: string | null): string {
 
 <style scoped>
 .page { height: 100%; display: flex; flex-direction: column; }
-.export-slot { padding: 2px 16px 10px; display: flex; flex-direction: column; gap: 6px; }
-.note.export-note { display: flex; align-items: flex-start; gap: 8px; padding: 5px 6px 5px 11px; }
-.note-icon { flex: none; margin-top: 5px; }
-.export-text { flex: 1; min-width: 0; padding: 3px 0; }
-.export-path { overflow-wrap: anywhere; }
-.export-note .btn { flex: none; }
-.export-note .btn.ghost { color: inherit; }
 .filters { flex: none; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 2px 16px 10px; }
 .tabs { display: inline-flex; gap: 2px; padding: 2px; border-radius: 999px; background: var(--subtle); }
 .tab { height: 24px; padding: 0 11px; border: 0; border-radius: 999px; background: transparent; font-size: 12px; display: inline-flex; gap: 5px; align-items: center; transition: background-color 180ms var(--ease), box-shadow 180ms var(--ease); }
@@ -461,7 +389,6 @@ h3 { display: flex; align-items: center; margin: 0; }
 .wf-bar.bad { background: #d93025; }
 .note { padding: 9px 11px; border-radius: 10px; font-size: 12px; line-height: 16px; }
 .note.bad { background: var(--danger-soft); color: var(--danger); }
-.note.ok { background: var(--success-soft); color: var(--success); }
 .icon-btn { width: 24px; height: 24px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); transition: background-color 150ms ease, color 150ms ease, transform 120ms var(--ease); }
 .icon-btn:hover { background: var(--hover); color: var(--text); }
 .icon-btn:active { transform: scale(0.92); }

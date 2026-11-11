@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { reactive } from 'vue'
+import type { Proposal } from './approvals'
 import { inApp } from './server'
 
 export type StoreKind = 'onePassword' | 'system'
@@ -92,20 +93,6 @@ export const WRITE_MODES: { value: WriteMode; label: string; hint: string }[] = 
   { value: 'auto', label: 'Boeken zonder akkoord', hint: 'AI-clients boeken en wijzigen direct. Verwijderen, crediteren en abonnementen factureren vragen nog wel je akkoord.' },
 ]
 
-/** A change an AI client asked for that waits for the user's approval (approvals.rs). */
-export interface Proposal {
-  id: number
-  accountId: string
-  account: string
-  client: string
-  tool: string
-  title: string
-  lines: { label: string; value: string }[]
-  /** Cannot be undone: asked even for an account that needs no approval otherwise. */
-  danger: boolean
-  askedAt: number
-}
-
 export interface Settings {
   idleMinutes: number
   appearance: Appearance
@@ -119,7 +106,7 @@ export const store = reactive({
   loaded: false,
   /** The latest step per account while signing in, and the end state until the user closes it. */
   signins: {} as Record<string, SigninEvent>,
-  /** Changes that wait for the user's approval, oldest first. */
+  /** Changes that wait for the user's approval, oldest first: the one list every page and sign reads (approvals.ts). */
   approvals: [] as Proposal[],
 })
 
@@ -189,26 +176,12 @@ export function receiveSignin(event: SigninEvent): void {
 
 let listening = false
 
-/** Starts listening once per window; later calls only refresh. */
-/** Reloads the changes that wait for approval. Apart from `refresh`: they change on their own events. */
-export async function refreshApprovals(): Promise<void> {
-  const list = inApp() ? await invoke<Proposal[]>('approvals_list') : []
-  store.approvals = Array.isArray(list) ? list : []
-}
-
-/** The user's answer to a waiting change. Only `approve` lets it go to e-Boekhouden. */
-export const decideApproval = (id: number, approve: boolean) =>
-  invoke('approval_decide', { id, approve }).finally(refreshApprovals)
-
+/** Loads the accounts and starts listening once per window; later calls only refresh. */
 export async function connect(): Promise<void> {
   await refresh()
-  await refreshApprovals()
   if (listening || !inApp()) return
   listening = true
-  await listen<{ type: string }>('state', (event) => {
-    void refresh()
-    if (event.payload?.type === 'approvalsChanged') void refreshApprovals()
-  })
+  await listen('state', () => void refresh())
   await listen<SigninEvent>('signin', (event) => {
     receiveSignin(event.payload)
     void refresh()
