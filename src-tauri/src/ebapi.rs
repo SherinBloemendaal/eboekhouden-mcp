@@ -42,17 +42,29 @@ impl ApiCall {
     }
 }
 
-/// Where e-Boekhouden's own app runs; its API calls carry this as Origin.
-const APP_ORIGIN: &str = "https://secure20.e-boekhouden.nl";
+/// e-Boekhouden's classic pages, where its login form lives (`inloggen.asp`).
+pub const CLASSIC_BASE: &str = "https://secure.e-boekhouden.nl/bh/";
+/// The login form is a browser page; it gets a browser's User-Agent, as the page expects.
+const BROWSER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 pub struct EbClient {
     base: Url,
+    classic: Url,
     http: reqwest::Client,
     limiter: Limiter,
 }
 
 impl EbClient {
+    /// The API at `base` with the classic pages under `/bh/` on the same host (tests, with a mock).
+    #[cfg(test)]
     pub fn new(base: &str) -> Self {
+        let classic = Url::parse(base)
+            .and_then(|url| url.join("/bh/"))
+            .expect("classic base");
+        Self::with_classic(base, classic.as_str())
+    }
+
+    pub fn with_classic(base: &str, classic: &str) -> Self {
         let http = reqwest::Client::builder()
             .timeout(TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
@@ -61,13 +73,14 @@ impl EbClient {
             .expect("HTTP client");
         Self {
             base: Url::parse(base).expect("API base"),
+            classic: Url::parse(classic).expect("classic base"),
             http,
             limiter: Limiter::new(),
         }
     }
 
     pub fn production() -> Self {
-        Self::new(API_BASE)
+        Self::with_classic(API_BASE, CLASSIC_BASE)
     }
 
     /// GET `path` (relative to /v1/api/) with the given cookies of the account's session.
@@ -166,19 +179,113 @@ impl EbClient {
         call
     }
 
-    /// `POST /v1/api/auth/login`, how e-Boekhouden's own app signs in: username, password and, when the account
-    /// asks for it, the two-step code. The answer's token becomes the `auth-token` cookie the API reads, next to
-    /// the cookies the answer sets. The password goes only into this request's body.
-    pub async fn login(
+    /// Signs in the way the browser does (Sherin's capture of 2026-11-11): fetch `inloggen.asp` for its
+    /// session cookies and the hidden `txtFormCheck`, then post the form. e-Boekhouden answers with the
+    /// `auth-token` cookie its API reads. `device` stands in for the page's browser fingerprint (`FP`).
+    /// The password goes only into the form's body. `notes` tell the diagnosis what came back, without values.
+    pub async fn login(&self, username: &str, password: &str, device: u32) -> LoginRun {
+        let mut run = LoginRun {
+            calls: Vec::new(),
+            notes: Vec::new(),
+            outcome: Login::Error(String::new()),
+        };
+        let page_url = self.classic.join("inloggen.asp").expect("login page URL");
+        let (call, page) = self.classic_call("GET", page_url.clone(), None, &[]).await;
+        run.calls.push(call.clone());
+        let Some(page) = page else {
+            run.outcome = Login::Error(call.error.unwrap_or_default());
+            return run;
+        };
+        let mut cookies = page.cookies;
+        run.notes.push(format!(
+            "Inlogpagina: status {}, cookies gezet: {}",
+            call.status,
+            cookie_names(&cookies)
+        ));
+        let Some(form_check) = input_value(&page.body, "txtFormCheck") else {
+            let message = format!(
+                "De inlogpagina van e-Boekhouden is veranderd: het veld txtFormCheck ontbreekt (status {})",
+                call.status
+            );
+            run.calls.last_mut().expect("page call").error = Some(message.clone());
+            run.outcome = Login::Error(message);
+            return run;
+        };
+        let server = cookies
+            .iter()
+            .find(|c| c.name == "SRVRID")
+            .map(|c| c.value.clone())
+            .unwrap_or_default();
+        let form = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("txtEmail", username)
+            .append_pair("txtWachtwoord", password)
+            .append_pair("txtFormCheck", &form_check)
+            .append_pair("FP", &device.to_string())
+            .append_pair("XSRVX", &server)
+            .finish();
+        let mut post_url = page_url.clone();
+        post_url.set_query(Some("LOGIN=1"));
+        let sent: Vec<(String, String)> = cookies
+            .iter()
+            .map(|c| (c.name.clone(), c.value.clone()))
+            .collect();
+        let (mut call, answer) = self
+            .classic_call("POST", post_url, Some((form, page_url.as_str())), &sent)
+            .await;
+        let Some(answer) = answer else {
+            run.outcome = Login::Error(call.error.clone().unwrap_or_default());
+            run.calls.push(call);
+            return run;
+        };
+        run.notes.push(format!(
+            "Formulier verstuurd: status {}, cookies gezet: {}{}, paginatitel: {}, velden: {}",
+            call.status,
+            cookie_names(&answer.cookies),
+            answer
+                .location
+                .as_deref()
+                .map(|l| format!(", doorverwijzing naar {}", l.split('?').next().unwrap_or(l)))
+                .unwrap_or_default(),
+            page_title(&answer.body).unwrap_or_else(|| "geen".into()),
+            {
+                let names = input_names(&answer.body);
+                if names.is_empty() {
+                    "geen".to_owned()
+                } else {
+                    names.join(", ")
+                }
+            }
+        ));
+        for cookie in answer.cookies {
+            cookies.retain(|c| c.name != cookie.name);
+            cookies.push(cookie);
+        }
+        run.outcome = classic_outcome(call.status, &answer.body, &cookies);
+        if let Login::Refused(m) | Login::Error(m) = &run.outcome {
+            call.error = Some(m.clone());
+        }
+        run.calls.push(call);
+        run
+    }
+
+    /// One request to the classic pages, as a browser would send it. The answer's body and cookies come back
+    /// beside the call; `None` when there was no answer at all.
+    async fn classic_call(
         &self,
-        username: &str,
-        password: &str,
-        code: Option<&str>,
-    ) -> (ApiCall, Login) {
+        method: &'static str,
+        url: Url,
+        form: Option<(String, &str)>,
+        cookies: &[(String, String)],
+    ) -> (ApiCall, Option<ClassicAnswer>) {
         let mut call = ApiCall {
-            method: "POST",
-            path: "auth/login".into(),
-            query: Vec::new(),
+            method,
+            path: format!(
+                "bh/{}",
+                url.path_segments()
+                    .and_then(|mut s| s.next_back())
+                    .unwrap_or_default()
+            ),
+            query: url.query_pairs().into_owned().collect(),
             status: 0,
             duration_ms: 0,
             bytes: 0,
@@ -186,54 +293,59 @@ impl EbClient {
             json: None,
             error: None,
         };
-        let url = self.base.join("auth/login").expect("login URL");
-        // As their app sends it: `twoFactorCode` only when there is a code (theirs is `undefined`, so left out).
-        let mut body = serde_json::json!({ "username": username, "password": password });
-        if let Some(code) = code {
-            body["twoFactorCode"] = Value::String(code.to_owned());
+        let origin = url.origin().ascii_serialization();
+        let mut request = match form {
+            Some((body, referer)) => self
+                .http
+                .post(url)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
+                .header(reqwest::header::ORIGIN, origin)
+                .header(reqwest::header::REFERER, referer)
+                .body(body),
+            None => self.http.get(url),
+        }
+        .header(reqwest::header::USER_AGENT, BROWSER_AGENT)
+        .header(
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header(reqwest::header::ACCEPT_LANGUAGE, "nl-NL,nl;q=0.9");
+        if !cookies.is_empty() {
+            request = request.header(reqwest::header::COOKIE, cookie_header(cookies));
         }
         let started = Instant::now();
-        let result = self
-            .http
-            .post(url)
-            .header(reqwest::header::ACCEPT, "application/json")
-            // What the browser adds for their app on secure20.
-            .header(reqwest::header::ORIGIN, APP_ORIGIN)
-            .header(reqwest::header::REFERER, format!("{APP_ORIGIN}/login"))
-            .json(&body)
-            .send()
-            .await;
-        let outcome = match result {
-            Err(e) => Login::Error(if e.is_timeout() {
-                "e-Boekhouden antwoordde niet binnen 30 s".into()
-            } else {
-                "Geen verbinding met e-Boekhouden".into()
-            }),
+        let result = request.send().await;
+        let answer = match result {
+            Err(e) => {
+                call.error = Some(if e.is_timeout() {
+                    "e-Boekhouden antwoordde niet binnen 30 s".into()
+                } else {
+                    "Geen verbinding met e-Boekhouden".into()
+                });
+                None
+            }
             Ok(response) => {
                 call.status = response.status().as_u16();
-                let set: Vec<(String, String)> = response
+                let cookies = set_cookies(response.headers());
+                let location = response
                     .headers()
-                    .get_all(reqwest::header::SET_COOKIE)
-                    .iter()
-                    .filter_map(|v| v.to_str().ok())
-                    .filter_map(|v| v.split(';').next())
-                    .filter_map(|pair| pair.split_once('='))
-                    .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
-                    .filter(|(k, _)| !k.is_empty())
-                    .collect();
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
                 let bytes = response.bytes().await.unwrap_or_default();
                 call.bytes = bytes.len();
-                let json = serde_json::from_slice::<Value>(&bytes).ok();
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                login_outcome(call.status, json.as_ref(), &text, set)
+                Some(ClassicAnswer {
+                    body: String::from_utf8_lossy(&bytes).into_owned(),
+                    cookies,
+                    location,
+                })
             }
         };
         call.duration_ms = started.elapsed().as_millis() as u64;
-        // A request for the two-step code is a normal step of the sign-in, not an error.
-        if let Login::Refused(m) | Login::Error(m) = &outcome {
-            call.error = Some(m.clone());
-        }
-        (call, outcome)
+        (call, answer)
     }
 
     /// `POST /v1/api/auth`, the check e-Boekhouden's own app makes at startup: whether these cookies make a
@@ -313,19 +425,41 @@ pub fn cookie_header(cookies: &[(String, String)]) -> String {
         .join("; ")
 }
 
-/// What `auth/login` answered.
+/// How a sign-in on the classic form ended.
 #[derive(Debug, PartialEq)]
 pub enum Login {
-    /// Signed in: the session's cookies, `auth-token` among them. Never logged or shown.
+    /// Signed in: the session's cookies for the API, `auth-token` among them. Never logged or shown.
     Session(Vec<(String, String)>),
-    /// The account uses two-step verification: sign in again with the code.
+    /// The page asks for a two-step code.
     NeedsCode,
     /// e-Boekhouden refused, with its own message where it gave one.
     Refused(String),
     Error(String),
 }
 
-const TWO_STEP: [&str; 7] = [
+/// A sign-in with what it sent: the calls for Verzoeken and notes for the diagnosis. No secret in either.
+pub struct LoginRun {
+    pub calls: Vec<ApiCall>,
+    pub notes: Vec<String>,
+    pub outcome: Login,
+}
+
+/// A cookie from a `Set-Cookie` header. `shared` when it names a domain: the browser then sends it to
+/// e-Boekhouden's API host as well, which is how the classic login hands its token to the API.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetCookie {
+    pub name: String,
+    pub value: String,
+    pub shared: bool,
+}
+
+struct ClassicAnswer {
+    body: String,
+    cookies: Vec<SetCookie>,
+    location: Option<String>,
+}
+
+const TWO_STEP: [&str; 8] = [
     "twofactor",
     "two-factor",
     "two factor",
@@ -333,63 +467,169 @@ const TWO_STEP: [&str; 7] = [
     "tweestap",
     "authenticator",
     "verificatiecode",
+    "verificatie code",
 ];
 
-/// Reads `auth/login`'s answer. Pure, so it can be tested without e-Boekhouden.
-pub fn login_outcome(
-    status: u16,
-    json: Option<&Value>,
-    text: &str,
-    mut cookies: Vec<(String, String)>,
-) -> Login {
-    let token = json
-        .and_then(|j| j.get("token"))
-        .and_then(Value::as_str)
-        .filter(|t| !t.is_empty());
-    if (200..300).contains(&status)
-        && let Some(token) = token
-    {
-        cookies.retain(|(k, _)| k != "auth-token");
-        cookies.push(("auth-token".into(), token.to_owned()));
-        return Login::Session(cookies);
+fn set_cookies(headers: &reqwest::header::HeaderMap) -> Vec<SetCookie> {
+    headers
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(parse_set_cookie)
+        .collect()
+}
+
+/// `name=value; Domain=...; Path=/` to a cookie. A cookie that is being removed (empty value) is skipped.
+pub fn parse_set_cookie(header: &str) -> Option<SetCookie> {
+    let mut parts = header.split(';');
+    let (name, value) = parts.next()?.split_once('=')?;
+    let (name, value) = (name.trim(), value.trim());
+    if name.is_empty() || value.is_empty() {
+        return None;
     }
-    let lower = text.to_lowercase();
-    if (200..300).contains(&status) || status == 400 || status == 401 || status == 403 {
-        if TWO_STEP.iter().any(|w| lower.contains(w)) {
-            return Login::NeedsCode;
+    let shared = parts.any(|attribute| {
+        attribute
+            .split_once('=')
+            .is_some_and(|(k, v)| k.trim().eq_ignore_ascii_case("domain") && !v.trim().is_empty())
+    });
+    Some(SetCookie {
+        name: name.to_owned(),
+        value: value.to_owned(),
+        shared,
+    })
+}
+
+fn cookie_names(cookies: &[SetCookie]) -> String {
+    if cookies.is_empty() {
+        return "geen".into();
+    }
+    let mut names: Vec<&str> = cookies.iter().map(|c| c.name.as_str()).collect();
+    names.sort_unstable();
+    names.join(", ")
+}
+
+/// The tags of every `<input>` in a page, lower-cased apart from their values.
+fn input_tags(html: &str) -> impl Iterator<Item = &str> {
+    let lower = html.to_ascii_lowercase();
+    let mut starts = Vec::new();
+    let mut from = 0;
+    while let Some(at) = lower[from..].find("<input") {
+        starts.push(from + at);
+        from += at + 6;
+    }
+    starts.into_iter().filter_map(move |start| {
+        let end = html[start..].find('>')?;
+        Some(&html[start..start + end])
+    })
+}
+
+/// An attribute of a tag, quoted or bare: `name="x"`, `name='x'` or `name=x`.
+fn attribute(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut from = 0;
+    loop {
+        let at = from + lower[from..].find(name)?;
+        let before_ok = at == 0 || lower.as_bytes()[at - 1].is_ascii_whitespace();
+        let rest = tag[at + name.len()..].trim_start();
+        if before_ok && let Some(rest) = rest.strip_prefix('=') {
+            let rest = rest.trim_start();
+            let value = match rest.chars().next() {
+                Some(quote @ ('"' | '\'')) => rest[1..].split(quote).next().unwrap_or_default(),
+                _ => rest
+                    .split(|c: char| c.is_ascii_whitespace() || c == '>')
+                    .next()
+                    .unwrap_or_default(),
+            };
+            return Some(value.to_owned());
         }
-        let message = json
-            .and_then(|j| {
-                ["message", "error", "detail", "title"]
-                    .iter()
-                    .find_map(|k| j.get(*k).and_then(Value::as_str))
-            })
-            .map(str::to_owned)
-            .or_else(|| json.and_then(Value::as_str).map(str::to_owned))
-            .or_else(|| {
-                (!text.trim().is_empty() && text.len() < 300 && !text.contains('<'))
-                    .then(|| text.trim().to_owned())
-            })
-            .unwrap_or_else(|| "e-Boekhouden weigerde de gebruikersnaam of het wachtwoord".into());
-        return Login::Refused(message.chars().take(300).collect());
+        from = at + name.len();
+    }
+}
+
+/// The value of the `<input>` named `name`.
+pub fn input_value(html: &str, name: &str) -> Option<String> {
+    input_tags(html)
+        .find(|tag| attribute(tag, "name").is_some_and(|n| n.eq_ignore_ascii_case(name)))
+        .and_then(|tag| attribute(tag, "value"))
+        .filter(|v| !v.is_empty())
+}
+
+/// The names of a page's inputs, for the diagnosis of a page EB MCP does not know.
+fn input_names(html: &str) -> Vec<String> {
+    let mut names: Vec<String> = input_tags(html)
+        .filter_map(|tag| attribute(tag, "name"))
+        .filter(|n| !n.is_empty())
+        .collect();
+    names.dedup();
+    names.truncate(12);
+    names
+}
+
+fn page_title(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let start = lower.find("<title>")? + 7;
+    let end = start + lower[start..].find("</title>")?;
+    let title = html[start..end].trim();
+    (!title.is_empty()).then(|| title.chars().take(80).collect())
+}
+
+/// What a page told the user in an `alert(...)`, apart from the form's own "moet ingevuld zijn" checks.
+fn page_alert(html: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(at) = html[from..].find("alert(") {
+        let rest = &html[from + at + 6..];
+        from += at + 6;
+        let Some(quote @ ('"' | '\'')) = rest.chars().next() else {
+            continue;
+        };
+        let text = rest[1..].split(quote).next().unwrap_or_default().trim();
+        if !text.is_empty() && !text.contains("moet ingevuld zijn") && !text.contains("doorsturen")
+        {
+            return Some(text.chars().take(200).collect());
+        }
+    }
+    None
+}
+
+/// Reads the answer to the login form. Pure, so it can be tested without e-Boekhouden. The cookies are those
+/// of the login page and of this answer together.
+pub fn classic_outcome(status: u16, body: &str, cookies: &[SetCookie]) -> Login {
+    if cookies.iter().any(|c| c.name == "auth-token") {
+        // What a browser would send on to the API host: the token and the other cookies set for the whole domain.
+        return Login::Session(
+            cookies
+                .iter()
+                .filter(|c| c.shared || c.name == "auth-token")
+                .map(|c| (c.name.clone(), c.value.clone()))
+                .collect(),
+        );
     }
     if status == 429 {
         return Login::Refused("e-Boekhouden vraagt om even te wachten met inloggen".into());
     }
-    let detail = json
-        .and_then(|j| {
-            ["message", "error", "detail", "title"]
-                .iter()
-                .find_map(|k| j.get(*k).and_then(Value::as_str))
-        })
-        .map(str::to_owned)
-        .or_else(|| {
-            (!text.trim().is_empty() && !text.contains('<')).then(|| text.trim().to_owned())
-        })
-        .map(|d| format!(": {}", d.chars().take(200).collect::<String>()))
-        .unwrap_or_default();
+    if status >= 500 {
+        return Login::Error(format!(
+            "e-Boekhouden gaf een fout bij het inloggen ({status})"
+        ));
+    }
+    let lower = body.to_lowercase();
+    let names = input_names(body);
+    let asks_password = names
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case("txtWachtwoord"));
+    if !asks_password && TWO_STEP.iter().any(|w| lower.contains(w)) {
+        return Login::NeedsCode;
+    }
+    if asks_password {
+        return Login::Refused(page_alert(body).unwrap_or_else(|| {
+            "e-Boekhouden weigerde de gebruikersnaam of het wachtwoord".into()
+        }));
+    }
     Login::Error(format!(
-        "e-Boekhouden gaf een fout bij het inloggen ({status}){detail}"
+        "e-Boekhouden gaf na het inloggen geen token (status {status}{})",
+        page_title(body)
+            .map(|t| format!(", pagina: {t}"))
+            .unwrap_or_default()
     ))
 }
 
@@ -561,33 +801,55 @@ mod tests {
             )
             .route("/v1/api/kapot", get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }))
             .route("/v1/api/verboden", get(|| async { axum::http::StatusCode::FORBIDDEN }))
+            // The classic login page: a session cookie, the server's name and a hidden check value.
             .route(
-                "/v1/api/auth/login",
-                axum::routing::post(|body: String| async move {
-                    let body: Value = serde_json::from_str(&body).unwrap_or_default();
-                    // e-Boekhouden answers 500 on an empty code; their app leaves the field out.
-                    if body.get("twoFactorCode").and_then(Value::as_str) == Some("") {
-                        return (
-                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                            [("set-cookie", "SRVRID=9s13; path=/; Secure")],
-                            "Object reference not set".to_owned(),
-                        );
+                "/bh/inloggen.asp",
+                get(|| async {
+                    // Two Set-Cookie headers, as the real page sends them.
+                    let mut headers = HeaderMap::new();
+                    headers.append("set-cookie", "ASPSESSIONIDX=sess; path=/; HttpOnly; Secure".parse().unwrap());
+                    headers.append("set-cookie", "SRVRID=9s13; path=/; Secure".parse().unwrap());
+                    headers.insert("content-type", "text/html".parse().unwrap());
+                    (headers, LOGIN_PAGE)
+                })
+                .post(|headers: HeaderMap, body: String| async move {
+                    let cookie = headers.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+                    let agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+                    let field = |name: &str| {
+                        url::form_urlencoded::parse(body.as_bytes())
+                            .find(|(k, _)| k == name)
+                            .map(|(_, v)| v.into_owned())
+                            .unwrap_or_default()
+                    };
+                    // As the real page: the form only counts in the session it was made for.
+                    let same_session = cookie.contains("ASPSESSIONIDX=sess")
+                        && cookie.contains("SRVRID=9s13")
+                        && field("txtFormCheck") == "643214248783498236735031453023"
+                        && field("XSRVX") == "9s13"
+                        && !field("FP").is_empty()
+                        && agent.starts_with("Mozilla/");
+                    let html = [("content-type", "text/html")];
+                    if !same_session {
+                        return (axum::http::StatusCode::OK, html, [("set-cookie", "X=; path=/")], "<title>Fout</title>".to_owned());
                     }
-                    match (body["username"].as_str(), body["password"].as_str(), body["twoFactorCode"].as_str()) {
-                        (Some("jan@studionoord.example"), Some("geheim"), Some("123456")) => (
+                    match (field("txtEmail").as_str(), field("txtWachtwoord").as_str()) {
+                        ("jan@studionoord.example", "geheim") => (
                             axum::http::StatusCode::OK,
-                            [("set-cookie", "SRVRID=9s13; path=/; Secure")],
-                            json!({"token": "jwt"}).to_string(),
+                            html,
+                            [("set-cookie", "auth-token=jwt; domain=.e-boekhouden.nl; path=/; Secure")],
+                            "<title>Inloggen | e-Boekhouden.nl</title><script>top.frames.sessionframe.location=\"updatesessie.asp\"</script>".to_owned(),
                         ),
-                        (Some("jan@studionoord.example"), Some("geheim"), _) => (
-                            axum::http::StatusCode::BAD_REQUEST,
-                            [("set-cookie", "SRVRID=9s13; path=/; Secure")],
-                            json!({"message": "TwoFactorCodeRequired"}).to_string(),
+                        ("tweestaps@studionoord.example", "geheim") => (
+                            axum::http::StatusCode::OK,
+                            html,
+                            [("set-cookie", "X=; path=/")],
+                            "<title>Tweestapsverificatie</title><form><input name=\"txtCode\"></form>".to_owned(),
                         ),
                         _ => (
-                            axum::http::StatusCode::UNAUTHORIZED,
-                            [("set-cookie", "SRVRID=9s13; path=/; Secure")],
-                            json!({"message": "Gebruikersnaam of wachtwoord onjuist"}).to_string(),
+                            axum::http::StatusCode::OK,
+                            html,
+                            [("set-cookie", "X=; path=/")],
+                            format!("{LOGIN_PAGE}<script>alert(\"Gebruikersnaam en/of wachtwoord is onjuist.\")</script>"),
                         ),
                     }
                 }),
@@ -601,7 +863,7 @@ mod tests {
                     if !json_type {
                         return (axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE, String::new());
                     }
-                    (axum::http::StatusCode::OK, json!({"valid": cookie.contains("ISLOGINX")}).to_string())
+                    (axum::http::StatusCode::OK, json!({"valid": cookie.contains("auth-token=jwt")}).to_string())
                 }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -609,6 +871,17 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{addr}/v1/api/")
     }
+
+    /// The parts of e-Boekhouden's login page the sign-in reads (saved 2026-10-29, checked live 2026-11-11).
+    const LOGIN_PAGE: &str = r#"<title>Inloggen | e-Boekhouden.nl</title>
+        <form name="frm" id="frm" Action="inloggen.asp?LOGIN=1" method="post" OnSubmit='return ValidateForm()' novalidate>
+        <INPUT class="INPUTBOX" type="text" id="txtEmail" name="txtEmail" value="" size="35" maxlength="50" tabindex=1>
+        <INPUT class="INPUTBOX" type="password" id="txtWachtwoord" name="txtWachtwoord" value="" size="35" tabindex=2>
+        <INPUT class="act-btn" type="submit"  value="Inloggen"  tabindex=3 id=submit1 name=submit1   >
+        <input type="hidden" id="txtFormCheck" name="txtFormCheck" value="643214248783498236735031453023">
+        <input type="hidden" id="FP" name="FP" value="">
+        <input type="hidden" id="XSRVX" name="XSRVX" value=""></form>
+        <script>if (document.frm.txtEmail.value==''){alert("Gebruikersnaam moet ingevuld zijn.");}</script>"#;
 
     fn cookies() -> Vec<(String, String)> {
         vec![
@@ -764,7 +1037,7 @@ mod tests {
     #[tokio::test]
     async fn checks_the_session_with_a_json_post() {
         let client = EbClient::new(&mock().await);
-        let signed_in = client.auth(&[("ISLOGINX".into(), "1".into())]).await;
+        let signed_in = client.auth(&[("auth-token".into(), "jwt".into())]).await;
         assert_eq!(signed_in.status, 200, "{:?}", signed_in.error);
         assert!(valid_session(&signed_in));
         let not_yet = client.auth(&[("SRVRID".into(), "1".into())]).await;
@@ -774,69 +1047,179 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signs_in_like_e_boekhoudens_app_with_a_two_step_code() {
+    async fn signs_in_through_the_classic_form_like_a_browser() {
         let client = EbClient::new(&mock().await);
-        let (call, wrong) = client.login("jan@studionoord.example", "fout", None).await;
-        assert_eq!(call.status, 401);
-        assert_eq!(
-            wrong,
-            Login::Refused("Gebruikersnaam of wachtwoord onjuist".into())
-        );
-        let (call, needs) = client
-            .login("jan@studionoord.example", "geheim", None)
+        let run = client
+            .login("jan@studionoord.example", "geheim", 4075681428)
             .await;
-        assert_eq!(needs, Login::NeedsCode);
-        assert!(call.error.is_none(), "asking for the code is no error");
-        let (call, ok) = client
-            .login("jan@studionoord.example", "geheim", Some("123456"))
-            .await;
-        assert_eq!(call.status, 200);
+        // The token and nothing that belongs to the classic host only (its ASP session, the server name).
         assert_eq!(
-            ok,
-            Login::Session(vec![
-                ("SRVRID".into(), "9s13".into()),
-                ("auth-token".into(), "jwt".into())
-            ])
+            run.outcome,
+            Login::Session(vec![("auth-token".into(), "jwt".into())])
         );
-        assert!(call.error.is_none());
+        let paths: Vec<(&str, &str)> = run
+            .calls
+            .iter()
+            .map(|c| (c.method, c.path.as_str()))
+            .collect();
+        assert_eq!(
+            paths,
+            [("GET", "bh/inloggen.asp"), ("POST", "bh/inloggen.asp")]
+        );
+        assert!(
+            run.calls
+                .iter()
+                .all(|c| c.error.is_none() && c.status == 200)
+        );
+        // The diagnosis names cookies and fields, never a value.
+        let notes = run.notes.join("\n");
+        assert!(notes.contains("ASPSESSIONIDX, SRVRID"), "{notes}");
+        assert!(notes.contains("auth-token"), "{notes}");
+        assert!(
+            !notes.contains("jwt") && !notes.contains("geheim") && !notes.contains("sess"),
+            "{notes}"
+        );
+        assert!(!format!("{:?}", run.calls).contains("geheim"));
+    }
+
+    #[tokio::test]
+    async fn tells_a_wrong_password_from_a_two_step_page() {
+        let client = EbClient::new(&mock().await);
+        let wrong = client.login("jan@studionoord.example", "fout", 1).await;
+        assert_eq!(
+            wrong.outcome,
+            Login::Refused("Gebruikersnaam en/of wachtwoord is onjuist.".into())
+        );
+        assert!(wrong.calls[1].error.is_some());
+        let code = client
+            .login("tweestaps@studionoord.example", "geheim", 1)
+            .await;
+        assert_eq!(code.outcome, Login::NeedsCode);
+        assert!(
+            code.calls[1].error.is_none(),
+            "asking for the code is no error"
+        );
+        assert!(code.notes.join(" ").contains("txtCode"), "{:?}", code.notes);
+    }
+
+    #[tokio::test]
+    async fn names_a_changed_login_page() {
+        let app = Router::new().route(
+            "/bh/inloggen.asp",
+            get(|| async { "<title>Onderhoud</title>" }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let run = EbClient::new(&format!("http://{addr}/v1/api/"))
+            .login("a", "b", 1)
+            .await;
+        let Login::Error(message) = run.outcome else {
+            panic!("{:?}", run.outcome)
+        };
+        assert!(message.contains("txtFormCheck"), "{message}");
+        assert_eq!(
+            run.calls.len(),
+            1,
+            "nothing is posted to a page it does not know"
+        );
     }
 
     #[test]
-    fn reads_the_login_answer() {
-        let json = |v: Value| Some(v);
-        assert!(matches!(
-            login_outcome(200, json(json!({"token": "t"})).as_ref(), "", vec![]),
-            Login::Session(_)
-        ));
+    fn reads_the_login_page_and_its_cookies() {
         assert_eq!(
-            login_outcome(200, json(json!({"token": ""})).as_ref(), "", vec![]),
+            input_value(LOGIN_PAGE, "txtFormCheck").as_deref(),
+            Some("643214248783498236735031453023")
+        );
+        assert_eq!(input_value(LOGIN_PAGE, "FP"), None);
+        assert_eq!(
+            input_names(LOGIN_PAGE),
+            [
+                "txtEmail",
+                "txtWachtwoord",
+                "submit1",
+                "txtFormCheck",
+                "FP",
+                "XSRVX"
+            ]
+        );
+        assert_eq!(
+            page_title(LOGIN_PAGE).as_deref(),
+            Some("Inloggen | e-Boekhouden.nl")
+        );
+        assert_eq!(
+            page_alert(LOGIN_PAGE),
+            None,
+            "the form's own checks are no answer"
+        );
+        assert_eq!(
+            parse_set_cookie("auth-token=abc; domain=.e-boekhouden.nl; path=/; Secure"),
+            Some(SetCookie {
+                name: "auth-token".into(),
+                value: "abc".into(),
+                shared: true
+            })
+        );
+        assert_eq!(
+            parse_set_cookie("SRVRID=9s13; path=/; Secure; SameSite=LAX"),
+            Some(SetCookie {
+                name: "SRVRID".into(),
+                value: "9s13".into(),
+                shared: false
+            })
+        );
+        assert_eq!(
+            parse_set_cookie("auth-token=; path=/"),
+            None,
+            "a removed cookie"
+        );
+    }
+
+    #[test]
+    fn reads_the_answer_to_the_login_form() {
+        let cookie = |name: &str, shared: bool| SetCookie {
+            name: name.into(),
+            value: "v".into(),
+            shared,
+        };
+        assert_eq!(
+            classic_outcome(
+                200,
+                "",
+                &[
+                    cookie("ASPSESSIONID", false),
+                    cookie("SessionId", true),
+                    cookie("auth-token", false)
+                ]
+            ),
+            Login::Session(vec![
+                ("SessionId".into(), "v".into()),
+                ("auth-token".into(), "v".into())
+            ])
+        );
+        assert_eq!(
+            classic_outcome(200, LOGIN_PAGE, &[]),
             Login::Refused("e-Boekhouden weigerde de gebruikersnaam of het wachtwoord".into())
         );
         assert_eq!(
-            login_outcome(400, None, "Two-factor authentication code required", vec![]),
+            classic_outcome(
+                200,
+                "<title>Extra controle</title>Vul de verificatiecode in <input name=\"code\">",
+                &[]
+            ),
             Login::NeedsCode
         );
+        assert!(matches!(classic_outcome(429, "", &[]), Login::Refused(_)));
         assert_eq!(
-            login_outcome(401, json(json!("Account geblokkeerd")).as_ref(), "", vec![]),
-            Login::Refused("Account geblokkeerd".into())
-        );
-        assert_eq!(
-            login_outcome(401, None, "<html>nope</html>", vec![]),
-            Login::Refused("e-Boekhouden weigerde de gebruikersnaam of het wachtwoord".into())
-        );
-        assert!(matches!(
-            login_outcome(502, None, "", vec![]),
-            Login::Error(_)
-        ));
-        assert_eq!(
-            login_outcome(500, None, "Object reference not set", vec![]),
-            Login::Error(
-                "e-Boekhouden gaf een fout bij het inloggen (500): Object reference not set".into()
-            )
-        );
-        assert_eq!(
-            login_outcome(500, None, "<html>stack</html>", vec![]),
+            classic_outcome(500, "<html>stack</html>", &[]),
             Login::Error("e-Boekhouden gaf een fout bij het inloggen (500)".into())
+        );
+        assert_eq!(
+            classic_outcome(302, "<title>Object moved</title>", &[]),
+            Login::Error(
+                "e-Boekhouden gaf na het inloggen geen token (status 302, pagina: Object moved)"
+                    .into()
+            )
         );
     }
 }

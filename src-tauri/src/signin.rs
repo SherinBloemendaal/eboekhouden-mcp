@@ -1,15 +1,18 @@
-//! Signing in (SPEC.md, Sign-in), the way e-Boekhouden's own app does it: the username and password from
-//! 1Password or the Keychain go to `auth/login` on e-Boekhouden's API, which answers with the session token.
-//! When the account uses two-step verification, the user types the code into EB MCP's own field and the
-//! login is sent once more with it. The token and the cookies of the answer live only in memory (SessionJar).
+//! Signing in (SPEC.md, Sign-in), the way the browser does it: EB MCP fetches e-Boekhouden's login page,
+//! posts its form with the username and password from 1Password or the Keychain, and gets the `auth-token`
+//! cookie e-Boekhouden's API reads (ebapi.rs, `login`). The token lives only in memory (SessionJar).
 //!
-//! Until 0.1.8 EB MCP filled e-Boekhouden's classic login page in a hidden webview. That signs in to the
-//! old ASP pages only: their API never accepted that session (Sherin's traces of 2026-11-10).
+//! Until 0.1.8 a hidden webview filled the same page but never found the token; 0.1.9 to 0.1.11 used the
+//! `auth/login` of e-Boekhouden's new app, which answers 500 for ordinary accounts. Sherin's capture of a
+//! browser sign-in (2026-11-11) showed the form's answer itself sets the token.
+//!
+//! Two-step verification: the form then answers with a page EB MCP has not seen yet. The sign-in stops and
+//! the diagnosis names that page's fields, so the step can be built from a real trace.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -23,18 +26,20 @@ use crate::state::{AppState, CookieJar, now_ms};
 
 /// e-Boekhouden's login page, for "Open e-Boekhouden in je browser".
 pub const LOGIN_URL: &str = "https://secure.e-boekhouden.nl/bh/";
-const POLL: Duration = Duration::from_millis(200);
-const CODE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How many finished sign-ins Instellingen › Diagnose keeps.
 const TRACES_KEPT: usize = 10;
-/// Wrong codes in a row before EB MCP stops asking.
-const CODE_TRIES: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Step {
     Credentials,
     Submit,
+    /// Waiting for a two-step code (the UI's code field and `give_code`). Not sent while the classic form's
+    /// two-step page is unknown; see the module comment.
+    #[expect(
+        dead_code,
+        reason = "returns with the two-step step of the classic form"
+    )]
     Code,
     Administration,
     Done,
@@ -307,84 +312,42 @@ async fn run(
     }
 
     emit(app, account_id, Step::Submit, None);
-    let mut code: Option<String> = None;
-    let mut code_tries = 0u32;
-    let cookies = loop {
-        signins.trace(
-            account_id,
-            if code.is_some() {
-                "Inloggen bij e-Boekhouden met de tweestapscode"
-            } else {
-                "Inloggen bij e-Boekhouden (auth/login)"
-            },
-        );
-        *called = true;
-        let (call, outcome) = state
-            .client
-            .login(
-                &credentials.username,
-                &credentials.password,
-                code.as_deref(),
-            )
-            .await;
-        state.log_signin_call(&call, account_id, &account.label);
-        signins.trace(
-            account_id,
-            format!("Antwoord: status {}, {}", call.status, describe(&outcome)),
-        );
-        if cancel.load(Ordering::SeqCst) {
-            return (Step::Cancelled, None);
+    signins.trace(account_id, "Inloggen bij e-Boekhouden (inlogformulier)");
+    *called = true;
+    let login = state
+        .client
+        .login(
+            &credentials.username,
+            &credentials.password,
+            device_number(account_id),
+        )
+        .await;
+    for call in &login.calls {
+        state.log_signin_call(call, account_id, &account.label);
+    }
+    for note in &login.notes {
+        signins.trace(account_id, note.as_str());
+    }
+    signins.trace(
+        account_id,
+        format!("Uitkomst: {}", describe(&login.outcome)),
+    );
+    if cancel.load(Ordering::SeqCst) {
+        return (Step::Cancelled, None);
+    }
+    let cookies = match login.outcome {
+        Login::Session(cookies) => cookies,
+        Login::Refused(message) => return (Step::Failed, Some(message)),
+        Login::NeedsCode => {
+            return (
+                Step::Unknown,
+                Some(
+                    "e-Boekhouden vraagt om een extra code. Die stap kent EB MCP nog niet: stuur de details van deze aanmelding door, dan kan hij erbij."
+                        .into(),
+                ),
+            );
         }
-        // A 429 is e-Boekhouden asking to wait, not a wrong code: asking for another code would not help.
-        let throttled = call.status == 429;
-        match outcome {
-            Login::Session(cookies) => break cookies,
-            Login::Refused(message) if code.is_none() || throttled => {
-                return (Step::Failed, Some(message));
-            }
-            Login::Refused(_) | Login::NeedsCode if code.is_some() && code_tries >= CODE_TRIES => {
-                return (
-                    Step::Failed,
-                    Some("De tweestapscode werd drie keer niet geaccepteerd".into()),
-                );
-            }
-            Login::Refused(_) | Login::NeedsCode => {
-                if code.is_some() {
-                    signins.trace(account_id, "De code werd niet geaccepteerd; opnieuw vragen");
-                }
-                let (tx, rx) = oneshot::channel();
-                if let Some(p) = signins.pending.lock().unwrap().get_mut(&account_id) {
-                    p.code = Some(tx);
-                }
-                emit(
-                    app,
-                    account_id,
-                    Step::Code,
-                    code.is_some().then(|| {
-                        "Die code werd niet geaccepteerd. Probeer de volgende.".to_owned()
-                    }),
-                );
-                let given = tokio::select! {
-                    given = rx => given.ok(),
-                    _ = tokio::time::sleep(CODE_TIMEOUT) => None,
-                    _ = wait_cancel(cancel) => None,
-                };
-                let Some(given) = given else {
-                    return if cancel.load(Ordering::SeqCst) {
-                        (Step::Cancelled, None)
-                    } else {
-                        (
-                            Step::Failed,
-                            Some("Geen code ontvangen binnen 5 minuten".into()),
-                        )
-                    };
-                };
-                code = Some(given);
-                code_tries += 1;
-                emit(app, account_id, Step::Submit, None);
-            }
-            Login::Error(message) => return (Step::Unknown, Some(message)),
-        }
+        Login::Error(message) => return (Step::Unknown, Some(message)),
     };
     drop(credentials);
 
@@ -441,7 +404,7 @@ async fn run(
     )
 }
 
-/// For the diagnosis: what `auth/login` answered, without any token.
+/// For the diagnosis: how the login form answered, without any token.
 fn describe(outcome: &Login) -> String {
     match outcome {
         Login::Session(cookies) => {
@@ -455,13 +418,14 @@ fn describe(outcome: &Login) -> String {
     }
 }
 
-async fn wait_cancel(cancel: &AtomicBool) {
-    while !cancel.load(Ordering::SeqCst) {
-        tokio::time::sleep(POLL).await;
-    }
+/// The number the login form sends as its browser fingerprint (`FP`): steady per account, so e-Boekhouden
+/// sees the same "browser" at every sign-in of that account.
+fn device_number(account_id: Uuid) -> u32 {
+    let bytes = account_id.as_bytes();
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
-/// The sessions' cookies, in memory only: what `auth/login` gave, `auth-token` among them.
+/// The sessions' cookies, in memory only: what the login form gave, `auth-token` among them.
 #[derive(Default)]
 pub struct SessionJar {
     sessions: Mutex<HashMap<String, Vec<(String, String)>>>,
