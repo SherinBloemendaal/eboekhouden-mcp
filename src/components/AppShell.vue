@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Alert from './Alert.vue'
-import { inApp, quitApp, serverInfo, type ServerInfo } from '../lib/server'
+import { hostPort, inApp, modKey, quitApp, server, startupNotice, watchServer } from '../lib/server'
 import Icon from './Icon.vue'
 import UpdateUi from './UpdateUi.vue'
 
@@ -28,20 +28,44 @@ onMounted(() => window.addEventListener('keydown', onKey))
 // Stop EB MCP (Cmd+Q) from the menu bar while AI calls still run: the app asks here first (lib.rs, QUIT_REQUESTED).
 const quitCalls = ref(0)
 const quitting = ref(false)
+let unlistenQuit: (() => void) | null = null
+let unmounted = false
 onMounted(async () => {
   if (!inApp()) return
   const { listen } = await import('@tauri-apps/api/event')
-  await listen<number>('quit-requested', (event) => (quitCalls.value = event.payload))
+  const stop = await listen<number>('quit-requested', (event) => (quitCalls.value = event.payload))
+  if (unmounted) stop()
+  else unlistenQuit = stop
 })
 async function confirmQuit() {
   quitting.value = true
   await quitApp()
 }
-onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 const title = computed(() => String(route.meta.title ?? ''))
-const info = ref<ServerInfo | null>(null)
+
+// The server can fail after this window loaded (a port in use): follow it instead of reading it once.
+const info = computed(() => server.info)
+const address = computed(() => (info.value ? hostPort(info.value.url) : ''))
+let stopServer: (() => void) | null = null
+onMounted(() => {
+  stopServer = watchServer()
+})
+
+// Something EB MCP noticed at startup (a damaged accounts.json it set aside): a banner until it is closed.
+const notice = ref<string | null>(null)
 onMounted(async () => {
-  info.value = await serverInfo()
+  try {
+    notice.value = await startupNotice()
+  } catch (error) {
+    console.error('startup_notice', error)
+  }
+})
+
+onBeforeUnmount(() => {
+  unmounted = true
+  window.removeEventListener('keydown', onKey)
+  unlistenQuit?.()
+  stopServer?.()
 })
 </script>
 
@@ -59,13 +83,13 @@ onMounted(async () => {
         <RouterLink to="/instellingen" class="nav settings" active-class="active">
           <Icon name="settings" class="nav-icon" />
           <span>Instellingen</span>
-          <span class="shortcut">⌘,</span>
+          <span class="shortcut">{{ modKey }},</span>
         </RouterLink>
         <span class="server-line">
           <span class="dot" :class="info?.running ? 'on' : 'bad'" />
           {{ info?.running ? 'MCP actief' : 'MCP staat uit' }}
         </span>
-        <span class="mono server-addr">{{ info?.error ?? '127.0.0.1:47821' }}</span>
+        <span class="mono server-addr">{{ info?.error ?? (address || '\u00a0') }}</span>
       </div>
     </nav>
     <main class="main">
@@ -74,6 +98,17 @@ onMounted(async () => {
         <h1>{{ title }}</h1>
         <span id="toolbar-actions" class="toolbar-actions" />
       </header>
+      <Transition name="accordion">
+        <div v-if="notice" class="accordion">
+          <div>
+            <div class="notice" role="status">
+              <Icon name="alert" :size="15" class="notice-icon" />
+              <p class="notice-text selectable">{{ notice }}</p>
+              <button type="button" class="btn small ghost" @click="notice = null">Sluiten</button>
+            </div>
+          </div>
+        </div>
+      </Transition>
       <div class="content">
         <RouterView />
       </div>
@@ -81,7 +116,7 @@ onMounted(async () => {
   </div>
   <Transition name="modal">
     <Alert v-if="quitCalls" title="Toch afsluiten?" tone="warn" @close="quitCalls = 0">
-      <p>{{ quitCalls === 1 ? 'Er loopt nog 1 aanroep' : `Er lopen nog ${quitCalls} aanroepen` }} van een AI-client. Die krijgt dan een fout, en alle sessies worden uitgelogd.</p>
+      <p>{{ quitCalls === 1 ? 'Er loopt nog 1 aanroep' : `Er lopen nog ${quitCalls} aanroepen` }} van een AI-client. Die krijgt dan een fout, en EB MCP vergeet alle sessies.</p>
       <template #buttons>
         <button type="button" class="btn" @click="quitCalls = 0">Annuleren</button>
         <button type="button" class="btn danger-fill" :disabled="quitting" :aria-busy="quitting" @click="confirmQuit"><span class="btn-label">Afsluiten</span></button>
@@ -118,4 +153,12 @@ onMounted(async () => {
 .toolbar h1 { font-size: 15px; font-weight: 700; }
 .toolbar-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 .content { flex: 1; min-height: 0; overflow: auto; }
+/* The margin sits inside the collapsing block, so it opens and closes with it. */
+.notice {
+  display: flex; align-items: flex-start; gap: 10px; margin: 0 20px 12px; padding: 9px 8px 9px 12px;
+  border-radius: 10px; background: var(--warn-soft); color: var(--warn); font-size: 12px; line-height: 16px;
+}
+.notice-icon { flex: none; margin-top: 4px; }
+.notice-text { flex: 1; min-width: 0; padding-top: 4px; overflow-wrap: anywhere; }
+.notice .btn { flex: none; color: var(--warn); }
 </style>

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import AccountForm from '../components/AccountForm.vue'
 import Alert from '../components/Alert.vue'
 import Avatar from '../components/Avatar.vue'
@@ -8,9 +8,10 @@ import Icon from '../components/Icon.vue'
 import Sheet from '../components/Sheet.vue'
 import SigninSteps from '../components/SigninSteps.vue'
 import {
-  cancelSignIn, connect, dismissSignin, getSettings, isRunning, opLabel, removeAccount, setDefault, signIn, signOut, since, store,
+  cancelSignIn, connect, dismissSignin, getSettings, isRunning, opLabel, removeAccount, sessionAge, setDefault, signIn, signOut, store,
   type AccountView,
 } from '../lib/accounts'
+import { unlockName } from '../lib/server'
 
 const editing = ref<AccountView | null>(null)
 const adding = ref(false)
@@ -19,16 +20,31 @@ const removeError = ref<string | null>(null)
 const watching = ref<string | null>(null)
 const idleMinutes = ref(30)
 const now = ref(Date.now())
+let tick: ReturnType<typeof setInterval> | undefined
 
 onMounted(async () => {
+  // Started before the awaits, so leaving the page early still finds it to clear.
+  tick = setInterval(() => (now.value = Date.now()), 30_000)
   await connect()
   idleMinutes.value = (await getSettings()).idleMinutes
-  setInterval(() => (now.value = Date.now()), 30_000)
 })
+onBeforeUnmount(() => clearInterval(tick))
+
+const idleText = computed(() => (idleMinutes.value === 60 ? '1 uur' : idleMinutes.value === 240 ? '4 uur' : `${idleMinutes.value} minuten`))
 
 const watched = computed(() => store.accounts.find((a) => a.id === watching.value) ?? null)
 const watchedEvent = computed(() => (watching.value ? store.signins[watching.value] : undefined))
 const ended = computed(() => !!watchedEvent.value && !isRunning(watchedEvent.value.step))
+
+/** A sign-in this window did not start (from the menu-bar panel) and does not show yet: the row offers to follow it. */
+function followable(account: AccountView): boolean {
+  return (account.signingIn || isRunning(store.signins[account.id]?.step)) && watching.value !== account.id
+}
+
+/** Shows the steps and the code field of a running sign-in, without starting a new one. */
+function follow(account: AccountView) {
+  watching.value = account.id
+}
 
 function startSignIn(account: AccountView) {
   watching.value = account.id
@@ -44,7 +60,9 @@ function onSaved(account: AccountView, added: boolean) {
 
 function closeSignin() {
   if (!watching.value) return
-  if (isRunning(watchedEvent.value?.step)) void cancelSignIn(watching.value)
+  // Without a step yet (followed from the panel before this window heard one), the account says whether it runs.
+  const running = watchedEvent.value ? isRunning(watchedEvent.value.step) : !!watched.value?.signingIn
+  if (running) void cancelSignIn(watching.value)
   dismissSignin(watching.value)
   watching.value = null
 }
@@ -63,7 +81,7 @@ async function confirmRemove() {
 function sessionText(account: AccountView): { tone: string; text: string } {
   if (account.signingIn || isRunning(store.signins[account.id]?.step)) return { tone: 'run', text: 'Bezig met inloggen…' }
   if (account.session?.expired) return { tone: 'bad', text: 'Sessie verlopen' }
-  if (account.session) return { tone: 'on', text: `Ingelogd ${since(account.session.startedAt, now.value)}` }
+  if (account.session) return { tone: 'on', text: sessionAge(account.session.startedAt, now.value) }
   return { tone: 'off', text: account.administration ? 'Niet ingelogd' : 'Nog nooit ingelogd' }
 }
 
@@ -91,23 +109,26 @@ function sessionText(account: AccountView): { tone: string; text: string } {
           <Avatar :label="account.label" :muted="!account.session" />
           <span class="stack">
             <span class="name"><span class="name-text" :title="account.label">{{ account.label }}</span><span v-if="account.isDefault" class="chip info">Standaard</span></span>
-            <span class="sub">{{ account.store === 'onePassword' ? account.username || opLabel(account) : account.username }}</span>
+            <span class="sub" :title="account.store === 'onePassword' ? account.username || opLabel(account) : account.username">{{ account.store === 'onePassword' ? account.username || opLabel(account) : account.username }}</span>
           </span>
         </span>
-        <span :class="{ muted: !account.administration }">{{ account.administration ?? 'Na eerste keer inloggen' }}</span>
+        <span class="cut" :class="{ muted: !account.administration }" :title="account.administration ?? undefined">{{ account.administration ?? 'Na eerste keer inloggen' }}</span>
         <span class="stack">
           <span class="chip" :class="account.store === 'onePassword' ? 'info' : ''">{{ account.store === 'onePassword' ? '1Password' : 'Sleutelhanger' }}</span>
-          <span class="sub" :class="{ mono: account.store === 'onePassword' && !account.opTitle }">{{ account.store === 'onePassword' ? opLabel(account) : 'Touch ID bij elk gebruik' }}</span>
+          <span class="sub" :class="{ mono: account.store === 'onePassword' && !account.opTitle }" :title="account.store === 'onePassword' ? opLabel(account) : `${unlockName} bij elk gebruik`">{{ account.store === 'onePassword' ? opLabel(account) : `${unlockName} bij elk gebruik` }}</span>
         </span>
         <span class="session" :class="sessionText(account).tone">
           <span class="dot" :class="{ on: sessionText(account).tone === 'on', off: sessionText(account).tone === 'off', bad: sessionText(account).tone === 'bad' }" />
-          {{ sessionText(account).text }}
+          <span class="session-text" :title="sessionText(account).text">{{ sessionText(account).text }}</span>
         </span>
         <span class="actions">
-          <button v-if="account.session && !account.session.expired" type="button" class="btn small" @click="signOut(account.id)">Uitloggen</button>
-          <button v-else type="button" class="btn small" :class="{ primary: account.session?.expired }" :disabled="account.signingIn" :aria-busy="account.signingIn" @click="startSignIn(account)">
-            <span class="btn-label">{{ account.session?.expired ? 'Opnieuw inloggen' : 'Inloggen' }}</span>
-          </button>
+          <Transition name="swap-btn" mode="out-in">
+            <button v-if="account.session && !account.session.expired" key="out" type="button" class="btn small" @click="signOut(account.id)">Uitloggen</button>
+            <button v-else-if="followable(account)" key="follow" type="button" class="btn small" :aria-label="`Inloggen van ${account.label} volgen`" @click="follow(account)">Volgen</button>
+            <button v-else key="in" type="button" class="btn small" :class="{ primary: account.session?.expired }" :disabled="account.signingIn" :aria-busy="account.signingIn" @click="startSignIn(account)">
+              <span class="btn-label">{{ account.session?.expired ? 'Opnieuw inloggen' : 'Inloggen' }}</span>
+            </button>
+          </Transition>
           <button type="button" class="icon-btn" :aria-pressed="account.isDefault" :title="account.isDefault ? 'Standaard voor AI-clients' : 'Maak standaard voor AI-clients'" :aria-label="`${account.label} standaard maken`" @click="setDefault(account.id)">
             <Icon name="star" :size="15" :class="account.isDefault ? 'star on' : 'star'" />
           </button>
@@ -124,7 +145,7 @@ function sessionText(account: AccountView): { tone: string; text: string } {
       </section>
       <section class="group card">
         <h2>Sessies</h2>
-        <p>Een account wordt uitgelogd na {{ idleMinutes === 60 ? '1 uur' : idleMinutes === 240 ? '4 uur' : `${idleMinutes} minuten` }} zonder aanroep van een AI-client. Afsluiten vergeet altijd alle sessies; EB MCP bewaart ze nergens.</p>
+        <p>EB MCP vergeet de sessie van een account na {{ idleText }} zonder aanroep van een AI-client; bij e-Boekhouden verloopt die daarna vanzelf. Afsluiten vergeet altijd alle sessies; EB MCP bewaart ze nergens.</p>
         <RouterLink class="btn small" to="/instellingen">Wijzigen in Instellingen</RouterLink>
       </section>
     </div>
@@ -168,13 +189,17 @@ function sessionText(account: AccountView): { tone: string; text: string } {
 
 <style scoped>
 .page { padding: 8px 28px 28px; display: flex; flex-direction: column; gap: 16px; }
+/* At the smallest window (980 px) the table is 700 px wide: 668 inside the row padding, 604 after four gaps. The
+   action column keeps its content width (Opnieuw inloggen plus three icon buttons, about 210 px); the four text
+   columns share the rest and may shrink to nothing, cutting their text with an ellipsis and a tooltip. */
 .table { overflow: hidden; }
 .row {
-  display: grid; grid-template-columns: minmax(170px, 1.5fr) minmax(110px, 0.8fr) minmax(150px, 1.1fr) minmax(120px, 0.8fr) auto; align-items: center; column-gap: 16px;
+  display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 0.9fr) minmax(0, 0.9fr) minmax(0, 0.9fr) auto; align-items: center; column-gap: 16px;
   min-height: 48px; padding: 0 16px; border-top: 0.5px solid var(--line-soft); transition: background-color 150ms ease;
 }
 .row:not(.head):hover { background: var(--hover); }
 .row.head { min-height: 26px; border-top: 0; background: var(--sunken); font-size: 11px; font-weight: 600; color: var(--label); }
+.row.head > span, .cut { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .who { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .stack { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .name { display: flex; align-items: center; gap: 6px; min-width: 0; font-weight: 600; }
@@ -185,10 +210,16 @@ function sessionText(account: AccountView): { tone: string; text: string } {
 .muted { color: var(--muted); }
 .chip { align-self: flex-start; height: 18px; display: inline-flex; align-items: center; padding: 0 7px; border-radius: 999px; background: var(--subtle); color: var(--label); font-size: 11px; font-weight: 500; }
 .chip.info { background: var(--info-soft); color: var(--info); }
-.session { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.session { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 12px; color: var(--muted); }
+.session .dot { flex: none; }
+/* A narrow column wraps the status to a second line rather than cutting it. */
+.session-text { min-width: 0; line-height: 15px; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
 .session.on { color: var(--success); }
 .session.bad { color: var(--danger); }
 .actions { display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
+.actions > * { flex: none; }
+.swap-btn-enter-active, .swap-btn-leave-active { transition: opacity 120ms ease; }
+.swap-btn-enter-from, .swap-btn-leave-to { opacity: 0; }
 .icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); transition: background-color 150ms ease, color 150ms ease, opacity 150ms ease, transform 120ms var(--ease); }
 .icon-btn:hover { background: var(--hover); color: var(--text); }
 .icon-btn:active { transform: scale(0.92); }

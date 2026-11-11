@@ -135,7 +135,7 @@ function stateText(c: ClientStatus): string {
         </dd>
       </dl>
       <div class="chips">
-        <span class="chip">Alleen 127.0.0.1</span><span class="chip">Websites geweigerd (Origin)</span><span class="chip">Alleen lezen</span><span class="chip mcp">12 tools</span>
+        <span class="chip">Alleen 127.0.0.1</span><span class="chip">Websites geweigerd (Origin)</span><span class="chip">Alleen lezen</span><span v-if="info" class="chip mcp rise">{{ info.toolCount }} {{ info.toolCount === 1 ? 'tool' : 'tools' }}</span>
       </div>
     </section>
 

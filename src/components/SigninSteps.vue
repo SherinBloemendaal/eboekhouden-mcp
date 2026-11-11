@@ -3,7 +3,7 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { sendCode, signinTraces, type AccountView, type SigninEvent, type Trace } from '../lib/accounts'
 import TraceView from './TraceView.vue'
-import { openEboekhouden } from '../lib/server'
+import { openEboekhouden, unlockName } from '../lib/server'
 import Icon from './Icon.vue'
 
 const props = defineProps<{ account: AccountView; event: SigninEvent | undefined; compact?: boolean }>()
@@ -37,7 +37,7 @@ const asked = computed(() => lastIndex.value >= 2 || props.event?.step === 'code
 const rows = computed(() => {
   const step = props.event?.step
   const labels = [
-    props.account.store === 'onePassword' ? 'Gegevens uit 1Password lezen' : 'Touch ID voor het wachtwoord',
+    props.account.store === 'onePassword' ? 'Gegevens uit 1Password lezen' : `${unlockName} voor het wachtwoord`,
     'Inloggen bij e-Boekhouden',
     ...(asked.value ? ['Tweestapsverificatie'] : []),
     'Administratie ophalen',
@@ -88,9 +88,12 @@ onBeforeUnmount(() => {
   clearInterval(poll)
 })
 
+// An authenticator gives 6 digits; a backup code can hold letters too (EB MCP takes up to 12 characters).
+// No maxlength on the field: a pasted "ABCD-EFGH-IJKL" would be cut before its dashes are stripped here.
+const CODE_MAX = 12
 function onInput() {
-  code.value = code.value.replace(/\D/g, '').slice(0, 8)
-  if (code.value.length === 6) void submitCode()
+  code.value = code.value.replace(/[^0-9a-z]/gi, '').slice(0, CODE_MAX)
+  if (/^\d{6}$/.test(code.value)) void submitCode()
 }
 </script>
 
@@ -115,12 +118,12 @@ function onInput() {
             <label :for="`code-${account.id}`">Code uit je authenticator-app</label>
             <span class="code-row">
               <input
-                :id="`code-${account.id}`" v-model="code" class="field mono" inputmode="numeric" autocomplete="one-time-code"
-                maxlength="8" placeholder="000000" @input="onInput"
+                :id="`code-${account.id}`" v-model="code" class="field mono" autocomplete="one-time-code" autocapitalize="off" spellcheck="false"
+                placeholder="000000" @input="onInput"
               />
               <button type="submit" class="btn primary" :disabled="sending || code.length < 6" :aria-busy="sending"><span class="btn-label">Inloggen</span></button>
             </span>
-            <span class="hint">EB MCP geeft de code door aan e-Boekhouden en bewaart hem niet.</span>
+            <span class="hint">Of een back-upcode. EB MCP geeft de code door aan e-Boekhouden en bewaart hem niet.</span>
             <span v-if="codeError || event?.message" class="error" role="alert">{{ codeError ?? event?.message }}</span>
           </form>
         </div>

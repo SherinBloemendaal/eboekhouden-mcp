@@ -1,18 +1,23 @@
 <script setup lang="ts">
-// A macOS alert: app icon, short title, text and equal buttons. Esc cancels. Mount it inside
-// <Transition name="modal"> so it can leave: a v-if alone takes it out in one frame.
-import { onBeforeUnmount, onMounted } from 'vue'
+// A macOS alert: app icon, short title, text and equal buttons. Esc cancels, also on top of a sheet: then only the
+// alert closes. Tab stays inside it. Mount it inside <Transition name="modal"> so it can leave: a v-if alone takes it
+// out in one frame.
+import { ref } from 'vue'
+import { useDialogLayer } from './Sheet.vue'
 
 const props = defineProps<{ title: string; tone?: 'danger' | 'warn' }>()
 const emit = defineEmits<{ close: [] }>()
-const onKey = (event: KeyboardEvent) => event.key === 'Escape' && emit('close')
-onMounted(() => document.addEventListener('keydown', onKey))
-onBeforeUnmount(() => document.removeEventListener('keydown', onKey))
+const panel = ref<HTMLElement | null>(null)
+
+// The default button gets the focus; without one (a destructive choice) the first button, so Enter never deletes.
+useDialogLayer(panel, () => emit('close'), (el) =>
+  el.querySelector<HTMLElement>('.buttons .btn.primary:not(:disabled)') ?? el.querySelector<HTMLElement>('.buttons .btn:not(:disabled)'),
+)
 </script>
 
 <template>
   <div class="scrim" data-tauri-drag-region>
-    <div class="alert" role="alertdialog" aria-modal="true" :aria-label="props.title">
+    <div ref="panel" class="alert" role="alertdialog" aria-modal="true" tabindex="-1" :aria-label="props.title">
       <span class="icon">
         <img src="/app-icon.png" alt="" width="56" height="56" />
         <span v-if="props.tone" class="badge" :class="props.tone">!</span>
@@ -31,7 +36,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKey))
 .alert {
   width: 300px; box-sizing: border-box; padding: 20px 16px 16px; border-radius: 22px; display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center;
   background: var(--glass-pop); -webkit-backdrop-filter: blur(40px) saturate(190%); backdrop-filter: blur(40px) saturate(190%); box-shadow: var(--pop-shadow);
-  animation: show 240ms var(--ease) both;
+  animation: show 240ms var(--ease) both; outline: none;
 }
 .icon { position: relative; display: inline-flex; }
 .icon img { border-radius: 13px; }

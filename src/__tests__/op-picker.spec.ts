@@ -1,5 +1,6 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { h } from 'vue'
 import { filterOpItems, opLabel, type OpItem } from '../lib/accounts'
 
 const invoke = vi.fn()
@@ -67,6 +68,28 @@ describe('item picker', () => {
     expect(wrapper.emitted('close')).toHaveLength(1)
     expect(sheetClose).not.toHaveBeenCalled()
     document.removeEventListener('keydown', sheetClose)
+    wrapper.unmount()
+  })
+
+  it('closes only the list on Esc when it sits in a sheet, and the next Esc closes the sheet', async () => {
+    invoke.mockResolvedValue(ITEMS)
+    const { default: OpItemPicker } = await import('../components/OpItemPicker.vue')
+    const { default: Sheet } = await import('../components/Sheet.vue')
+    const pickerClose = vi.fn()
+    const wrapper = mount(Sheet, {
+      props: { title: 'Account toevoegen' },
+      slots: { default: () => h(OpItemPicker, { onClose: pickerClose }) },
+      attachTo: document.body,
+    })
+    await flushPromises()
+    const search = wrapper.find('input').element as HTMLInputElement
+    search.focus()
+    search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+    expect(pickerClose).toHaveBeenCalledTimes(1)
+    expect(wrapper.emitted('close')).toBeUndefined()
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+    expect(wrapper.emitted('close')).toHaveLength(1)
     wrapper.unmount()
   })
 

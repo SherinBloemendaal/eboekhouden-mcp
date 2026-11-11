@@ -2,6 +2,7 @@
 // Add or edit an account. Passwords go straight to the system store; the app keeps none.
 import { computed, reactive, ref } from 'vue'
 import { addAccount, updateAccount, type AccountView, type OpItem, type StoreKind } from '../lib/accounts'
+import { unlockName } from '../lib/server'
 import Icon from './Icon.vue'
 import OpItemPicker from './OpItemPicker.vue'
 import Sheet from './Sheet.vue'
@@ -116,7 +117,7 @@ async function save() {
           </button>
           <button type="button" role="radio" :aria-checked="form.store === 'system'" class="option" :class="{ on: form.store === 'system' }" @click="form.store = 'system'">
             <span class="ring" />
-            <span><strong>Sleutelhanger</strong><small>Gebruikersnaam en wachtwoord in je sleutelhanger, met Touch ID bij elk gebruik.</small></span>
+            <span><strong>Sleutelhanger</strong><small>Gebruikersnaam en wachtwoord in je sleutelhanger, met {{ unlockName }} bij elk gebruik.</small></span>
           </button>
         </div>
       </div>

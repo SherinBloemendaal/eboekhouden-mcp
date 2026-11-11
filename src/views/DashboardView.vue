@@ -80,7 +80,7 @@ function bar(part: number, of: number): string {
     <div class="tiles">
       <div class="group tile">
         <span class="tile-label">Nu</span>
-        <span class="tile-value">{{ current.eb + current.mcp }} /min<svg width="96" height="30" viewBox="0 0 96 30" aria-hidden="true"><polyline :points="spark" fill="none" stroke="#0a84ff" stroke-width="1.6" stroke-linejoin="round" /></svg></span>
+        <span class="tile-value">{{ current.eb + current.mcp }} /min<svg class="spark" width="96" height="30" viewBox="0 0 96 30" aria-hidden="true"><polyline :points="spark" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" /></svg></span>
         <span class="tile-sub">e-Boekhouden {{ current.eb }} · MCP {{ current.mcp }}</span>
       </div>
       <div class="group tile">
@@ -202,6 +202,7 @@ function bar(part: number, of: number): string {
 .tile.bad .tile-label, .tile.bad .tile-sub, .tile.bad .tile-value { color: var(--danger); }
 .tile-label { font-size: 11px; color: var(--muted); }
 .tile-value { display: flex; align-items: flex-end; justify-content: space-between; font-size: 24px; line-height: 30px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.spark { flex: none; color: var(--accent); }
 .tile-sub { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 16px; align-items: start; }
 .side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }

@@ -4,18 +4,28 @@ import Alert from '../components/Alert.vue'
 import Avatar from '../components/Avatar.vue'
 import Icon from '../components/Icon.vue'
 import SigninSteps from '../components/SigninSteps.vue'
-import { cancelSignIn, clock, connect, dismissSignin, isRunning, signIn, signOut, signOutAll, since, store, type AccountView } from '../lib/accounts'
-import { fitPanel, openMain, quitApp, runningCalls, serverInfo, type ServerInfo } from '../lib/server'
+import {
+  askedCode, cancelSignIn, connect, dismissSignin, isRunning, sessionAge, signIn, signOut, signOutAll, startedHere, store,
+  type AccountView,
+} from '../lib/accounts'
+import { fitPanel, isMac, modKey, openMain, quitApp, runningCalls, server, watchServer } from '../lib/server'
 import { checkNow } from '../lib/updates'
 
-const info = ref<ServerInfo | null>(null)
+const info = computed(() => server.info)
 const now = ref(Date.now())
 const quitting = ref(false)
 
+// The panel loads at launch, before a port error is known: the server state follows events, focus and a timer.
+let stopServer: (() => void) | null = null
+let clockTimer: ReturnType<typeof setInterval> | undefined
 onMounted(async () => {
+  stopServer = watchServer()
+  clockTimer = setInterval(() => (now.value = Date.now()), 30_000)
   await connect()
-  info.value = await serverInfo()
-  setInterval(() => (now.value = Date.now()), 30_000)
+})
+onBeforeUnmount(() => {
+  stopServer?.()
+  clearInterval(clockTimer)
 })
 
 const active = computed(() => store.accounts.filter((a) => a.session && !a.session.expired))
@@ -41,13 +51,28 @@ function line(account: AccountView): string {
 function sessionLine(account: AccountView): string | null {
   const s = account.session
   if (!s || s.expired) return null
-  return `Ingelogd ${since(s.startedAt, now.value)}${s.renewedAt ? ` · verlengd ${clock(s.renewedAt)}` : ''}`
+  return sessionAge(s.startedAt, now.value)
+}
+
+/** Running here or elsewhere: a sign-in started in the main window (or before this window loaded) counts too. */
+function busy(account: AccountView): boolean {
+  return account.signingIn || isRunning(store.signins[account.id]?.step)
+}
+
+/**
+ * The steps open only for a sign-in started in this panel, or one that needs a code, wherever it started. Other
+ * windows' sign-ins show as a busy row; their end state never reaches this window's store.
+ */
+function showSteps(account: AccountView): boolean {
+  const event = store.signins[account.id]
+  if (!event) return false
+  return !isRunning(event.step) || startedHere(account.id) || askedCode(account.id)
 }
 
 /** macOS: Sparkle's own window. Windows: the main window shows the update card after a fresh check. */
 async function checkForUpdates() {
   await checkNow()
-  if (!navigator.userAgent.includes('Mac')) await openMain('/dashboard')
+  if (!isMac) await openMain('/dashboard')
 }
 
 /** Asks first only while an AI client is waiting on a call; otherwise quits at once. */
@@ -110,7 +135,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
       Nog geen accounts. Voeg er een toe via Accounts beheren.
     </p>
     <div class="accounts">
-      <div v-for="account in store.accounts" :key="account.id" class="account" :class="{ expired: account.session?.expired, busy: isRunning(store.signins[account.id]?.step) }">
+      <div v-for="account in store.accounts" :key="account.id" class="account" :class="{ expired: account.session?.expired, busy: busy(account) }">
         <div class="account-row">
           <Avatar :label="account.label" :size="30" :muted="!account.session || account.session.expired" />
           <span class="stack">
@@ -118,14 +143,14 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
             <span class="sub" :class="{ bad: account.session?.expired }">{{ line(account) }}</span>
             <span v-if="sessionLine(account)" class="sub">{{ sessionLine(account) }}</span>
           </span>
-          <button v-if="isRunning(store.signins[account.id]?.step)" type="button" class="btn small ghost" @click="cancelSignIn(account.id)">Annuleren</button>
+          <button v-if="busy(account)" type="button" class="btn small ghost" @click="cancelSignIn(account.id)">Annuleren</button>
           <button v-else-if="account.session && !account.session.expired" type="button" class="btn small" @click="signOut(account.id)">Uitloggen</button>
           <button v-else type="button" class="btn small" :class="{ primary: account.session?.expired || account.isDefault }" @click="signIn(account.id)">
             {{ account.session?.expired ? 'Opnieuw inloggen' : 'Inloggen' }}
           </button>
         </div>
         <Transition name="accordion">
-          <div v-if="store.signins[account.id]" class="accordion">
+          <div v-if="showSteps(account)" class="accordion">
             <div>
               <div class="inline">
                 <SigninSteps :account="account" :event="store.signins[account.id]" compact />
@@ -159,14 +184,14 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
       </span>
       <span class="swap">
         <span :class="{ off: quitting }" :aria-hidden="quitting">Afsluiten</span>
-        <span :class="{ off: !quitting }" :aria-hidden="!quitting">Uitloggen en afsluiten…</span>
+        <span :class="{ off: !quitting }" :aria-hidden="!quitting">Afsluiten…</span>
       </span>
-      <span class="kbd">⌘Q</span>
+      <span class="kbd">{{ modKey }}Q</span>
     </button>
     </div>
     <Transition name="modal">
       <Alert v-if="confirmQuit" title="Toch afsluiten?" tone="warn" @close="confirmQuit = 0">
-        <p>{{ confirmQuit === 1 ? 'Er loopt nog 1 aanroep' : `Er lopen nog ${confirmQuit} aanroepen` }} van een AI-client. Die krijgt dan een fout, en alle sessies worden uitgelogd.</p>
+        <p>{{ confirmQuit === 1 ? 'Er loopt nog 1 aanroep' : `Er lopen nog ${confirmQuit} aanroepen` }} van een AI-client. Die krijgt dan een fout, en EB MCP vergeet alle sessies.</p>
         <template #buttons>
           <button type="button" class="btn" @click="confirmQuit = 0">Annuleren</button>
           <button type="button" class="btn danger-fill" @click="quit">Afsluiten</button>
