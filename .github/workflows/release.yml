@@ -4,12 +4,17 @@ name: Release
 # feeds the installed apps read. Ported from Tresso's release workflow. A pull request that changes the release, and a
 # run by hand, build the same files without publishing them.
 #
+# A push to main builds them too, without publishing: a tag's build may only read caches saved on main, so this
+# is what keeps a release from compiling every dependency from nothing.
+#
 # Repository variables: SPARKLE_PUBLIC_KEY, TAURI_UPDATER_PUBKEY (public halves, scripts/release-config.mjs).
 # Repository secrets: SPARKLE_PRIVATE_KEY (EdDSA), TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD.
 # The private keys live in 1Password and are never rotated: installed apps trust only these keys.
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   pull_request:
@@ -86,6 +91,8 @@ jobs:
         with:
           workspaces: src-tauri
           key: ${{ matrix.target }}
+          # Only main's cache is within reach of later tags; one saved by a tag or a pull request just fills the quota.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm ci
       - name: Build and bundle
         shell: bash
