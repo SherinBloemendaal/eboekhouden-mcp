@@ -1,6 +1,6 @@
 name: Release
 
-# A tag v1.2.3 builds EB MCP for macOS (universal) and publishes it as a GitHub release with the update
+# A tag v1.2.3 builds EB MCP for macOS (universal) and Windows (x64) and publishes it as a GitHub release with the update
 # feeds the installed apps read. Ported from Tresso's release workflow. A pull request that changes the release, and a
 # run by hand, build the same files without publishing them.
 #
@@ -68,12 +68,11 @@ jobs:
             target: universal-apple-darwin
             rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
             bundles: app,dmg
-          # Windows joins after the first Mac release (Sherin, 2026-11-06). CI already builds and tests it:
-          # - name: windows-x64
-          #   os: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          #   rust-targets: x86_64-pc-windows-msvc
-          #   bundles: nsis,msi
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rust-targets: x86_64-pc-windows-msvc
+            bundles: nsis,msi
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
