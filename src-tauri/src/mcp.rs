@@ -274,6 +274,8 @@ mod tests {
             "offerte_pdf",
             "sjablonen",
             "sjabloon",
+            "kvk_zoeken",
+            "kvk_adres",
         ] {
             assert!(names.contains(&want), "{want} missing from {names:?}");
         }
@@ -303,8 +305,12 @@ mod tests {
             "sjabloon_toevoegen",
             "sjabloon_wijzigen",
             "sjabloon_verwijderen",
+            "relatie_toevoegen",
+            "relatie_wijzigen",
+            "relatie_verwijderen",
         ];
         let destructive = [
+            "relatie_verwijderen",
             "offerte_verwijderen",
             "sjabloon_verwijderen",
             "mutatie_verwijderen",
@@ -328,7 +334,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(names.len(), 25 + writes.len());
+        assert_eq!(names.len(), 27 + writes.len());
         assert_eq!(crate::tools::tool_count(), names.len());
 
         let call = message(

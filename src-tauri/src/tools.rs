@@ -312,6 +312,149 @@ pub struct ArchiefUploadenArgs {
     pub account: Option<String>,
 }
 
+/// De gegevens van een relatie zoals het formulier van e-Boekhouden ze kent. Alles is optioneel bij wijzigen.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct RelatieVelden {
+    /// Bedrijfsnaam, of de naam van een particulier.
+    pub bedrijf: Option<String>,
+    /// Relatiecode, uniek binnen de administratie (bijvoorbeeld een afkorting van de naam).
+    pub code: Option<String>,
+    /// true voor een particulier, false voor een bedrijf (standaard bedrijf).
+    pub particulier: Option<bool>,
+    /// KvK-nummer.
+    pub kvk: Option<String>,
+    /// Contactpersoon.
+    pub contactpersoon: Option<String>,
+    /// Aanhef in brieven en e-mails.
+    pub aanhef: Option<String>,
+    /// Straat en huisnummer.
+    pub adres: Option<String>,
+    pub postcode: Option<String>,
+    pub plaats: Option<String>,
+    pub land: Option<String>,
+    /// Telefoonnummer.
+    pub telefoon: Option<String>,
+    /// Mobiel nummer.
+    pub mobiel: Option<String>,
+    /// Algemeen e-mailadres.
+    pub email: Option<String>,
+    /// E-mailadres voor facturen.
+    pub email_factuur: Option<String>,
+    /// E-mailadres voor herinneringen en aanmaningen.
+    pub email_herinnering: Option<String>,
+    /// Website.
+    pub website: Option<String>,
+    /// IBAN van de relatie.
+    pub iban: Option<String>,
+    /// BIC van de bank.
+    pub bic: Option<String>,
+    /// Btw-nummer.
+    pub btw_nr: Option<String>,
+    /// Eigen indeling van de relatie (vrije tekst, bijvoorbeeld Klant of Leverancier).
+    pub soort: Option<String>,
+    /// Notitie.
+    pub notitie: Option<String>,
+}
+
+impl RelatieVelden {
+    /// Each given field as (the API's key, the label for the user, the value, whether it decides where money or
+    /// invoices go).
+    fn given(&self) -> Result<Vec<(&'static str, &'static str, String, bool)>, String> {
+        let mut out = Vec::new();
+        let fields: [(&Option<String>, &'static str, &'static str, bool); 19] = [
+            (&self.bedrijf, "bedrijf", "Naam", false),
+            (&self.code, "code", "Code", false),
+            (&self.kvk, "kvk", "KvK-nummer", false),
+            (
+                &self.contactpersoon,
+                "contactpersoon",
+                "Contactpersoon",
+                false,
+            ),
+            (&self.aanhef, "aanhef", "Aanhef", false),
+            (&self.adres, "adres", "Adres", false),
+            (&self.postcode, "postcode", "Postcode", false),
+            (&self.plaats, "plaats", "Plaats", false),
+            (&self.land, "land", "Land", false),
+            (&self.telefoon, "telefoonnummer", "Telefoon", false),
+            (&self.mobiel, "mobielnummer", "Mobiel", false),
+            (&self.email, "email", "E-mail", true),
+            (
+                &self.email_factuur,
+                "emailFactuur",
+                "E-mail voor facturen",
+                true,
+            ),
+            (
+                &self.email_herinnering,
+                "emailHerinnering",
+                "E-mail voor herinneringen",
+                true,
+            ),
+            (&self.website, "site", "Website", false),
+            (&self.iban, "iban", "IBAN", true),
+            (&self.bic, "bic", "BIC", true),
+            (&self.btw_nr, "btwNr", "Btw-nummer", false),
+            (&self.soort, "soort", "Soort", false),
+        ];
+        for (value, key, label, sensitive) in fields {
+            if let Some(value) = value {
+                let value = value.trim().to_owned();
+                if matches!(key, "email" | "emailFactuur" | "emailHerinnering") && !value.is_empty()
+                {
+                    email(&value, label)?;
+                }
+                if matches!(key, "bedrijf" | "code") && value.is_empty() {
+                    return Err(format!("{label} mag niet leeg zijn"));
+                }
+                out.push((key, label, value, sensitive));
+            }
+        }
+        if let Some(notitie) = &self.notitie {
+            out.push(("notitie", "Notitie", notitie.trim().to_owned(), false));
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct RelatieToevoegenArgs {
+    #[serde(flatten)]
+    pub velden: RelatieVelden,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct RelatieWijzigenArgs {
+    /// Id van de relatie (uit relaties).
+    pub id: u64,
+    #[serde(flatten)]
+    pub velden: RelatieVelden,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct KvkZoekenArgs {
+    /// Bedrijfsnaam, KvK-nummer, of postcode met huisnummer.
+    pub zoek: String,
+    /// Aantal resultaten, 1 tot 200 (standaard 20).
+    pub limit: Option<u32>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct KvkAdresArgs {
+    /// Vestigingsnummer uit kvk_zoeken. Gaat voor het KvK-nummer.
+    pub vestigingsnummer: Option<String>,
+    /// KvK-nummer uit kvk_zoeken, voor het adres van de eigenaar.
+    pub kvk_nr: Option<String>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
 /// De soorten sjablonen naast e-mailsjablonen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -3508,6 +3651,269 @@ impl EbMcp {
         .await;
         Ok(self.end_write(run, "Sjabloon verwijderd", result))
     }
+
+    #[tool(
+        description = "Een bedrijf zoeken in het Handelsregister van de KvK, via e-Boekhouden: op bedrijfsnaam, KvK-nummer of postcode met huisnummer. Geeft per resultaat het KvK-nummer (nr), de naam, plaats, straat en het vestigingsnummer. Het volledige adres haal je op met kvk_adres. Handig om een relatie mee aan te maken.",
+        annotations(title = "KvK zoeken", read_only_hint = true, open_world_hint = true)
+    )]
+    async fn kvk_zoeken(
+        &self,
+        Parameters(args): Parameters<KvkZoekenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const PATH: &str = "kvk/gridtable";
+        let run = match self.begin(&context, "kvk_zoeken", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let zoek = args.zoek.trim();
+        if zoek.chars().count() < 2 || zoek.chars().count() > 50 {
+            return Ok(self.refuse(run, "Geef een zoekterm van 2 tot 50 tekens".into()));
+        }
+        let query = match grid(Some(args.limit.unwrap_or(20)), None) {
+            Ok(mut query) => {
+                query.insert(0, ("search".to_owned(), zoek.to_owned()));
+                query
+            }
+            Err(message) => return Ok(self.refuse(run, message)),
+        };
+        let result = self.fetch(&run, PATH, query).await.map(named_rows);
+        Ok(self.end(run, PATH, result))
+    }
+
+    #[tool(
+        description = "Het adres bij een resultaat van kvk_zoeken: van een vestiging (vestigingsnummer) of van de eigenaar (kvk_nr). Geeft straat, huisnummer, postcode, plaats en land.",
+        annotations(title = "KvK-adres", read_only_hint = true, open_world_hint = true)
+    )]
+    async fn kvk_adres(
+        &self,
+        Parameters(args): Parameters<KvkAdresArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let run = match self.begin(&context, "kvk_adres", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let digits = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty() && v.len() <= 12 && v.chars().all(|c| c.is_ascii_digit()))
+                .map(str::to_owned)
+        };
+        let path = match (digits(&args.vestigingsnummer), digits(&args.kvk_nr)) {
+            (Some(vestiging), _) => format!("kvk/vestiging/{vestiging}/adres"),
+            (None, Some(kvk)) => format!("kvk/{kvk}/eigenaar/adres"),
+            (None, None) => {
+                return Ok(self.refuse(
+                    run,
+                    "Geef een vestigingsnummer of een KvK-nummer (alleen cijfers)".into(),
+                ));
+            }
+        };
+        let result = self.fetch(&run, &path, Vec::new()).await;
+        Ok(self.end(run, &path, result))
+    }
+
+    #[tool(
+        description = "Een relatie (klant of leverancier) aanmaken. Naam en code zijn nodig; de code is uniek binnen de administratie. Zoek de gegevens van een bedrijf eerst op met kvk_zoeken en kvk_adres. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de relatie eerst goed in EB MCP.",
+        annotations(
+            title = "Relatie toevoegen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn relatie_toevoegen(
+        &self,
+        Parameters(args): Parameters<RelatieToevoegenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "relatie_toevoegen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let given = args.velden.given()?;
+            let has = |key: &str| given.iter().any(|(k, _, v, _)| *k == key && !v.is_empty());
+            if !has("bedrijf") || !has("code") {
+                return Err(Halt::Error(
+                    "Een relatie heeft een naam (bedrijf) en een code nodig".into(),
+                ));
+            }
+            let particulier = args.velden.particulier.unwrap_or(false);
+            // The fields e-Boekhouden's form always sends along, with the values of an untouched form.
+            let mut relatie = serde_json::Map::new();
+            relatie.insert("bp".into(), json!(if particulier { "P" } else { "B" }));
+            let mut lines = vec![line(
+                "Soort",
+                if particulier {
+                    "particulier"
+                } else {
+                    "bedrijf"
+                },
+            )];
+            for (key, label, value, _) in &given {
+                if !value.is_empty() {
+                    relatie.insert((*key).into(), json!(value));
+                    lines.push(line(label, value));
+                }
+            }
+            for key in [
+                "sepaMachtiging",
+                "menHAllowMail",
+                "menHAllowHerken",
+                "geenEmail",
+                "la",
+            ] {
+                relatie.insert(key.into(), json!(0));
+            }
+            let naam = args
+                .velden
+                .bedrijf
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let built = Built {
+                body: json!({"relatie": relatie}),
+                title: format!("Relatie toevoegen: {naam}"),
+                lines,
+            };
+            self.approve(&run, TOOL, &built, false).await?;
+            self.change(&run, "POST", "relatie/model", Some(&built.body))
+                .await
+        }
+        .await;
+        Ok(self.end_write(run, "Relatie toegevoegd; data.id is het id", result))
+    }
+
+    #[tool(
+        description = "Een relatie wijzigen, op id. Wat je niet noemt blijft zoals het is; een leeg veld maakt het leeg. Een wijziging van het IBAN, de BIC of een e-mailadres bepaalt waar geld en facturen heen gaan en vraagt daarom altijd het akkoord van de gebruiker. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet.",
+        annotations(
+            title = "Relatie wijzigen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn relatie_wijzigen(
+        &self,
+        Parameters(args): Parameters<RelatieWijzigenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "relatie_wijzigen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let mut relatie = self
+                .fetch(&run, &format!("relatie/{}", args.id), Vec::new())
+                .await?;
+            let naam = relatie
+                .get("bedrijf")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let object = relatie.as_object_mut().ok_or_else(|| {
+                Halt::Error("e-Boekhouden gaf deze relatie in een onbekende vorm terug".into())
+            })?;
+            let mut lines = vec![line("Relatie", &naam)];
+            let mut sensitive = false;
+            for (key, label, value, decides) in args.velden.given()? {
+                let before = object
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if before == value {
+                    continue;
+                }
+                sensitive |= decides;
+                lines.push(line(&format!("{label} was"), known(before)));
+                lines.push(line(
+                    &format!("{label} wordt"),
+                    if value.is_empty() {
+                        "(leeg)".to_owned()
+                    } else {
+                        value.clone()
+                    },
+                ));
+                object.insert(key.into(), json!(value));
+            }
+            if let Some(particulier) = args.velden.particulier {
+                let bp = if particulier { "P" } else { "B" };
+                if object.get("bp").and_then(Value::as_str) != Some(bp) {
+                    object.insert("bp".into(), json!(bp));
+                    lines.push(line(
+                        "Soort wordt",
+                        if particulier {
+                            "particulier"
+                        } else {
+                            "bedrijf"
+                        },
+                    ));
+                }
+            }
+            if lines.len() == 1 {
+                return Err(Halt::Error(
+                    "Er is niets gewijzigd: geef aan wat er anders moet".into(),
+                ));
+            }
+            let built = Built {
+                body: json!({"relatie": relatie}),
+                title: format!("Relatie wijzigen: {naam}"),
+                lines,
+            };
+            self.approve(&run, TOOL, &built, sensitive).await?;
+            self.change_done(&run, "PUT", "relatie/model", Some(&built.body))
+                .await
+        }
+        .await;
+        Ok(self.end_write(run, "Relatie gewijzigd", result))
+    }
+
+    #[tool(
+        description = "Een relatie verwijderen, op id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        annotations(
+            title = "Relatie verwijderen",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn relatie_verwijderen(
+        &self,
+        Parameters(args): Parameters<IdArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "relatie_verwijderen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let relatie = self.fetch(&run, &format!("relatie/{}", args.id), Vec::new()).await?;
+            let text = |key: &str| relatie.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
+            let naam = text("bedrijf");
+            let built = Built {
+                body: Value::Null,
+                title: format!("Relatie verwijderen: {naam}"),
+                lines: vec![
+                    line("Relatie", &naam),
+                    line("Code", known(text("code"))),
+                    line("Plaats", known(text("plaats"))),
+                    line("Gevolg", "de relatie verdwijnt uit de administratie; dit is niet terug te draaien. e-Boekhouden kan weigeren als er nog boekingen aan hangen."),
+                ],
+            };
+            self.approve(&run, TOOL, &built, true).await?;
+            self.change_done(&run, "DELETE", &format!("relatie/{}", args.id), None).await
+        }
+        .await;
+        Ok(self.end_write(run, "Relatie verwijderd", result))
+    }
 }
 
 /// How clients name and picture the server: "e-Boekhouden MCP" with the app icon, sent inline so it
@@ -3538,7 +3944,7 @@ impl ServerHandler for EbMcp {
             .with_server_info(server_info())
             .with_instructions(
                 "Leest de boekhouding in e-Boekhouden van de accounts die in EB MCP zijn ingelogd. \
-                 Wijzigen (mutaties, bestanden, facturen, offertes, abonnementen, sjablonen) en facturen mailen kan alleen voor accounts waar de gebruiker schrijven heeft aangezet; \
+                 Wijzigen (relaties, mutaties, bestanden, facturen, offertes, abonnementen, sjablonen) en facturen mailen kan alleen voor accounts waar de gebruiker schrijven heeft aangezet; \
                  status zegt per account of dat uit staat, met akkoord of zonder akkoord. Met akkoord toont EB MCP elke wijziging eerst aan de gebruiker, \
                  en de tool wacht tot die is goedgekeurd of geweigerd: vertel de gebruiker dat er in EB MCP iets klaarstaat. \
                  Staat er meer dan één account in EB MCP, dan moet elke tool de account-parameter meekrijgen; status zegt welke accounts er zijn.",
@@ -3674,7 +4080,7 @@ mod tests {
 
     #[test]
     fn counts_its_tools_on_the_router() {
-        assert_eq!(tool_count(), 49);
+        assert_eq!(tool_count(), 54);
     }
 
     #[test]
@@ -3835,6 +4241,36 @@ mod tests {
         );
         assert_eq!(targets("<p>Geen links</p>"), None);
         assert_eq!(known(" ".into()), "onbekend");
+        let velden = RelatieVelden {
+            bedrijf: Some(" Studio Noord ".into()),
+            iban: Some("NL91ABNA0417164300".into()),
+            telefoon: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(
+            velden.given().unwrap(),
+            vec![
+                ("bedrijf", "Naam", "Studio Noord".to_owned(), false),
+                ("telefoonnummer", "Telefoon", String::new(), false),
+                ("iban", "IBAN", "NL91ABNA0417164300".to_owned(), true),
+            ]
+        );
+        assert!(
+            RelatieVelden {
+                email_factuur: Some("geen adres".into()),
+                ..Default::default()
+            }
+            .given()
+            .is_err()
+        );
+        assert!(
+            RelatieVelden {
+                code: Some(" ".into()),
+                ..Default::default()
+            }
+            .given()
+            .is_err()
+        );
         assert_eq!(sjabloon_voor(&[SjabloonVoor::Offerte]), Ok((false, true)));
         assert!(sjabloon_voor(&[]).is_err());
     }
