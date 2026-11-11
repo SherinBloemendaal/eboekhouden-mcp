@@ -642,6 +642,29 @@ impl EbMcp {
         .await
     }
 
+    // The list behind Boekhouden > Importeren in e-Boekhouden's own app (`import/gridtable`). Only the read: the
+    // paths that process, book or delete these lines (`import/verwerk`, `import/bulk/wegboeken`) are never called.
+    #[tool(
+        description = "Geïmporteerde bankregels (afschriftregels) die nog niet verwerkt zijn tot een mutatie: datum, bedrag, omschrijving, rekening en tegenrekening. Alleen lezen: verwerken of wegboeken kan EB MCP niet.",
+        annotations(title = "Bankregels", read_only_hint = true)
+    )]
+    async fn bankregels(
+        &self,
+        Parameters(args): Parameters<ListArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let query = grid(args.limit, args.offset);
+        self.simple(
+            &context,
+            "bankregels",
+            &args,
+            args.account.as_deref(),
+            "import/gridtable",
+            query,
+        )
+        .await
+    }
+
     #[tool(
         description = "Het rekeningschema: alle grootboekrekeningen met code en omschrijving.",
         annotations(title = "Grootboek", read_only_hint = true)
@@ -1058,7 +1081,7 @@ mod tests {
 
     #[test]
     fn counts_its_tools_on_the_router() {
-        assert_eq!(tool_count(), 12);
+        assert_eq!(tool_count(), 13);
     }
 
     #[test]

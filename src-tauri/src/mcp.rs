@@ -254,6 +254,7 @@ mod tests {
             "relatie",
             "mutaties",
             "open_posten",
+            "bankregels",
             "grootboek",
             "balans",
             "winst_en_verlies",
@@ -264,7 +265,7 @@ mod tests {
         ] {
             assert!(names.contains(&want), "{want} missing from {names:?}");
         }
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 13);
         assert_eq!(crate::tools::tool_count(), names.len());
         assert!(
             tools
