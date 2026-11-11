@@ -578,6 +578,7 @@ async fn quit_now(app: &AppHandle, app_state: &AppState) {
 }
 
 /// Sent to the main window when Stop EB MCP (Cmd+Q) is chosen while AI calls still run; it asks first.
+#[cfg(target_os = "macos")]
 const QUIT_REQUESTED: &str = "quit-requested";
 
 /// The macOS menu bar, as every Mac app has it: Instellingen and Zoek naar updates in the app menu,
@@ -679,10 +680,15 @@ fn build_menu(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 const MENU_SETTINGS: &str = "settings";
+#[cfg(target_os = "macos")]
 const MENU_SETTINGS_FILE: &str = "settings-file";
+#[cfg(target_os = "macos")]
 const MENU_UPDATES: &str = "check-updates";
+#[cfg(target_os = "macos")]
 const MENU_UPDATES_FILE: &str = "check-updates-file";
+#[cfg(target_os = "macos")]
 const MENU_QUIT: &str = "quit";
 
 /// The panel takes the height of its content (PanelView measures it), between limits that keep it
