@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import EmptyState from '../components/EmptyState.vue'
 import { connectLog, duration, loadStats, size, type Minute, type StatsView } from '../lib/log'
 
-const LIMIT_PER_MINUTE = 30
+const LIMIT_PER_MINUTE = 60
 const stats = ref<StatsView | null>(null)
 const range = ref<15 | 60>(60)
 const hover = ref<number | null>(null)
@@ -58,6 +58,10 @@ const failing = computed(() => (stats.value?.endpoints ?? []).find((e) => e.erro
 function clock(minute: number): string {
   return new Date(minute * 60_000).toLocaleTimeString('nl-NL', { hour: '2-digit', minute: '2-digit' })
 }
+/** "10 nov. 14:05": counting can start days before today, so the date is part of it. */
+function since(ms: number): string {
+  return new Date(ms).toLocaleString('nl-NL', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+}
 function pct(n: number): string {
   return `${n.toFixed(1).replace('.', ',').replace(',0', '')} %`
 }
@@ -68,7 +72,7 @@ function bar(part: number, of: number): string {
 
 <template>
   <EmptyState v-if="stats && total === 0" icon="chart" title="Nog geen aanroepen">
-    Zodra een AI-client EB MCP gebruikt, zie je hier het verkeer van deze run: aanroepen per minuut, duur per endpoint, fouten en data. Alles in het geheugen, sinds de start om {{ clock(Math.floor(stats.startedAt / 60_000)) }}.
+    Zodra een AI-client EB MCP gebruikt, zie je hier het verkeer: aanroepen per minuut, duur per endpoint, fouten en data. EB MCP bewaart het, ook na een herstart of update. Geteld vanaf {{ since(stats.startedAt) }}.
   </EmptyState>
 
   <div v-else-if="stats" class="page">
@@ -118,7 +122,7 @@ function bar(part: number, of: number): string {
           <span><i class="sw eb" />e-Boekhouden</span><span><i class="sw mcp" />MCP</span><span><i class="sw err" />Fouten</span><span><i class="sw limit" />Rem {{ LIMIT_PER_MINUTE }} per minuut</span>
         </div>
         <div class="chart" @mouseleave="hover = null">
-          <span v-for="v in [0, 10, 20, 30]" :key="v" class="grid-line" :style="{ bottom: `${(v / top) * 100}%` }"><span>{{ v }}</span></span>
+          <span v-for="v in [0, 20, 40, 60]" :key="v" class="grid-line" :style="{ bottom: `${(v / top) * 100}%` }"><span>{{ v }}</span></span>
           <span class="limit" :style="{ bottom: `${(LIMIT_PER_MINUTE / top) * 100}%` }" />
           <div class="bars" role="img" :aria-label="`Aanroepen per minuut, laatste ${range} minuten`">
             <span v-for="(x, i) in minutes" :key="x.at" class="col" :class="{ dim: hover !== null && hover !== i }" @mouseenter="hover = i">

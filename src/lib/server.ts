@@ -137,6 +137,14 @@ export const autostartSet = (enabled: boolean): Promise<boolean> => invoke<boole
 /** Opens the folder with EB MCP's log files. */
 export const openLogDir = () => (inApp() ? invoke('open_log_dir') : Promise.resolve())
 
+/** The button that shows a file in the system's file manager. */
+export const revealName: string = isMac ? 'Toon in Finder' : 'Toon in Verkenner'
+/**
+ * Shows a debug export from `log_export` in Finder or Explorer, with the file selected. The app reveals it through
+ * tauri-plugin-opener on its side and refuses any other path; it rejects with a Dutch sentence.
+ */
+export const revealExport = (path: string): Promise<void> => invoke<void>('log_export_reveal', { path })
+
 export async function quitApp(): Promise<void> {
   if (inApp()) await invoke('quit')
 }

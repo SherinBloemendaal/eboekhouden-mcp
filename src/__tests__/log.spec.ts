@@ -3,11 +3,12 @@ import { duration, isError, size, statusLabel, timeline, type EbEntry, type McpE
 
 const mcp = (id: number, calls: number[], outcome: McpEntry['outcome'] = 'ok'): McpEntry => ({
   kind: 'mcp', id, at: id * 1000, client: 'Claude', tool: 'relaties', args: {}, account: 'Studio Noord',
-  outcome, durationMs: 400, bytes: 10, error: null, calls,
+  outcome, durationMs: 400, bytes: 10, error: null, calls, version: '0.2.0',
 })
 const eb = (id: number, parent: number | null, status = 200): EbEntry => ({
   kind: 'eb', id, at: id * 1000, parent, client: 'Claude', account: 'Studio Noord', method: 'GET', path: 'relatie/gridtable',
   query: [], status, durationMs: 300, bytes: 10, rows: 2, error: status >= 400 ? 'fout' : null, headers: [], truncated: false,
+  version: '',
 })
 
 describe('request log helpers', () => {

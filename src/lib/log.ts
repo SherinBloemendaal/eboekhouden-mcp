@@ -19,6 +19,8 @@ export interface McpEntry {
   error: string | null
   calls: number[]
   result?: unknown
+  /** The EB MCP version that made the entry; empty for entries from before versions were recorded. */
+  version: string
 }
 
 export interface EbEntry {
@@ -39,6 +41,8 @@ export interface EbEntry {
   headers: [string, string][]
   response?: unknown
   truncated: boolean
+  /** The EB MCP version that made the entry; empty for entries from before versions were recorded. */
+  version: string
 }
 
 export type Entry = McpEntry | EbEntry
@@ -101,6 +105,8 @@ export async function connectLog(onChange?: () => void): Promise<void> {
 
 export const entryDetail = (id: number) => invoke<Entry | null>('log_get', { id })
 export const clearLog = () => invoke('log_clear').then(refreshLog)
+/** Writes a debug export of the request log to a file; resolves to its absolute path, rejects with a Dutch sentence. */
+export const exportLog = () => invoke<string>('log_export')
 export const loadStats = () =>
   inApp()
     ? invoke<StatsView>('stats')

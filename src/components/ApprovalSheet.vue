@@ -71,7 +71,8 @@ async function decide(approve: boolean) {
 .sub { font-size: 12px; color: var(--muted); }
 .lines { display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); column-gap: 14px; row-gap: 6px; margin: 14px 0 0; padding: 12px; border-radius: 10px; background: var(--sunken); }
 dt { color: var(--label); font-size: 12px; line-height: 18px; white-space: nowrap; }
-dd { margin: 0; line-height: 18px; overflow-wrap: anywhere; }
+/* pre-line: a message or a list of links keeps the line breaks it was given. */
+dd { margin: 0; line-height: 18px; overflow-wrap: anywhere; white-space: pre-line; }
 .note { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; padding: 9px 11px; border-radius: 10px; font-size: 12px; line-height: 16px; }
 .note.warn { background: var(--warning-soft, var(--danger-soft)); color: var(--warning, var(--danger)); }
 .note.bad { background: var(--danger-soft); color: var(--danger); }
