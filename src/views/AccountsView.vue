@@ -8,7 +8,7 @@ import Icon from '../components/Icon.vue'
 import Sheet from '../components/Sheet.vue'
 import SigninSteps from '../components/SigninSteps.vue'
 import {
-  cancelSignIn, connect, dismissSignin, getSettings, isRunning, opLabel, removeAccount, sessionAge, setDefault, signIn, signOut, store,
+  cancelSignIn, connect, dismissSignin, getSettings, isRunning, opLabel, removeAccount, sessionAge, signIn, signOut, store,
   type AccountView,
 } from '../lib/accounts'
 import { unlockName } from '../lib/server'
@@ -108,7 +108,7 @@ function sessionText(account: AccountView): { tone: string; text: string } {
         <span class="who">
           <Avatar :label="account.label" :muted="!account.session" />
           <span class="stack">
-            <span class="name"><span class="name-text" :title="account.label">{{ account.label }}</span><span v-if="account.isDefault" class="chip info">Standaard</span></span>
+            <span class="name"><span class="name-text" :title="account.label">{{ account.label }}</span></span>
             <span class="sub" :title="account.store === 'onePassword' ? account.username || opLabel(account) : account.username">{{ account.store === 'onePassword' ? account.username || opLabel(account) : account.username }}</span>
           </span>
         </span>
@@ -129,9 +129,6 @@ function sessionText(account: AccountView): { tone: string; text: string } {
               <span class="btn-label">{{ account.session?.expired ? 'Opnieuw inloggen' : 'Inloggen' }}</span>
             </button>
           </Transition>
-          <button type="button" class="icon-btn" :aria-pressed="account.isDefault" :title="account.isDefault ? 'Standaard voor AI-clients' : 'Maak standaard voor AI-clients'" :aria-label="`${account.label} standaard maken`" @click="setDefault(account.id)">
-            <Icon name="star" :size="15" :class="account.isDefault ? 'star on' : 'star'" />
-          </button>
           <button type="button" class="icon-btn hov" title="Bewerken" :aria-label="`${account.label} bewerken`" @click="editing = account"><Icon name="pencil" :size="15" /></button>
           <button type="button" class="icon-btn hov danger" title="Verwijderen" :aria-label="`${account.label} verwijderen`" @click="removing = account"><Icon name="trash" :size="15" /></button>
         </span>
@@ -205,7 +202,6 @@ function sessionText(account: AccountView): { tone: string; text: string } {
 .name { display: flex; align-items: center; gap: 6px; min-width: 0; font-weight: 600; }
 /* A long account name stays on one line; the full name is in the tooltip. */
 .name-text { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.name .chip { flex: none; }
 .sub { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .muted { color: var(--muted); }
 .chip { align-self: flex-start; height: 18px; display: inline-flex; align-items: center; padding: 0 7px; border-radius: 999px; background: var(--subtle); color: var(--label); font-size: 11px; font-weight: 500; }
@@ -226,8 +222,6 @@ function sessionText(account: AccountView): { tone: string; text: string } {
 .icon-btn.danger { color: var(--danger); }
 .icon-btn.hov { opacity: 0; }
 .row:hover .icon-btn.hov, .row:focus-within .icon-btn.hov { opacity: 1; }
-.star { color: var(--off); fill: transparent; transition: color 150ms ease, fill 150ms ease; }
-.star.on { color: #f59e0b; fill: currentColor; }
 .cards { display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px; }
 .card { padding: 16px 18px; display: flex; flex-direction: column; gap: 8px; }
 .card h2 { font-size: 13px; font-weight: 700; }

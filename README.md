@@ -7,7 +7,7 @@ A menu-bar app (macOS, and Windows from the same code) that signs in to e-Boekho
 
 ## How it works
 
-- **Accounts** (`src-tauri/src/accounts.rs`): label, username or `op://` item, administration and which store holds the password. Never a password in the app's files.
+- **Accounts** (`src-tauri/src/accounts.rs`): label, username or `op://` item, administration and which store holds the password. Never a password in the app's files. There is no default account: with more than one, every tool call must name its account, so an AI client never reads the wrong books.
 - **Credentials** (`creds.rs`): 1Password through the `op` CLI, or the system store (Keychain with Touch ID, Credential Manager with Windows Hello), read only at sign-in.
 - **Sign-in as the browser does it** (`signin.rs`, `ebapi.rs`): EB MCP fetches e-Boekhouden's login page (`bh/inloggen.asp`) and posts its form with the username and password from 1Password or the Keychain. The answer sets the `auth-token` cookie that e-Boekhouden's API reads; EB MCP then checks the session with `POST auth`, as their app does at startup. Token and cookies stay in memory only. Two-step verification on this form is not built yet: the sign-in stops and its diagnosis names the page's fields. (0.1.9 to 0.1.11 used the `auth/login` of their new app, which answers 500 for ordinary accounts.)
 - **API** (`ebapi.rs`): GET only under `/v1/api/`, with the session's cookies, 30 reads a minute and 2 at a time, and a growing pause after errors.

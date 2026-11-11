@@ -240,13 +240,6 @@ fn account_remove(
 }
 
 #[tauri::command]
-fn account_set_default(app_state: Shared<'_, AppState>, id: Uuid) -> Result<(), String> {
-    app_state.accounts.set_default(id)?;
-    let _ = app_state.events.send(state::AppEvent::SessionsChanged);
-    Ok(())
-}
-
-#[tauri::command]
 fn signin_start(app: AppHandle, id: Uuid) {
     start_sign_in(&app, id);
 }
@@ -851,7 +844,6 @@ pub fn run() {
             account_add,
             account_update,
             account_remove,
-            account_set_default,
             signin_start,
             signin_cancel,
             signin_code,

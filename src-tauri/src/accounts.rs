@@ -36,7 +36,6 @@ pub struct Account {
     pub op_vault: Option<String>,
     /// Filled in from e-Boekhouden after a sign-in.
     pub administration: Option<String>,
-    pub is_default: bool,
 }
 
 /// What the UI sends to add or change an account.
@@ -51,7 +50,6 @@ pub struct AccountInput {
     pub op_title: Option<String>,
     #[serde(default)]
     pub op_vault: Option<String>,
-    pub is_default: bool,
 }
 
 pub struct AccountStore {
@@ -140,15 +138,6 @@ impl AccountStore {
             .cloned()
     }
 
-    pub fn default_account(&self) -> Option<Account> {
-        let accounts = self.accounts.lock().unwrap();
-        accounts
-            .iter()
-            .find(|a| a.is_default)
-            .or(accounts.first())
-            .cloned()
-    }
-
     pub fn add(&self, input: AccountInput) -> Result<Account, String> {
         let input = validate(input)?;
         let mut accounts = self.accounts.lock().unwrap();
@@ -161,11 +150,7 @@ impl AccountStore {
             op_title: input.op_title,
             op_vault: input.op_vault,
             administration: None,
-            is_default: input.is_default || accounts.is_empty(),
         };
-        if account.is_default {
-            accounts.iter_mut().for_each(|a| a.is_default = false);
-        }
         accounts.push(account.clone());
         self.save(&accounts)?;
         Ok(account)
@@ -185,16 +170,8 @@ impl AccountStore {
         account.op_title = input.op_title;
         account.op_vault = input.op_vault;
         let updated = account.clone();
-        if input.is_default {
-            accounts.iter_mut().for_each(|a| a.is_default = a.id == id);
-        }
-        let result = accounts
-            .iter()
-            .find(|a| a.id == id)
-            .cloned()
-            .unwrap_or(updated);
         self.save(&accounts)?;
-        Ok(result)
+        Ok(updated)
     }
 
     pub fn set_administration(&self, id: Uuid, administration: &str) -> Result<(), String> {
@@ -205,15 +182,6 @@ impl AccountStore {
         self.save(&accounts)
     }
 
-    pub fn set_default(&self, id: Uuid) -> Result<(), String> {
-        let mut accounts = self.accounts.lock().unwrap();
-        if !accounts.iter().any(|a| a.id == id) {
-            return Err("Dit account bestaat niet meer".into());
-        }
-        accounts.iter_mut().for_each(|a| a.is_default = a.id == id);
-        self.save(&accounts)
-    }
-
     pub fn remove(&self, id: Uuid) -> Result<Account, String> {
         let mut accounts = self.accounts.lock().unwrap();
         let index = accounts
@@ -221,11 +189,6 @@ impl AccountStore {
             .position(|a| a.id == id)
             .ok_or("Dit account bestaat niet meer")?;
         let removed = accounts.remove(index);
-        if removed.is_default
-            && let Some(first) = accounts.first_mut()
-        {
-            first.is_default = true;
-        }
         self.save(&accounts)?;
         Ok(removed)
     }
@@ -304,7 +267,6 @@ mod tests {
             op_ref: None,
             op_title: None,
             op_vault: None,
-            is_default: false,
         }
     }
 
@@ -313,7 +275,6 @@ mod tests {
         let dir = dir();
         let store = AccountStore::open(&dir).unwrap();
         let added = store.add(system("Atelier Zuid")).unwrap();
-        assert!(added.is_default, "the first account becomes the default");
         let again = AccountStore::open(&dir).unwrap();
         assert_eq!(again.list(), vec![added]);
         let text = fs::read_to_string(dir.join("accounts.json")).unwrap();
@@ -334,7 +295,6 @@ mod tests {
             op_ref: Some("op://Werk".into()),
             op_title: None,
             op_vault: None,
-            is_default: false,
         };
         assert!(store.add(bad_ref).is_err());
         let good_ref = AccountInput {
@@ -344,7 +304,6 @@ mod tests {
             op_ref: Some(" op://Werk/e-Boekhouden Studio Noord ".into()),
             op_title: Some(" e-Boekhouden Studio Noord ".into()),
             op_vault: Some("  ".into()),
-            is_default: false,
         };
         let added = store.add(good_ref).unwrap();
         assert_eq!(
@@ -361,32 +320,14 @@ mod tests {
             op_ref: Some("op://abcvault123/xyzitem456".into()),
             op_title: Some("e-Boekhouden".into()),
             op_vault: Some("Werk".into()),
-            is_default: false,
         };
         assert!(store.add(by_id).is_ok());
-        // Accounts written before these fields existed still load.
+        // Accounts written before these fields existed, and with the default mark of 0.1.12 and older, still load.
         let old: Account = serde_json::from_str(
             r#"{"id":"00000000-0000-0000-0000-000000000001","label":"Oud","username":"","store":"onePassword","opRef":"op://Werk/EB","administration":null,"isDefault":false}"#,
         )
         .unwrap();
         assert_eq!(old.op_title, None);
-    }
-
-    #[test]
-    fn one_default_at_a_time() {
-        let store = AccountStore::open(&dir()).unwrap();
-        let a = store.add(system("A")).unwrap();
-        let mut input = system("B");
-        input.is_default = true;
-        let b = store.add(input).unwrap();
-        assert_eq!(store.default_account().unwrap().id, b.id);
-        store.set_default(a.id).unwrap();
-        assert_eq!(store.list().iter().filter(|x| x.is_default).count(), 1);
-        store.remove(a.id).unwrap();
-        assert!(
-            store.get(b.id).unwrap().is_default,
-            "removing the default hands it on"
-        );
     }
 
     #[test]

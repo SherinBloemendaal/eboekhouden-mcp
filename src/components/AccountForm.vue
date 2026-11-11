@@ -19,7 +19,6 @@ const form = reactive({
   opVault: props.account?.opVault ?? null as string | null,
   username: props.account?.store === 'system' ? props.account.username : '',
   password: '',
-  isDefault: props.account?.isDefault ?? false,
 })
 const error = ref<string | null>(null)
 const busy = ref(false)
@@ -79,7 +78,6 @@ async function save() {
     opRef: form.store === 'onePassword' ? form.opRef : null,
     opTitle: form.store === 'onePassword' ? form.opTitle : null,
     opVault: form.store === 'onePassword' ? form.opVault : null,
-    isDefault: form.isDefault,
   }
   try {
     const password = form.store === 'system' && form.password ? form.password : null
@@ -171,10 +169,6 @@ async function save() {
           </div>
         </div>
       </Transition>
-      <label class="check">
-        <input v-model="form.isDefault" type="checkbox" />
-        <span>Standaardaccount voor AI-clients</span>
-      </label>
       <p v-if="!editing" class="hint">Bij Opslaan logt EB MCP op de achtergrond één keer in, om de gegevens te controleren en de administratienaam op te halen.</p>
       <p v-if="error" class="note bad rise" role="alert">{{ error }}</p>
     </form>
@@ -230,8 +224,6 @@ async function save() {
 .swap-op-leave-to { opacity: 0; }
 @media (prefers-reduced-motion: reduce) { .swap-op-enter-from { transform: none; } }
 .with-button { display: flex; gap: 6px; align-items: center; }
-.check { display: flex; align-items: center; gap: 8px; }
-.check input { accent-color: var(--accent); width: 14px; height: 14px; margin: 0; }
 .note { padding: 9px 11px; border-radius: 10px; font-size: 12px; line-height: 16px; }
 .note.warn { background: var(--warn-soft); color: var(--warn); }
 .note.bad { background: var(--danger-soft); color: var(--danger); }

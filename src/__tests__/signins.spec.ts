@@ -19,7 +19,7 @@ afterAll(() => {
 function account(id: string, signingIn: boolean): AccountView {
   return {
     id, label: id, username: `${id}@example.test`, store: 'system', opRef: null, opTitle: null, opVault: null,
-    administration: null, isDefault: false, session: null, signingIn,
+    administration: null, session: null, signingIn,
   }
 }
 const event = (accountId: string, step: SigninEvent['step'], message: string | null = null): SigninEvent => ({ accountId, step, message })
@@ -70,7 +70,7 @@ describe('sign-ins started in this window', () => {
 
   it('marks an account it added, since the app signs that one in by itself', async () => {
     invoke.mockImplementation(async (command: string) => (command === 'account_add' ? account('new', true) : []))
-    await addAccount({ label: 'new', username: 'n', store: 'system', opRef: null, opTitle: null, opVault: null, isDefault: false }, 'geheim')
+    await addAccount({ label: 'new', username: 'n', store: 'system', opRef: null, opTitle: null, opVault: null }, 'geheim')
     expect(startedHere('new')).toBe(true)
     receiveSignin(event('new', 'done'))
     expect(store.signins.new?.step).toBe('done')

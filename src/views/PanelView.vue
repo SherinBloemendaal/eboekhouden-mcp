@@ -139,13 +139,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
         <div class="account-row">
           <Avatar :label="account.label" :size="30" :muted="!account.session || account.session.expired" />
           <span class="stack">
-            <span class="title">{{ account.label }}<span v-if="account.isDefault" class="chip">Standaard</span></span>
+            <span class="title">{{ account.label }}</span>
             <span class="sub" :class="{ bad: account.session?.expired }">{{ line(account) }}</span>
             <span v-if="sessionLine(account)" class="sub">{{ sessionLine(account) }}</span>
           </span>
           <button v-if="busy(account)" type="button" class="btn small ghost" @click="cancelSignIn(account.id)">Annuleren</button>
           <button v-else-if="account.session && !account.session.expired" type="button" class="btn small" @click="signOut(account.id)">Uitloggen</button>
-          <button v-else type="button" class="btn small" :class="{ primary: account.session?.expired || account.isDefault }" @click="signIn(account.id)">
+          <button v-else type="button" class="btn small" :class="{ primary: account.session?.expired }" @click="signIn(account.id)">
             {{ account.session?.expired ? 'Opnieuw inloggen' : 'Inloggen' }}
           </button>
         </div>
@@ -220,7 +220,6 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 .account-row { display: flex; align-items: center; gap: 10px; padding: 6px 8px; }
 .stack { display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 0; }
 .title { display: flex; align-items: center; gap: 6px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.chip { height: 16px; display: inline-flex; align-items: center; padding: 0 6px; border-radius: 999px; background: var(--info-soft); color: var(--info); font-size: 10px; font-weight: 500; }
 .sub { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sub.bad { color: var(--danger); }
 .inline { padding: 0 10px 10px 48px; display: flex; flex-direction: column; gap: 6px; }

@@ -22,7 +22,6 @@ export interface AccountView {
   opTitle: string | null
   opVault: string | null
   administration: string | null
-  isDefault: boolean
   session: SessionView | null
   signingIn: boolean
 }
@@ -34,7 +33,6 @@ export interface AccountInput {
   opRef: string | null
   opTitle: string | null
   opVault: string | null
-  isDefault: boolean
 }
 
 /** A Login item in 1Password, as `op item list` gives it. Never carries a password. */
@@ -181,7 +179,6 @@ export const addAccount = (input: AccountInput, password: string | null) =>
 export const updateAccount = (id: string, input: AccountInput, password: string | null) =>
   invoke<AccountView>('account_update', { id, input, password }).finally(refresh)
 export const removeAccount = (id: string) => invoke('account_remove', { id }).finally(refresh)
-export const setDefault = (id: string) => invoke('account_set_default', { id }).finally(refresh)
 export const signIn = (id: string) => {
   delete store.signins[id]
   markStarted(id)

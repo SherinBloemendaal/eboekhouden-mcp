@@ -162,7 +162,7 @@ pub struct RelatiesArgs {
     pub limit: Option<u32>,
     /// Vanaf welke rij (standaard 0).
     pub offset: Option<u32>,
-    /// Naam van het account in EB MCP. Leeg: het standaardaccount.
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
 
@@ -170,7 +170,7 @@ pub struct RelatiesArgs {
 pub struct IdArgs {
     /// Het id uit een lijst van e-Boekhouden.
     pub id: u64,
-    /// Naam van het account in EB MCP. Leeg: het standaardaccount.
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
 
@@ -190,7 +190,7 @@ pub struct MutatiesArgs {
     pub limit: Option<u32>,
     /// Vanaf welke rij (standaard 0).
     pub offset: Option<u32>,
-    /// Naam van het account in EB MCP. Leeg: het standaardaccount.
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
 
@@ -213,7 +213,7 @@ pub struct OpenPostenArgs {
     pub limit: Option<u32>,
     /// Vanaf welke rij (standaard 0).
     pub offset: Option<u32>,
-    /// Naam van het account in EB MCP. Leeg: het standaardaccount.
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
 
@@ -223,7 +223,7 @@ pub struct ListArgs {
     pub limit: Option<u32>,
     /// Vanaf welke rij (standaard 0).
     pub offset: Option<u32>,
-    /// Naam van het account in EB MCP. Leeg: het standaardaccount.
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
 
@@ -231,7 +231,7 @@ pub struct ListArgs {
 pub struct BalansArgs {
     /// Stand per datum, JJJJ-MM-DD (standaard vandaag).
     pub datum: Option<String>,
-    /// Naam van het account in EB MCP. Leeg: het standaardaccount.
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
 
@@ -241,7 +241,7 @@ pub struct PeriodeArgs {
     pub van: Option<String>,
     /// Einde van de periode, JJJJ-MM-DD (standaard vandaag).
     pub tot: Option<String>,
-    /// Naam van het account in EB MCP. Leeg: het standaardaccount.
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
 
@@ -261,7 +261,7 @@ pub struct BtwArgs {
     pub periode_type: Option<PeriodeType>,
     /// Nummer van de maand (1 tot 12) of het kwartaal (1 tot 4). Niet nodig bij jaar.
     pub periode: Option<u32>,
-    /// Naam van het account in EB MCP. Leeg: het standaardaccount.
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
 
@@ -277,7 +277,7 @@ pub struct UrenArgs {
     pub activiteit_id: Option<u64>,
     /// Aantal rijen, 1 tot 200 (standaard 50).
     pub limit: Option<u32>,
-    /// Naam van het account in EB MCP. Leeg: het standaardaccount.
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
 
@@ -287,7 +287,7 @@ pub struct ArchiefArgs {
     pub map_id: Option<u64>,
     /// Aantal bestanden, 1 tot 200 (standaard 50).
     pub limit: Option<u32>,
-    /// Naam van het account in EB MCP. Leeg: het standaardaccount.
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
 
@@ -297,7 +297,7 @@ pub struct GetArgs {
     pub pad: String,
     /// Queryparameters als sleutel en waarde.
     pub query: Option<std::collections::BTreeMap<String, String>>,
-    /// Naam van het account in EB MCP. Leeg: het standaardaccount.
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
 
@@ -331,6 +331,40 @@ fn client_name(context: &RequestContext<RoleServer>) -> String {
         .unwrap_or_else(|| "Onbekende client".into())
 }
 
+/// The account a tool call is about. There is no default account: with several accounts a call must name
+/// its own, so an AI client never answers from the wrong books. A single account needs no name.
+fn pick_account(mut accounts: Vec<Account>, name: Option<&str>) -> Result<Account, String> {
+    let labels = || {
+        accounts
+            .iter()
+            .map(|a| a.label.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => accounts
+            .iter()
+            .find(|a| a.label.eq_ignore_ascii_case(name) || a.id.to_string() == name)
+            .cloned()
+            .ok_or_else(|| match accounts.len() {
+                0 => {
+                    "Er staat nog geen account in EB MCP. Voeg er een toe via Accounts.".to_owned()
+                }
+                _ => format!("Geen account {name:?} in EB MCP. Kies uit: {}.", labels()),
+            }),
+        None => match accounts.len() {
+            0 => {
+                Err("Er staat nog geen account in EB MCP. Voeg er een toe via Accounts.".to_owned())
+            }
+            1 => Ok(accounts.remove(0)),
+            count => Err(format!(
+                "Er staan {count} accounts in EB MCP. Geef met de parameter account aan welke je bedoelt: {}.",
+                labels()
+            )),
+        },
+    }
+}
+
 impl EbMcp {
     /// Logs the call and finds the account; a refusal is logged and returned as the tool's answer.
     fn begin(
@@ -353,31 +387,16 @@ impl EbMcp {
             let _ = self.state.events.send(AppEvent::LogChanged);
             return Err(CallToolResult::error(vec![ContentBlock::text(message)]));
         }
-        let found = match account.map(str::trim).filter(|a| !a.is_empty()) {
-            Some(name) => self
-                .state
-                .accounts
-                .list()
-                .into_iter()
-                .find(|a| a.label.eq_ignore_ascii_case(name) || a.id.to_string() == name),
-            None => self.state.accounts.default_account(),
-        };
-        let Some(account) = found else {
-            let message = match account {
-                Some(name) => format!(
-                    "Geen account {name:?} in EB MCP. Kies uit: {}.",
-                    self.labels()
-                ),
-                None => {
-                    "Er staat nog geen account in EB MCP. Voeg er een toe via Accounts.".to_owned()
-                }
-            };
-            let id = self.state.log.start_mcp(&client, tool, args, None);
-            self.state
-                .log
-                .finish_mcp(id, Outcome::Error, None, Some(message.clone()));
-            let _ = self.state.events.send(AppEvent::LogChanged);
-            return Err(CallToolResult::error(vec![ContentBlock::text(message)]));
+        let account = match pick_account(self.state.accounts.list(), account) {
+            Ok(account) => account,
+            Err(message) => {
+                let id = self.state.log.start_mcp(&client, tool, args, None);
+                self.state
+                    .log
+                    .finish_mcp(id, Outcome::Error, None, Some(message.clone()));
+                let _ = self.state.events.send(AppEvent::LogChanged);
+                return Err(CallToolResult::error(vec![ContentBlock::text(message)]));
+            }
         };
         let id = self
             .state
@@ -389,21 +408,6 @@ impl EbMcp {
             client,
             account,
         })
-    }
-
-    fn labels(&self) -> String {
-        let labels: Vec<String> = self
-            .state
-            .accounts
-            .list()
-            .into_iter()
-            .map(|a| a.label)
-            .collect();
-        if labels.is_empty() {
-            "geen".into()
-        } else {
-            labels.join(", ")
-        }
     }
 
     async fn fetch(
@@ -491,7 +495,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Welke e-Boekhouden-accounts er in EB MCP staan, welke is ingelogd en welke de standaard is. Gebruik dit eerst als een andere tool zegt dat er niemand is ingelogd.",
+        description = "Welke e-Boekhouden-accounts er in EB MCP staan en welke is ingelogd. Gebruik dit eerst als er meer dan één account kan zijn, of als een andere tool zegt dat er niemand is ingelogd.",
         annotations(title = "Status", read_only_hint = true, open_world_hint = false)
     )]
     async fn status(&self) -> Result<CallToolResult, McpError> {
@@ -506,7 +510,6 @@ impl EbMcp {
                 json!({
                     "account": a.label,
                     "administratie": a.administration,
-                    "standaard": a.is_default,
                     "ingelogd": session.is_some_and(|s| !s.expired),
                     "verlopen": session.is_some_and(|s| s.expired),
                 })
@@ -923,7 +926,7 @@ impl ServerHandler for EbMcp {
             .with_server_info(server_info())
             .with_instructions(
                 "Leest de boekhouding in e-Boekhouden van de accounts die in EB MCP zijn ingelogd. Alleen lezen: niets boeken, opslaan of verwijderen. \
-                 Zonder account-parameter gebruikt elke tool het standaardaccount; status zegt welke accounts er zijn.",
+                 Staat er meer dan één account in EB MCP, dan moet elke tool de account-parameter meekrijgen; status zegt welke accounts er zijn.",
             )
     }
 }
@@ -943,6 +946,61 @@ mod tests {
             "{}",
             &icon.src[..40]
         );
+    }
+
+    fn account(label: &str) -> Account {
+        Account {
+            id: uuid::Uuid::new_v4(),
+            label: label.into(),
+            username: "lisa@atelierzuid.example".into(),
+            store: crate::accounts::Store::System,
+            op_ref: None,
+            op_title: None,
+            op_vault: None,
+            administration: None,
+        }
+    }
+
+    #[test]
+    fn a_single_account_needs_no_name() {
+        let only = account("Atelier Zuid");
+        assert_eq!(pick_account(vec![only.clone()], None), Ok(only.clone()));
+        assert_eq!(
+            pick_account(vec![only.clone()], Some("  ")),
+            Ok(only.clone())
+        );
+        assert_eq!(
+            pick_account(vec![only.clone()], Some("atelier zuid")),
+            Ok(only)
+        );
+    }
+
+    #[test]
+    fn several_accounts_must_be_named() {
+        let (a, b) = (account("Atelier Zuid"), account("Studio Noord"));
+        let both = vec![a.clone(), b.clone()];
+        let unnamed = pick_account(both.clone(), None).unwrap_err();
+        assert!(unnamed.contains("2 accounts"), "{unnamed}");
+        assert!(
+            unnamed.contains("parameter account") && unnamed.contains("Atelier Zuid, Studio Noord"),
+            "{unnamed}"
+        );
+        assert_eq!(pick_account(both.clone(), Some(" ")).unwrap_err(), unnamed);
+        assert_eq!(pick_account(both.clone(), Some("Studio Noord")), Ok(b));
+        assert_eq!(pick_account(both.clone(), Some(&a.id.to_string())), Ok(a));
+        let wrong = pick_account(both, Some("Werkplaats Oost")).unwrap_err();
+        assert!(
+            wrong.contains("\"Werkplaats Oost\"") && wrong.contains("Atelier Zuid, Studio Noord"),
+            "{wrong}"
+        );
+    }
+
+    #[test]
+    fn says_so_when_there_is_no_account_yet() {
+        for name in [None, Some("Atelier Zuid")] {
+            let message = pick_account(Vec::new(), name).unwrap_err();
+            assert!(message.contains("nog geen account"), "{message}");
+        }
     }
 
     #[test]
