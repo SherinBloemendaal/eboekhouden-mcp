@@ -16,7 +16,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use url::Url;
 
-use crate::ebapi::{auth_token, cookie_header};
+use crate::ebapi::{auth_token, cookie_header, with_set_cookies};
 
 /// SignalR's record separator.
 const RS: char = '\u{1e}';
@@ -116,6 +116,9 @@ pub async fn invoke(
         300..=399 | 401 => return Err("Niet (meer) ingelogd bij e-Boekhouden".into()),
         status => return Err(format!("e-Boekhouden gaf een fout ({status})")),
     }
+    // The connection lives on the server that answered the negotiate; the load balancer names it in a cookie.
+    // Without that cookie the WebSocket can land on another server, which answers 404 (seen live, 0.3.1).
+    let cookies = with_set_cookies(cookies, answer.headers());
     let negotiated: Value = answer
         .json()
         .await
@@ -128,7 +131,14 @@ pub async fn invoke(
     let mut socket_url = address.clone();
     socket_url.query_pairs_mut().append_pair("id", token);
     let key = base64::engine::general_purpose::STANDARD.encode(rand::random::<[u8; 16]>());
-    let upgrade = signed(http.get(socket_url))
+    let upgrade = http
+        .get(socket_url)
+        .header(reqwest::header::COOKIE, cookie_header(&cookies));
+    let upgrade = match auth_token(&cookies) {
+        Some(token) => upgrade.bearer_auth(token),
+        None => upgrade,
+    };
+    let upgrade = upgrade
         .header(reqwest::header::CONNECTION, "Upgrade")
         .header(reqwest::header::UPGRADE, "websocket")
         .header("Sec-WebSocket-Version", "13")
@@ -296,7 +306,11 @@ mod tests {
                     if headers.get("content-length").and_then(|v| v.to_str().ok()) != Some("0") {
                         return axum::http::StatusCode::LENGTH_REQUIRED.into_response();
                     }
-                    axum::Json(json!({"negotiateVersion": 1, "connectionToken": "tok en/1"}))
+                    // As the load balancer: the server that holds the connection is named in a cookie.
+                    (
+                        [(axum::http::header::SET_COOKIE, "SRVRID=s7; path=/")],
+                        axum::Json(json!({"negotiateVersion": 1, "connectionToken": "tok en/1"})),
+                    )
                         .into_response()
                 }),
             )
@@ -311,10 +325,16 @@ mod tests {
                             Some("id=tok+en%2F1"),
                             "the token goes in the query, encoded"
                         );
-                        let signed_in = headers
+                        let cookie = headers
                             .get("cookie")
                             .and_then(|v| v.to_str().ok())
-                            .is_some_and(|c| c.contains("auth-token=jwt"));
+                            .unwrap_or_default()
+                            .to_owned();
+                        // Another server does not know the connection.
+                        if !cookie.contains("SRVRID=s7") {
+                            return axum::http::StatusCode::NOT_FOUND.into_response();
+                        }
+                        let signed_in = cookie.contains("auth-token=jwt");
                         upgrade.on_upgrade(move |socket| serve(socket, signed_in))
                     },
                 ),

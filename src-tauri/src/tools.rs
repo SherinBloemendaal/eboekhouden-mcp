@@ -182,14 +182,13 @@ fn named_rows(mut grid: Value) -> Value {
         .get("colMetadata")
         .and_then(Value::as_array)
         .map(|columns| {
+            // A row's values come in the order of the columns. The `index` and `readerIndex` a column carries are
+            // not always filled in (the KvK list has 0 for every column), so the position decides.
             columns
                 .iter()
-                .filter_map(|column| {
-                    let index = column
-                        .get("readerIndex")
-                        .or(column.get("index"))?
-                        .as_u64()?;
-                    Some((index as usize, column.get("name")?.as_str()?.to_owned()))
+                .enumerate()
+                .filter_map(|(position, column)| {
+                    Some((position, column.get("name")?.as_str()?.to_owned()))
                 })
                 .collect()
         });
@@ -4159,6 +4158,15 @@ mod tests {
         assert_eq!(named["rowCount"], 2);
         assert!(named.get("colMetadata").is_none());
         assert_eq!(crate::ebapi::count_rows(&named), Some(2));
+        // Columns that all claim index 0, as the KvK list sends them, still get their own value.
+        let kvk = json!({
+            "colMetadata": [{"name": "nr", "index": 0, "readerIndex": 0}, {"name": "bedrijf", "index": 0, "readerIndex": 0}, {"name": "plaats", "index": 0, "readerIndex": 0}],
+            "data": [["85504289", "Vitrion", "Groningen"]]
+        });
+        assert_eq!(
+            named_rows(kvk)["data"],
+            json!([{"nr": "85504289", "bedrijf": "Vitrion", "plaats": "Groningen"}])
+        );
         // Another shape is left alone.
         let other = json!({"data": [{"id": 1}], "colMetadata": [{"name": "id", "readerIndex": 0}]});
         assert_eq!(named_rows(other.clone()), other);

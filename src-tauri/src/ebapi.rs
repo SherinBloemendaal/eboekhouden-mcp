@@ -62,6 +62,8 @@ pub struct EbClient {
     editor: Url,
     http: reqwest::Client,
     limiter: Limiter,
+    /// Cookies the template editor set for an open session (its sticky server among them), by session hash.
+    editor_cookies: std::sync::Mutex<std::collections::HashMap<String, Vec<(String, String)>>>,
 }
 
 impl EbClient {
@@ -90,6 +92,7 @@ impl EbClient {
             editor: Url::parse(editor).expect("editor base"),
             http,
             limiter: Limiter::new(),
+            editor_cookies: Default::default(),
         }
     }
 
@@ -154,6 +157,7 @@ impl EbClient {
             Err(_) => call.error = Some("Geen verbinding met e-Boekhouden".into()),
             Ok(response) => {
                 call.status = response.status().as_u16();
+                let mut session = with_set_cookies(cookies, response.headers());
                 let target = response
                     .headers()
                     .get(reqwest::header::LOCATION)
@@ -167,6 +171,23 @@ impl EbClient {
                             !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric())
                         })
                 });
+                if let (Some(hash), Some(page)) = (&hash, target) {
+                    // The browser lands on the editor's page first, and that page's answer names the server that
+                    // holds the session. Without that cookie the editor's API answers 500 (seen live, 0.3.1).
+                    if let Ok(landed) = self
+                        .http
+                        .get(page)
+                        .header(reqwest::header::COOKIE, cookie_header(&session))
+                        .send()
+                        .await
+                    {
+                        session = with_set_cookies(&session, landed.headers());
+                    }
+                    self.editor_cookies
+                        .lock()
+                        .unwrap()
+                        .insert(hash.clone(), session);
+                }
                 call.error = match (call.status, &hash) {
                     (300..=399, Some(_)) => None,
                     // A redirect anywhere else is the login page.
@@ -218,6 +239,17 @@ impl EbClient {
         } else {
             reqwest::Method::GET
         };
+        // The session's own cookies, as collected when it was opened; they end with the session.
+        let hash = path.rsplit('/').next().unwrap_or_default();
+        let session = {
+            let mut known = self.editor_cookies.lock().unwrap();
+            if path.contains("session/end/") {
+                known.remove(hash)
+            } else {
+                known.get(hash).cloned()
+            }
+        };
+        let cookies = session.as_deref().unwrap_or(cookies);
         let mut request = self
             .http
             .request(verb, url)
@@ -748,6 +780,23 @@ impl EbClient {
         }
         Ok(url)
     }
+}
+
+/// `cookies` with what a response set on top (`Set-Cookie`), a later value replacing an earlier one. e-Boekhouden
+/// sits behind a load balancer that names the server in a cookie; a conversation that must stay on one server
+/// (the template editor's session, a hub connection) has to send that cookie back.
+pub fn with_set_cookies(
+    cookies: &[(String, String)],
+    headers: &reqwest::header::HeaderMap,
+) -> Vec<(String, String)> {
+    let mut all = cookies.to_vec();
+    for header in headers.get_all(reqwest::header::SET_COOKIE) {
+        if let Some(set) = header.to_str().ok().and_then(parse_set_cookie) {
+            all.retain(|(name, _)| *name != set.name);
+            all.push((set.name, set.value));
+        }
+    }
+    all
 }
 
 /// Takes the editor's session keys out of what it answers: they are the keys to an open session and have no
@@ -1460,6 +1509,35 @@ mod tests {
             "asking for the code is no error"
         );
         assert!(code.notes.join(" ").contains("txtCode"), "{:?}", code.notes);
+    }
+
+    #[test]
+    fn sends_back_the_cookies_a_server_set_along_the_way() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append(
+            reqwest::header::SET_COOKIE,
+            "SRVRID=s7; path=/".parse().unwrap(),
+        );
+        headers.append(
+            reqwest::header::SET_COOKIE,
+            "EBSRV=b2; path=/; HttpOnly".parse().unwrap(),
+        );
+        let base = vec![
+            ("auth-token".to_owned(), "jwt".to_owned()),
+            ("SRVRID".to_owned(), "s1".to_owned()),
+        ];
+        assert_eq!(
+            with_set_cookies(&base, &headers),
+            vec![
+                ("auth-token".to_owned(), "jwt".to_owned()),
+                ("SRVRID".to_owned(), "s7".to_owned()),
+                ("EBSRV".to_owned(), "b2".to_owned())
+            ]
+        );
+        assert_eq!(
+            with_set_cookies(&base, &reqwest::header::HeaderMap::new()),
+            base
+        );
     }
 
     #[test]
