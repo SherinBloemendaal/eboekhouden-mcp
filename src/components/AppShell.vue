@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Alert from './Alert.vue'
+import ApprovalSheet from './ApprovalSheet.vue'
 import { hostPort, inApp, modKey, quitApp, server, startupNotice, watchServer } from '../lib/server'
 import Icon from './Icon.vue'
 import UpdateUi from './UpdateUi.vue'
@@ -123,6 +124,7 @@ onBeforeUnmount(() => {
       </template>
     </Alert>
   </Transition>
+  <ApprovalSheet />
 </template>
 
 <style scoped>

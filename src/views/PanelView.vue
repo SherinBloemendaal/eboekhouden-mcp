@@ -162,6 +162,16 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
     </div>
     <p v-if="!active.length && store.accounts.length" class="hint">AI-clients horen nu dat ze eerst moeten wachten tot je inlogt.</p>
 
+    <Transition name="accordion">
+      <div v-if="store.approvals.length" class="accordion">
+        <div>
+          <button type="button" class="item waiting" @click="openMain()">
+            <Icon name="alert" :size="15" class="item-icon" />
+            <span>{{ store.approvals.length === 1 ? '1 wijziging wacht op je akkoord' : `${store.approvals.length} wijzigingen wachten op je akkoord` }}</span>
+          </button>
+        </div>
+      </div>
+    </Transition>
     <div class="sep" />
     <button v-for="item in items" :key="item.route" type="button" class="item" @click="openMain(item.route)">
       <Icon :name="item.icon" :size="15" class="item-icon" />
@@ -232,6 +242,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 .item:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.42); }
 .item > .item-icon + span { flex: 1; }
 .item-icon { color: var(--label); }
+.item.waiting, .item.waiting .item-icon { color: var(--accent); font-weight: 500; }
 .swap.item-icon > * { align-self: center; justify-self: center; }
 .spinner { box-sizing: border-box; width: 12px; height: 12px; border-radius: 50%; border: 1.5px solid var(--line); border-top-color: var(--label); }
 .item[aria-busy='true'] .spinner { animation: spin 800ms linear infinite; }

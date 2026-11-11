@@ -64,7 +64,7 @@ describe('views', () => {
 function account(over: Partial<AccountView>): AccountView {
   return {
     id: 'a1', label: 'Studio Noord', username: 'jan@studionoord.example', store: 'system', opRef: null, opTitle: null, opVault: null,
-    administration: 'Studio Noord B.V.', session: null, signingIn: false, signin: null, ...over,
+    administration: 'Studio Noord B.V.', write: 'off', session: null, signingIn: false, signin: null, ...over,
   }
 }
 

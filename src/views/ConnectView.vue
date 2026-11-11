@@ -7,6 +7,7 @@ import Sheet from '../components/Sheet.vue'
 import ClientIcon from '../components/ClientIcon.vue'
 import { CLIENT_NAMES, SERVER_NAMES, usesBridge, clientsStatus, link, otherClientSettings, preview, renewToken, revealToken, unlink, type Client, type ClientStatus, type Preview } from '../lib/connect'
 import { masked, serverInfo, type ServerInfo } from '../lib/server'
+import { connect as watchAccounts, store } from '../lib/accounts'
 
 const info = ref<ServerInfo | null>(null)
 const clients = ref<ClientStatus[]>([])
@@ -27,6 +28,10 @@ async function load() {
   clients.value = await clientsStatus()
 }
 onMounted(load)
+
+// Whether any account lets AI clients change its books: the page says so next to the other safeguards.
+onMounted(() => void watchAccounts())
+const writes = computed(() => store.accounts.some((a) => a.write !== 'off'))
 
 function flash(what: string) {
   copied.value = what
@@ -135,7 +140,7 @@ function stateText(c: ClientStatus): string {
         </dd>
       </dl>
       <div class="chips">
-        <span class="chip">Alleen 127.0.0.1</span><span class="chip">Websites geweigerd (Origin)</span><span class="chip">Alleen lezen</span><span v-if="info" class="chip mcp rise">{{ info.toolCount }} {{ info.toolCount === 1 ? 'tool' : 'tools' }}</span>
+        <span class="chip">Alleen 127.0.0.1</span><span class="chip">Websites geweigerd (Origin)</span><span class="chip">{{ writes ? 'Boeken alleen waar jij het aanzet' : 'Alleen lezen' }}</span><span v-if="info" class="chip mcp rise">{{ info.toolCount }} {{ info.toolCount === 1 ? 'tool' : 'tools' }}</span>
       </div>
     </section>
 
@@ -200,7 +205,7 @@ function stateText(c: ClientStatus): string {
         <li v-if="confirming.legacy">Een koppeling onder de oude naam eb-mcp maakt plaats voor {{ SERVER_NAMES[confirming.client] }}.</li>
         <li v-if="confirming.client === 'claude'">Claude Desktop start EB MCP via een kleine brug in de app, omdat Claude alleen lokale stdio-servers start.</li>
         <li v-if="confirming.client === 'codex'">Codex start EB MCP via een kleine brug in de app; je andere Codex-instellingen en opmerkingen blijven staan.</li>
-        <li v-if="usesBridge(confirming.client)">Het token staat niet in dit bestand: de brug leest het uit je sleutelhanger.</li>
+        <li v-if="usesBridge(confirming.client)">Het token staat niet in dit bestand: de brug leest het uit een bestand van EB MCP dat alleen jij kunt lezen.</li>
         <li>{{ ({ claude: 'Start Claude daarna opnieuw; Claude leest het bestand alleen bij de start.', claudeCode: 'Start een nieuwe Claude Code-sessie; lopende sessies zien de server pas na een herstart.', cursor: 'Cursor pakt de wijziging meestal zelf op.', codex: 'Start Codex daarna opnieuw; Codex leest config.toml alleen bij de start.' } as const)[confirming.client] }}</li>
       </ul>
       <template #footer>

@@ -8,7 +8,7 @@ import Icon from '../components/Icon.vue'
 import Sheet from '../components/Sheet.vue'
 import SigninSteps from '../components/SigninSteps.vue'
 import {
-  cancelSignIn, connect, dismissSignin, getSettings, isRunning, opLabel, removeAccount, sessionAge, signIn, signingIn, signOut, store,
+  cancelSignIn, connect, dismissSignin, getSettings, isRunning, opLabel, removeAccount, sessionAge, signIn, signingIn, signOut, store, WRITE_MODES,
   type AccountView,
 } from '../lib/accounts'
 import { unlockName } from '../lib/server'
@@ -29,6 +29,11 @@ onMounted(async () => {
   idleMinutes.value = (await getSettings()).idleMinutes
 })
 onBeforeUnmount(() => clearInterval(tick))
+
+/** The account's write setting in words, for the chip's tooltip. */
+function writeLabel(account: AccountView): string {
+  return WRITE_MODES.find((m) => m.value === account.write)?.hint ?? ''
+}
 
 const idleText = computed(() => (idleMinutes.value === 60 ? '1 uur' : idleMinutes.value === 240 ? '4 uur' : `${idleMinutes.value} minuten`))
 
@@ -106,7 +111,7 @@ function sessionText(account: AccountView): { tone: string; text: string } {
         <span class="who">
           <Avatar :label="account.label" :muted="!account.session" />
           <span class="stack">
-            <span class="name"><span class="name-text" :title="account.label">{{ account.label }}</span></span>
+            <span class="name"><span class="name-text" :title="account.label">{{ account.label }}</span><span v-if="account.write !== 'off'" class="chip" :class="account.write === 'auto' ? 'warn' : 'info'" :title="writeLabel(account)">{{ account.write === 'auto' ? 'Boekt zelf' : 'Boekt met akkoord' }}</span></span>
             <span class="sub" :title="account.store === 'onePassword' ? account.username || opLabel(account) : account.username">{{ account.store === 'onePassword' ? account.username || opLabel(account) : account.username }}</span>
           </span>
         </span>
@@ -204,6 +209,8 @@ function sessionText(account: AccountView): { tone: string; text: string } {
 .muted { color: var(--muted); }
 .chip { align-self: flex-start; height: 18px; display: inline-flex; align-items: center; padding: 0 7px; border-radius: 999px; background: var(--subtle); color: var(--label); font-size: 11px; font-weight: 500; }
 .chip.info { background: var(--info-soft); color: var(--info); }
+.chip.warn { background: var(--danger-soft); color: var(--danger); }
+.name .chip { flex: none; }
 .session { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 12px; color: var(--muted); }
 .session .dot { flex: none; }
 /* A narrow column wraps the status to a second line rather than cutting it. */

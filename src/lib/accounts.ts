@@ -22,6 +22,8 @@ export interface AccountView {
   opTitle: string | null
   opVault: string | null
   administration: string | null
+  /** Whether AI clients may change this account's books: not at all, each change with approval, or freely. */
+  write: WriteMode
   session: SessionView | null
   signingIn: boolean
   /** The newest step of this account's latest sign-in since EB MCP started, its end state included. */
@@ -35,6 +37,7 @@ export interface AccountInput {
   opRef: string | null
   opTitle: string | null
   opVault: string | null
+  write: WriteMode
 }
 
 /** A Login item in 1Password, as `op item list` gives it. Never carries a password. */
@@ -80,6 +83,29 @@ export interface SigninEvent {
 
 export type Appearance = 'system' | 'light' | 'dark'
 
+export type WriteMode = 'off' | 'ask' | 'auto'
+
+/** How the app names an account's write setting. */
+export const WRITE_MODES: { value: WriteMode; label: string; hint: string }[] = [
+  { value: 'off', label: 'Alleen lezen', hint: 'AI-clients kunnen in dit account niets wijzigen.' },
+  { value: 'ask', label: 'Boeken met akkoord', hint: 'Elke wijziging komt eerst bij jou in EB MCP; pas na Goedkeuren gaat hij naar e-Boekhouden.' },
+  { value: 'auto', label: 'Boeken zonder akkoord', hint: 'AI-clients boeken en wijzigen direct. Verwijderen, crediteren en abonnementen factureren vragen nog wel je akkoord.' },
+]
+
+/** A change an AI client asked for that waits for the user's approval (approvals.rs). */
+export interface Proposal {
+  id: number
+  accountId: string
+  account: string
+  client: string
+  tool: string
+  title: string
+  lines: { label: string; value: string }[]
+  /** Cannot be undone: asked even for an account that needs no approval otherwise. */
+  danger: boolean
+  askedAt: number
+}
+
 export interface Settings {
   idleMinutes: number
   appearance: Appearance
@@ -93,6 +119,8 @@ export const store = reactive({
   loaded: false,
   /** The latest step per account while signing in, and the end state until the user closes it. */
   signins: {} as Record<string, SigninEvent>,
+  /** Changes that wait for the user's approval, oldest first. */
+  approvals: [] as Proposal[],
 })
 
 let refreshSeq = 0
@@ -162,11 +190,25 @@ export function receiveSignin(event: SigninEvent): void {
 let listening = false
 
 /** Starts listening once per window; later calls only refresh. */
+/** Reloads the changes that wait for approval. Apart from `refresh`: they change on their own events. */
+export async function refreshApprovals(): Promise<void> {
+  const list = inApp() ? await invoke<Proposal[]>('approvals_list') : []
+  store.approvals = Array.isArray(list) ? list : []
+}
+
+/** The user's answer to a waiting change. Only `approve` lets it go to e-Boekhouden. */
+export const decideApproval = (id: number, approve: boolean) =>
+  invoke('approval_decide', { id, approve }).finally(refreshApprovals)
+
 export async function connect(): Promise<void> {
   await refresh()
+  await refreshApprovals()
   if (listening || !inApp()) return
   listening = true
-  await listen('state', () => void refresh())
+  await listen<{ type: string }>('state', (event) => {
+    void refresh()
+    if (event.payload?.type === 'approvalsChanged') void refreshApprovals()
+  })
   await listen<SigninEvent>('signin', (event) => {
     receiveSignin(event.payload)
     void refresh()

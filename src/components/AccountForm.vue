@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Add or edit an account. Passwords go straight to the system store; the app keeps none.
 import { computed, reactive, ref } from 'vue'
-import { addAccount, updateAccount, type AccountView, type OpItem, type StoreKind } from '../lib/accounts'
+import { addAccount, updateAccount, WRITE_MODES, type AccountView, type OpItem, type StoreKind, type WriteMode } from '../lib/accounts'
 import { unlockName } from '../lib/server'
 import Icon from './Icon.vue'
 import OpItemPicker from './OpItemPicker.vue'
@@ -19,7 +19,9 @@ const form = reactive({
   opVault: props.account?.opVault ?? null as string | null,
   username: props.account?.store === 'system' ? props.account.username : '',
   password: '',
+  write: (props.account?.write ?? 'off') as WriteMode,
 })
+const writeHint = computed(() => WRITE_MODES.find((m) => m.value === form.write)?.hint ?? '')
 const error = ref<string | null>(null)
 const busy = ref(false)
 const showPassword = ref(false)
@@ -78,6 +80,7 @@ async function save() {
     opRef: form.store === 'onePassword' ? form.opRef : null,
     opTitle: form.store === 'onePassword' ? form.opTitle : null,
     opVault: form.store === 'onePassword' ? form.opVault : null,
+    write: form.write,
   }
   try {
     const password = form.store === 'system' && form.password ? form.password : null
@@ -169,6 +172,13 @@ async function save() {
           </div>
         </div>
       </Transition>
+      <div class="field-block" role="radiogroup" aria-label="AI-clients mogen in dit account">
+        <span class="label">AI-clients mogen in dit account</span>
+        <div class="seg">
+          <button v-for="mode in WRITE_MODES" :key="mode.value" type="button" role="radio" :aria-checked="form.write === mode.value" :class="{ on: form.write === mode.value }" @click="form.write = mode.value">{{ mode.label }}</button>
+        </div>
+        <span class="hint">{{ writeHint }}</span>
+      </div>
       <p v-if="!editing" class="hint">Bij Opslaan logt EB MCP op de achtergrond één keer in, om de gegevens te controleren en de administratienaam op te halen.</p>
       <p v-if="error" class="note bad rise" role="alert">{{ error }}</p>
     </form>
@@ -190,6 +200,10 @@ async function save() {
 .field:focus { box-shadow: inset 0 0 0 1px var(--accent), 0 0 0 3.5px rgba(10, 132, 255, 0.42); }
 .field[readonly] { background: var(--sunken); color: var(--label); }
 .hint { font-size: 11px; line-height: 15px; color: var(--muted); }
+.seg { align-self: flex-start; display: inline-flex; padding: 2px; border-radius: 999px; background: var(--subtle); }
+.seg button { height: 24px; padding: 0 12px; border: 0; border-radius: 999px; background: transparent; font-size: 12px; transition: background-color 180ms var(--ease), box-shadow 180ms var(--ease); }
+.seg button:hover { background: var(--hover); }
+.seg button.on { background: var(--seg-on); box-shadow: var(--seg-on-shadow); font-weight: 500; }
 .options { display: flex; gap: 10px; }
 .option {
   flex: 1; display: flex; gap: 10px; align-items: flex-start; padding: 12px; border: 0; border-radius: 12px; text-align: left;
