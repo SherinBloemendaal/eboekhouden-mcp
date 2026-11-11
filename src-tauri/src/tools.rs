@@ -11,7 +11,10 @@ use std::sync::{Arc, LazyLock};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, Icon, Implementation, ServerCapabilities, ServerConfig},
+    model::{
+        CallToolResult, ContentBlock, Icon, Implementation, ResourceContents, ServerCapabilities,
+        ServerConfig,
+    },
     schemars::{self, JsonSchema},
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -305,6 +308,190 @@ pub struct ArchiefUploadenArgs {
     pub mutatie_nr: Option<u64>,
     /// Een bestaand bestand met dezelfde naam overschrijven (standaard niet).
     pub overschrijven: Option<bool>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+/// De soorten sjablonen naast e-mailsjablonen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SjabloonSoort {
+    /// De opmaak van de factuur-pdf.
+    Factuur,
+    /// De opmaak van de offerte-pdf.
+    Offerte,
+    /// De tekst van een herinnering of aanmaning per e-mail.
+    Aanmaan,
+}
+
+impl SjabloonSoort {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Factuur => "factuursjabloon",
+            Self::Offerte => "offertesjabloon",
+            Self::Aanmaan => "aanmaansjabloon",
+        }
+    }
+
+    fn naam(self) -> &'static str {
+        match self {
+            Self::Factuur => "Factuursjabloon",
+            Self::Offerte => "Offertesjabloon",
+            Self::Aanmaan => "Aanmaansjabloon",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SjablonenArgs {
+    /// Welke sjablonen: factuur, offerte of aanmaan.
+    pub soort: SjabloonSoort,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SjabloonArgs {
+    /// factuur, offerte of aanmaan.
+    pub soort: SjabloonSoort,
+    /// Id van het sjabloon (uit sjablonen).
+    pub id: u64,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SjabloonToevoegenArgs {
+    /// factuur, offerte of aanmaan.
+    pub soort: SjabloonSoort,
+    /// Naam van het nieuwe sjabloon.
+    pub naam: String,
+    /// Bij factuur en offerte: id van het sjabloon waarvan de opmaak wordt overgenomen (standaard het eerste actieve). Pas de kopie daarna aan met sjabloon_wijzigen.
+    pub kopie_van: Option<u64>,
+    /// Bij aanmaan: het onderwerp van de e-mail.
+    pub onderwerp: Option<String>,
+    /// Bij aanmaan: de tekst van de e-mail als HTML, met codes zoals [NAAM], [FACTNUMMER], [FACTDATUM], [TOTAAL], [VOLDAAN] en [OPENSTAAND].
+    pub bericht: Option<String>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SjabloonWijzigenArgs {
+    /// factuur, offerte of aanmaan.
+    pub soort: SjabloonSoort,
+    /// Id van het sjabloon (uit sjablonen).
+    pub id: u64,
+    /// Nieuwe naam.
+    pub naam: Option<String>,
+    /// Bij factuur en offerte: het sjabloon op inactief zetten (true) of weer actief (false).
+    pub inactief: Option<bool>,
+    /// Bij factuur en offerte: de nieuwe opmaak. Geef het hele document `opmaak` zoals de tool sjabloon het teruggaf, met je wijzigingen: elements (elk met id, tag, x, y, width, height, content als HTML met codes), documentDefinition en sjabloon.
+    pub opmaak: Option<Value>,
+    /// Bij aanmaan: nieuw onderwerp.
+    pub onderwerp: Option<String>,
+    /// Bij aanmaan: nieuwe tekst als HTML.
+    pub bericht: Option<String>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PdfArgs {
+    /// Het id, zoals de lijst het geeft.
+    pub id: u64,
+    /// Map op deze computer om de pdf in te zetten, als volledig pad (standaard de map Downloads).
+    pub map: Option<String>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BestandArgs {
+    /// Id van het bestand in het digitaal archief (uit digitaal_archief).
+    pub bestand_id: u64,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct FactuurMailenArgs {
+    /// Id van de factuur (uit facturen).
+    pub id: u64,
+    /// E-mailadres van de ontvanger (standaard het factuur- of e-mailadres van de relatie).
+    pub aan: Option<String>,
+    /// Id van een e-mailsjabloon (uit emailsjablonen) voor onderwerp, bericht en afzender. e-Boekhouden vult de codes zoals [FACTNUMMER] in.
+    pub sjabloon_id: Option<u64>,
+    /// Onderwerp (gaat voor het sjabloon).
+    pub onderwerp: Option<String>,
+    /// Bericht als HTML (gaat voor het sjabloon).
+    pub bericht: Option<String>,
+    /// Cc-adres.
+    pub cc: Option<String>,
+    /// Bcc-adres.
+    pub bcc: Option<String>,
+    /// Ook het UBL-bestand meesturen (standaard niet).
+    pub ubl: Option<bool>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct AccountArgs {
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+/// Waarvoor een e-mailsjabloon te kiezen is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SjabloonVoor {
+    Factuur,
+    Offerte,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct EmailsjabloonToevoegenArgs {
+    /// Naam van het sjabloon.
+    pub naam: String,
+    /// Onderwerp. Codes zoals [FACTNUMMER] en [FACTKENMERK] vult e-Boekhouden in.
+    pub onderwerp: String,
+    /// Bericht als HTML. Codes zoals [RELBEDRIJF], [RELCONTACTPERSOON], [RELAANHEF], [RELADRES], [RELPOSTCODE], [RELPLAATS], [DATUM], [FACTNUMMER] en [ABBEDRIJF] vult e-Boekhouden in.
+    pub bericht: String,
+    /// Waarvoor het sjabloon te kiezen is: factuur, offerte of beide (standaard factuur).
+    pub voor: Option<Vec<SjabloonVoor>>,
+    /// Naam van de afzender (standaard de naam van de administratie).
+    pub van_naam: Option<String>,
+    /// E-mailadres van de afzender (standaard dat van de ingelogde gebruiker).
+    pub van_email: Option<String>,
+    /// Vast cc-adres.
+    pub cc: Option<String>,
+    /// Vast bcc-adres.
+    pub bcc: Option<String>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct EmailsjabloonWijzigenArgs {
+    /// Id van het sjabloon (uit emailsjablonen).
+    pub id: u64,
+    /// Nieuwe naam.
+    pub naam: Option<String>,
+    /// Nieuw onderwerp.
+    pub onderwerp: Option<String>,
+    /// Nieuw bericht als HTML.
+    pub bericht: Option<String>,
+    /// Waarvoor het sjabloon te kiezen is: factuur, offerte of beide.
+    pub voor: Option<Vec<SjabloonVoor>>,
+    /// Nieuwe naam van de afzender.
+    pub van_naam: Option<String>,
+    /// Nieuw e-mailadres van de afzender.
+    pub van_email: Option<String>,
+    /// Nieuw cc-adres.
+    pub cc: Option<String>,
+    /// Nieuw bcc-adres.
+    pub bcc: Option<String>,
     /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
@@ -822,6 +1009,177 @@ impl EbMcp {
         answer
     }
 
+    /// Fetches a pdf from e-Boekhouden and saves it on this computer, next to whatever is there already.
+    async fn save_pdf(
+        &self,
+        run: &Run,
+        path: &str,
+        map: Option<&str>,
+        fallback: &str,
+    ) -> Result<(Value, String), String> {
+        use base64::Engine;
+        let dir = download_dir(map)?;
+        let (call, file) = self
+            .state
+            .api_download(run.account.id, path, Some(run.id), &run.client)
+            .await;
+        let (bytes, name) = match file {
+            Some(file) if call.ok() => file,
+            _ => {
+                return Err(call
+                    .error
+                    .unwrap_or_else(|| format!("e-Boekhouden gaf {} op {path}", call.status)));
+            }
+        };
+        if !bytes.starts_with(b"%PDF") {
+            return Err("e-Boekhouden gaf geen pdf terug".to_owned());
+        }
+        let name = name
+            .filter(|n| n.to_ascii_lowercase().ends_with(".pdf"))
+            .unwrap_or_else(|| fallback.to_owned());
+        let target = write_new(&dir, &name, &bytes)
+            .map_err(|e| format!("De pdf is niet op te slaan in {}: {e}", dir.display()))?;
+        let saved = json!({"pad": target.to_string_lossy(), "bestandsnaam": target.file_name().map(|n| n.to_string_lossy().into_owned()), "bytes": bytes.len()});
+        Ok((
+            saved,
+            base64::engine::general_purpose::STANDARD.encode(&bytes),
+        ))
+    }
+
+    /// The answer of a pdf tool: where the file was saved, and the pdf itself as an embedded resource, so an AI
+    /// client without access to this computer's files can read it too. The log keeps the first part only.
+    fn end_pdf(
+        &self,
+        run: Run,
+        source: &str,
+        result: Result<(Value, String), String>,
+    ) -> CallToolResult {
+        let (saved, pdf) = match result {
+            Ok(done) => done,
+            Err(message) => return self.end(run, source, Err(message)),
+        };
+        let name = saved
+            .get("bestandsnaam")
+            .and_then(Value::as_str)
+            .unwrap_or("document.pdf")
+            .to_owned();
+        let mut answer = self.end(run, source, Ok(saved));
+        answer.content.push(ContentBlock::resource(
+            ResourceContents::BlobResourceContents {
+                uri: format!("eb-mcp://pdf/{}", name.replace(' ', "%20")),
+                mime_type: Some("application/pdf".to_owned()),
+                blob: pdf,
+                meta: None,
+            },
+        ));
+        answer
+    }
+
+    /// Opens an editor session for a factuur- or offertesjabloon and reads its layout document.
+    async fn editor_session(
+        &self,
+        run: &Run,
+        soort: SjabloonSoort,
+        id: u64,
+    ) -> Result<(String, Value), String> {
+        // The editor opens a template in its own language; "NL" when e-Boekhouden does not say.
+        let taal = self
+            .fetch(run, &format!("{}/{id}/language", soort.path()), Vec::new())
+            .await
+            .ok()
+            .and_then(|t| t.as_str().map(str::to_owned))
+            .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphabetic()))
+            .unwrap_or_else(|| "NL".to_owned());
+        let path = format!("{}/editor/{id}/{taal}", soort.path());
+        let (call, hash) = self
+            .state
+            .api_editor_open(run.account.id, &path, Some(run.id), &run.client)
+            .await;
+        let hash = match hash {
+            Some(hash) if call.error.is_none() => hash,
+            _ => {
+                return Err(call
+                    .error
+                    .unwrap_or_else(|| "e-Boekhouden opende de sjabloon-editor niet".into()));
+            }
+        };
+        let session = self
+            .state
+            .api_editor(
+                run.account.id,
+                "GET",
+                &format!("api/session/{hash}"),
+                None,
+                Some(run.id),
+                &run.client,
+            )
+            .await;
+        let document = session
+            .json
+            .and_then(|mut j| j.get_mut("sjabloon").map(Value::take))
+            .filter(|document| document.get("elements").is_some_and(Value::is_array));
+        match (session.error, document) {
+            (None, Some(document)) => Ok((hash, document)),
+            (error, _) => {
+                // The session is open at e-Boekhouden: it is closed again, without saving, before the tool gives up.
+                let _ = self.editor_end(run, &hash, Value::Null, false).await;
+                Err(error.unwrap_or_else(|| {
+                    "De sjabloon-editor gaf de opmaak in een onbekende vorm terug".into()
+                }))
+            }
+        }
+    }
+
+    /// Ends an editor session: with `save` the document becomes the template's layout, without it nothing changes.
+    async fn editor_end(
+        &self,
+        run: &Run,
+        hash: &str,
+        mut document: Value,
+        save: bool,
+    ) -> Result<(), String> {
+        if let Some(object) = document.as_object_mut() {
+            // As the editor does when it saves: the document carries the hash of the session it is saved in.
+            object.insert("sessionHash".into(), json!(hash));
+        }
+        let body = json!({"saveChanges": save, "saveData": document});
+        let call = self
+            .state
+            .api_editor(
+                run.account.id,
+                "POST",
+                &format!("api/session/end/{hash}"),
+                Some(&body),
+                Some(run.id),
+                &run.client,
+            )
+            .await;
+        match call.error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// The first row of a list (`gridtable` with named rows, or a plain array) that is not inactive: its id.
+    async fn first_active(&self, run: &Run, path: &str) -> Result<Option<u64>, String> {
+        let list = self.fetch(run, path, grid(Some(MAX_ROWS), None)?).await?;
+        let rows = match named_rows(list) {
+            Value::Array(rows) => rows,
+            other => other
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        Ok(rows
+            .iter()
+            .find(|row| {
+                !row.get("inactief")
+                    .is_some_and(|v| v.as_bool() == Some(true) || v.as_u64() == Some(1))
+            })
+            .and_then(|row| row.get("id").and_then(Value::as_u64)))
+    }
+
     /// What a new invoice takes from the administration: its next number, its sjabloon and whether it books at once.
     async fn factuur_context(&self, run: &Run) -> Result<write::FactuurContext, String> {
         let nummer = self
@@ -854,6 +1212,166 @@ impl EbMcp {
             .await?;
         Ok((now, items))
     }
+}
+
+/// A plausible e-mail address: enough to stop a slip before it reaches e-Boekhouden, which does the real check.
+/// A value for the approval window, or "onbekend" when e-Boekhouden did not give it: never a made-up default.
+fn known(value: String) -> String {
+    if value.trim().is_empty() {
+        "onbekend".to_owned()
+    } else {
+        value
+    }
+}
+
+fn email(value: &str, what: &str) -> Result<String, String> {
+    let value = value.trim();
+    let ok = value.len() <= 150
+        && !value.contains(char::is_whitespace)
+        && value.split_once('@').is_some_and(|(name, host)| {
+            !name.is_empty() && host.contains('.') && !host.starts_with('.') && !host.ends_with('.')
+        });
+    if ok {
+        Ok(value.to_owned())
+    } else {
+        Err(format!("{what} is geen geldig e-mailadres"))
+    }
+}
+
+/// Every address an HTML message points at (`href`, `src`), which plain words do not show: a link's text can say
+/// one thing and lead somewhere else, and an image can report that the mail was opened.
+fn targets(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut found: Vec<String> = Vec::new();
+    for attribute in ["href", "src"] {
+        let mut from = 0;
+        while let Some(at) = lower[from..].find(attribute) {
+            from += at + attribute.len();
+            let Some(after) = html[from..].trim_start().strip_prefix('=') else {
+                continue;
+            };
+            let after = after.trim_start();
+            let value = match after.chars().next() {
+                Some(quote @ ('"' | '\'')) => after[1..].split(quote).next().unwrap_or_default(),
+                _ => after
+                    .split(|c: char| c.is_whitespace() || c == '>')
+                    .next()
+                    .unwrap_or_default(),
+            };
+            let value = value.trim();
+            if !value.is_empty() && !found.iter().any(|f| f == value) {
+                found.push(value.to_owned());
+            }
+        }
+    }
+    (!found.is_empty()).then(|| found.join("\n"))
+}
+
+/// An HTML message as plain words, for the approval window: the user reads what will be sent, not markup.
+fn plain_text(html: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    // Line ends in the source are only white space in HTML; the breaks come from the tags.
+    for c in html
+        .replace(['\n', '\r'], " ")
+        .replace("<br", "\n<br")
+        .replace("</div>", "\n</div>")
+        .replace("</p>", "\n</p>")
+        .chars()
+    {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let out = out
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">");
+    let lines: Vec<&str> = out.lines().map(str::trim).collect();
+    let mut text = String::new();
+    for line in lines {
+        if line.is_empty() && (text.is_empty() || text.ends_with("\n\n")) {
+            continue;
+        }
+        text.push_str(line);
+        text.push('\n');
+    }
+    text.trim().to_owned()
+}
+
+/// Saves `bytes` as `dir/name`, or `dir/name (2).pdf` and on while that name is taken. The file is created new:
+/// an existing file is never overwritten and a symlink with that name is never followed.
+fn write_new(
+    dir: &std::path::Path,
+    name: &str,
+    bytes: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) => (stem, format!(".{ext}")),
+        None => (name, String::new()),
+    };
+    for n in 1..10_000u32 {
+        let path = if n == 1 {
+            dir.join(name)
+        } else {
+            dir.join(format!("{stem} ({n}){ext}"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("te veel bestanden met deze naam"))
+}
+
+/// The folder a tool may save a download in: the one named (a full path to an existing folder) or Downloads.
+fn download_dir(named: Option<&str>) -> Result<std::path::PathBuf, String> {
+    match named.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(dir) => {
+            let path = std::path::PathBuf::from(dir);
+            if !path.is_absolute() {
+                return Err("Geef de map als volledig pad".into());
+            }
+            if !path.is_dir() {
+                return Err(format!("{} is geen bestaande map", path.display()));
+            }
+            Ok(path)
+        }
+        None => {
+            let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .ok_or("De map Downloads is niet te vinden; geef een map op")?;
+            let downloads = std::path::PathBuf::from(home).join("Downloads");
+            if downloads.is_dir() {
+                Ok(downloads)
+            } else {
+                Err("De map Downloads is niet te vinden; geef een map op".into())
+            }
+        }
+    }
+}
+
+/// Which uses an e-mail template is offered for, as the API's three flags.
+fn sjabloon_voor(voor: &[SjabloonVoor]) -> Result<(bool, bool), String> {
+    if voor.is_empty() {
+        return Err("Geef aan waarvoor het sjabloon is: factuur, offerte of beide".into());
+    }
+    Ok((
+        voor.contains(&SjabloonVoor::Factuur),
+        voor.contains(&SjabloonVoor::Offerte),
+    ))
 }
 
 /// How many tools the server offers, counted on its tool router.
@@ -1938,6 +2456,1058 @@ impl EbMcp {
         .await;
         Ok(self.end_write(run, "Facturen gemaakt; data.createdIds zijn de ids van de nieuwe facturen en data.errorMessages wat niet lukte", result))
     }
+
+    #[tool(
+        description = "Een mutatie verwijderen, op mutatienummer. Boekhoudkundig wordt dit afgeraden: corrigeer liever met een tegenboeking of wijzig de mutatie, zodat zichtbaar blijft wat er is gebeurd. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        annotations(
+            title = "Mutatie verwijderen",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn mutatie_verwijderen(
+        &self,
+        Parameters(args): Parameters<MutatieArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "mutatie_verwijderen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let model = self.fetch(&run, &format!("mutatie/nr/{}/model", args.nr), Vec::new()).await?;
+            let mutatie = model.get("mutatie").cloned().unwrap_or(Value::Null);
+            let datum = mutatie
+                .get("datum")
+                .and_then(Value::as_str)
+                .and_then(|d| d.get(..10))
+                .ok_or_else(|| Halt::Error("e-Boekhouden gaf deze mutatie zonder datum terug".into()))?
+                .to_owned();
+            // Deleting goes by the mutatie's id, which changes with every edit and is only in the list: the
+            // list of that one day is searched for the number.
+            let mut id = None;
+            let mut shown = Value::Null;
+            for page in 0..10u32 {
+                let mut query = grid(Some(MAX_ROWS), Some(page * MAX_ROWS)).map_err(Halt::Error)?;
+                query.push(("datumVan".into(), datum.clone()));
+                query.push(("datumTot".into(), datum.clone()));
+                let rows = named_rows(self.fetch(&run, "mutatie/gridtable", query).await?);
+                let rows = rows.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+                if let Some(row) = rows.iter().find(|r| r.get("mutatieNr").and_then(Value::as_u64) == Some(args.nr)) {
+                    id = row.get("id").and_then(Value::as_u64);
+                    shown = row.clone();
+                    break;
+                }
+                if rows.len() < MAX_ROWS as usize {
+                    break;
+                }
+            }
+            let id = id.ok_or_else(|| Halt::Error(format!("Mutatie {} staat niet in de lijst van {datum}", args.nr)))?;
+            let text = |name: &str| shown.get(name).and_then(Value::as_str).unwrap_or_default().to_owned();
+            let built = Built {
+                body: json!([id]),
+                title: format!("Mutatie {} verwijderen", args.nr),
+                lines: vec![
+                    line("Mutatie", format!("nr {}", args.nr)),
+                    line("Soort", known(text("soort"))),
+                    line("Datum", &datum),
+                    line("Bedrag", shown.get("bedrag").and_then(Value::as_f64).map_or("onbekend".to_owned(), write::euro)),
+                    line("Rekening", format!("{} tegen {}", text("rekening"), text("tegenrekening"))),
+                    line("Omschrijving", mutatie.get("omschrijving").and_then(Value::as_str).unwrap_or_default()),
+                    line("Let op", "boekhoudkundig wordt verwijderen afgeraden: een tegenboeking laat zien wat er is gebeurd. Dit is niet terug te draaien."),
+                ],
+            };
+            self.approve(&run, TOOL, &built, true).await?;
+            let done = self.change(&run, "POST", "mutatie/bulk/delete", Some(&built.body)).await?;
+            let removed = done
+                .get("removedIds")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| ids.iter().any(|v| v.as_u64() == Some(id)));
+            if !removed {
+                let why = done
+                    .get("errorMessages")
+                    .and_then(Value::as_array)
+                    .and_then(|m| m.first())
+                    .map(|m| m.as_str().map(str::to_owned).unwrap_or_else(|| m.to_string()))
+                    .unwrap_or_else(|| "e-Boekhouden heeft de mutatie niet verwijderd".into());
+                return Err(Halt::Error(format!("e-Boekhouden weigert dit: {why}")));
+            }
+            Ok(done)
+        }
+        .await;
+        Ok(self.end_write(run, "Mutatie verwijderd", result))
+    }
+
+    #[tool(
+        description = "Een bestand uit het digitaal archief verwijderen; het gaat naar de prullenbak van het archief. Is het bestand nog aan een mutatie of iets anders gekoppeld, dan krijgt de gebruiker een waarschuwing en moet die het altijd goedkeuren. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet.",
+        annotations(
+            title = "Bestand verwijderen",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn archief_verwijderen(
+        &self,
+        Parameters(args): Parameters<BestandArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "archief_verwijderen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let file = self
+                .fetch(&run, &format!("folder/{}", args.bestand_id), Vec::new())
+                .await?;
+            let name = file
+                .get("naam")
+                .and_then(Value::as_str)
+                .unwrap_or("bestand")
+                .to_owned();
+            if file.get("soort").and_then(Value::as_str) != Some("F") {
+                return Err(Halt::Error(format!("{name} is een map, geen bestand")));
+            }
+            if file.get("isDeleted").and_then(Value::as_bool) == Some(true) {
+                return Err(Halt::Error(format!(
+                    "{name} staat al in de prullenbak van het archief; EB MCP verwijdert het daar niet definitief"
+                )));
+            }
+            let links = self
+                .fetch(&run, &format!("folder/{}/koppel", args.bestand_id), Vec::new())
+                .await?;
+            // Anything that is not plainly "no link" counts as a link: an unknown shape must ask, never slip through.
+            let linked_to = |value: &Value| -> Option<usize> {
+                match value {
+                    Value::Null | Value::Bool(false) => None,
+                    Value::Array(items) => (!items.is_empty()).then_some(items.len()),
+                    Value::Number(n) => (n.as_f64() != Some(0.0)).then(|| n.as_u64().unwrap_or(1) as usize),
+                    _ => Some(1),
+                }
+            };
+            let mut linked: Vec<String> = Vec::new();
+            match links.as_object() {
+                Some(object) => {
+                    for (key, value) in object {
+                        if let Some(count) = linked_to(value) {
+                            let (one, more) = match key.as_str() {
+                                "koppelMutatie" => ("mutatie", "mutaties"),
+                                "koppelImport" => ("bankregel", "bankregels"),
+                                "koppelRelatie" => ("relatie", "relaties"),
+                                "koppelOfferte" => ("offerte", "offertes"),
+                                _ => ("ander onderdeel", "andere onderdelen"),
+                            };
+                            linked.push(if count == 1 { format!("1 {one}") } else { format!("{count} {more}") });
+                        }
+                    }
+                }
+                None => linked.push("iets wat EB MCP niet kan lezen".to_owned()),
+            }
+            if linked.is_empty() && file.get("koppelCount").and_then(Value::as_u64).unwrap_or(0) > 0 {
+                linked.push("iets anders".to_owned());
+            }
+            let mut lines = vec![
+                line("Bestand", &name),
+                line(
+                    "Gevolg",
+                    "het bestand gaat naar de prullenbak van het digitaal archief",
+                ),
+            ];
+            if !linked.is_empty() {
+                lines.push(line(
+                    "Let op",
+                    format!(
+                        "dit bestand is nog gekoppeld aan {}; die koppeling verdwijnt mee",
+                        linked.join(", ")
+                    ),
+                ));
+            }
+            let built = Built {
+                body: Value::Null,
+                title: format!("Bestand verwijderen: {name}"),
+                lines,
+            };
+            self.approve(&run, TOOL, &built, !linked.is_empty()).await?;
+            self.change_done(&run, "DELETE", &format!("folder/{}", args.bestand_id), None)
+                .await
+        }
+        .await;
+        Ok(self.end_write(
+            run,
+            "Bestand verwijderd (staat in de prullenbak van het archief)",
+            result,
+        ))
+    }
+
+    #[tool(
+        description = "Een verkoopfactuur als pdf ophalen, op id (uit facturen). De pdf wordt op deze computer opgeslagen, standaard in de map Downloads; het antwoord geeft het volledige pad en de pdf zelf als bijlage, zodat je hem kunt lezen en de gebruiker hem kan openen. Bestaande bestanden worden niet overschreven.",
+        annotations(title = "Factuur als pdf", read_only_hint = true)
+    )]
+    async fn factuur_pdf(
+        &self,
+        Parameters(args): Parameters<PdfArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let run = match self.begin(&context, "factuur_pdf", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let path = format!("factuur/{}/print", args.id);
+        let result = self
+            .save_pdf(
+                &run,
+                &path,
+                args.map.as_deref(),
+                &format!("factuur-{}.pdf", args.id),
+            )
+            .await;
+        Ok(self.end_pdf(run, &path, result))
+    }
+
+    #[tool(
+        description = "Een verkoopfactuur per e-mail versturen vanuit e-Boekhouden, met de factuur als pdf in de bijlage. Onderwerp en bericht komen uit een e-mailsjabloon (sjabloon_id) of geef je zelf mee; zonder ontvanger gaat de mail naar het factuur- of e-mailadres van de relatie. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de ontvanger, het onderwerp en het bericht.",
+        annotations(
+            title = "Factuur mailen",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn factuur_mailen(
+        &self,
+        Parameters(args): Parameters<FactuurMailenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "factuur_mailen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let factuur = self.fetch(&run, &format!("factuur/{}", args.id), Vec::new()).await?;
+            let nummer = factuur.get("nummer").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let relatie_id = factuur.get("relatieId").and_then(Value::as_u64).unwrap_or(0);
+            let sjabloon = match args.sjabloon_id {
+                Some(id) => Some(self.fetch(&run, &format!("EmailSjabloonAb/{id}"), Vec::new()).await?),
+                None => None,
+            };
+            let from_sjabloon = |name: &str| {
+                sjabloon
+                    .as_ref()
+                    .and_then(|s| s.get(name))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned)
+            };
+            let given = |value: &Option<String>| value.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+            let aan = match given(&args.aan) {
+                Some(aan) => aan,
+                None => {
+                    let relatie = self.fetch(&run, &format!("relatie/{relatie_id}"), Vec::new()).await?;
+                    let field = |name: &str| relatie.get(name).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+                    field("emailFactuur")
+                        .or_else(|| field("email"))
+                        .ok_or_else(|| Halt::Error("De relatie van deze factuur heeft geen e-mailadres; geef de ontvanger op met aan".into()))?
+                }
+            };
+            let aan = email(&aan, "De ontvanger")?;
+            let cc = given(&args.cc).or_else(|| from_sjabloon("cc")).map(|v| email(&v, "Het cc-adres")).transpose()?;
+            let bcc = given(&args.bcc).or_else(|| from_sjabloon("bcc")).map(|v| email(&v, "Het bcc-adres")).transpose()?;
+            let subject = given(&args.onderwerp)
+                .or_else(|| from_sjabloon("subject"))
+                .ok_or_else(|| Halt::Error("Geef een onderwerp, of een e-mailsjabloon met sjabloon_id".into()))?;
+            let body = given(&args.bericht)
+                .or_else(|| from_sjabloon("body"))
+                .ok_or_else(|| Halt::Error("Geef een bericht, of een e-mailsjabloon met sjabloon_id".into()))?;
+            let user = self.fetch(&run, "user", Vec::new()).await?;
+            let user_field = |name: &str| user.get(name).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+            let van_naam = from_sjabloon("vanNaam")
+                .or_else(|| run.account.administration.clone())
+                .or_else(|| user_field("naam"))
+                .ok_or_else(|| Halt::Error("De naam van de afzender is niet bekend".into()))?;
+            let van_email = from_sjabloon("vanEmail")
+                .or_else(|| user_field("email"))
+                .ok_or_else(|| Halt::Error("Het e-mailadres van de afzender is niet bekend".into()))?;
+            let van_email = email(&van_email, "Het adres van de afzender")?;
+            let ubl = args.ubl.unwrap_or(false);
+            let built = Built {
+                body: json!({
+                    "vanNaam": van_naam, "vanEmail": van_email, "aanEmail": aan, "ccEmail": cc, "bccEmail": bcc,
+                    "subject": subject, "body": body, "factuurUbl": ubl, "rememberMessage": false,
+                    "useEmailSjabloon": false, "bijlagen": [], "factuurId": args.id
+                }),
+                title: format!("Factuur {nummer} mailen naar {aan}"),
+                lines: [
+                    Some(line("Aan", &aan)),
+                    cc.as_ref().map(|cc| line("Cc", cc)),
+                    bcc.as_ref().map(|bcc| line("Bcc", bcc)),
+                    Some(line("Van", format!("{van_naam} <{van_email}>"))),
+                    Some(line("Onderwerp", &subject)),
+                    Some(line("Bericht", plain_text(&body))),
+                    targets(&body).map(|t| line("Links en afbeeldingen in het bericht", t)),
+                    Some(line("Bijlage", if ubl { format!("factuur {nummer} als pdf en als UBL") } else { format!("factuur {nummer} als pdf") })),
+                    Some(line("Let op", "dit verstuurt echte e-mail en is niet terug te draaien")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            };
+            self.approve(&run, TOOL, &built, true).await?;
+            let sent = self.change(&run, "POST", "factuur/mail", Some(&built.body)).await?;
+            let failed = sent.get("errorCount").and_then(Value::as_u64).unwrap_or(0) > 0;
+            let said = sent.get("errorMessage").and_then(Value::as_str).filter(|m| !m.is_empty());
+            if failed || said.is_some() {
+                return Err(Halt::Error(format!("e-Boekhouden kon de mail niet versturen: {}", said.unwrap_or("geen uitleg gegeven"))));
+            }
+            Ok(json!({"verstuurd_aan": aan, "factuur": nummer}))
+        }
+        .await;
+        Ok(self.end_write(run, "Factuur verstuurd per e-mail", result))
+    }
+
+    #[tool(
+        description = "De e-mailsjablonen van de administratie, met onderwerp, bericht (HTML), afzender en waarvoor ze te kiezen zijn. In onderwerp en bericht staan codes die e-Boekhouden invult, zoals [FACTNUMMER], [FACTKENMERK], [RELBEDRIJF], [RELCONTACTPERSOON], [RELAANHEF], [RELADRES], [RELPOSTCODE], [RELPLAATS], [DATUM] en [ABBEDRIJF].",
+        annotations(title = "E-mailsjablonen", read_only_hint = true)
+    )]
+    async fn emailsjablonen(
+        &self,
+        Parameters(args): Parameters<AccountArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        self.simple(
+            &context,
+            "emailsjablonen",
+            &args,
+            args.account.as_deref(),
+            "emailsjabloonab",
+            Ok(Vec::new()),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Een e-mailsjabloon maken voor het mailen van facturen of offertes. Gebruik in onderwerp en bericht de codes van e-Boekhouden, zoals [FACTNUMMER], [RELBEDRIJF] en [ABBEDRIJF] (zie emailsjablonen voor voorbeelden). Het bericht is HTML. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP.",
+        annotations(
+            title = "E-mailsjabloon toevoegen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn emailsjabloon_toevoegen(
+        &self,
+        Parameters(args): Parameters<EmailsjabloonToevoegenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "emailsjabloon_toevoegen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let naam = args.naam.trim().to_owned();
+            let (subject, body) = (args.onderwerp.trim().to_owned(), args.bericht.trim().to_owned());
+            if naam.is_empty() || subject.is_empty() || body.is_empty() {
+                return Err(Halt::Error("Naam, onderwerp en bericht zijn alle drie nodig".into()));
+            }
+            let (factuur, offerte) = sjabloon_voor(args.voor.as_deref().unwrap_or(&[SjabloonVoor::Factuur]))?;
+            let given = |value: &Option<String>| value.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+            let user = self.fetch(&run, "user", Vec::new()).await?;
+            let van_naam = given(&args.van_naam)
+                .or_else(|| run.account.administration.clone())
+                .ok_or_else(|| Halt::Error("Geef de naam van de afzender met van_naam".into()))?;
+            let van_email = given(&args.van_email)
+                .or_else(|| user.get("email").and_then(Value::as_str).map(str::to_owned))
+                .ok_or_else(|| Halt::Error("Geef het e-mailadres van de afzender met van_email".into()))?;
+            let van_email = email(&van_email, "Het adres van de afzender")?;
+            let cc = given(&args.cc).map(|v| email(&v, "Het cc-adres")).transpose()?.unwrap_or_default();
+            let bcc = given(&args.bcc).map(|v| email(&v, "Het bcc-adres")).transpose()?.unwrap_or_default();
+            let built = Built {
+                body: json!({"naam": naam, "vanNaam": van_naam, "vanEmail": van_email, "cc": cc, "bcc": bcc, "subject": subject, "body": body,
+                             "useOfferte": offerte, "useFactuur": factuur, "useNB": false}),
+                title: format!("E-mailsjabloon toevoegen: {naam}"),
+                lines: vec![
+                    line("Naam", &naam),
+                    line("Te kiezen bij", match (factuur, offerte) { (true, true) => "facturen en offertes", (true, false) => "facturen", _ => "offertes" }),
+                    line("Van", format!("{van_naam} <{van_email}>")),
+                    line("Onderwerp", &subject),
+                    line("Bericht", plain_text(&body)),
+                ],
+            };
+            self.approve(&run, TOOL, &built, false).await?;
+            self.change(&run, "POST", "emailsjabloonab", Some(&built.body)).await
+        }
+        .await;
+        Ok(self.end_write(run, "E-mailsjabloon toegevoegd; data.id is het id", result))
+    }
+
+    #[tool(
+        description = "Een e-mailsjabloon wijzigen, op id (uit emailsjablonen). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP.",
+        annotations(
+            title = "E-mailsjabloon wijzigen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn emailsjabloon_wijzigen(
+        &self,
+        Parameters(args): Parameters<EmailsjabloonWijzigenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "emailsjabloon_wijzigen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let mut sjabloon = self
+                .fetch(&run, &format!("EmailSjabloonAb/{}", args.id), Vec::new())
+                .await?;
+            let old_name = sjabloon
+                .get("naam")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let object = sjabloon.as_object_mut().ok_or_else(|| {
+                Halt::Error("e-Boekhouden gaf dit sjabloon in een onbekende vorm terug".into())
+            })?;
+            let mut lines = vec![line("Sjabloon", &old_name)];
+            let mut set = |key: &str,
+                           label: &str,
+                           value: &Option<String>,
+                           shown: fn(&str) -> String|
+             -> Result<(), Halt> {
+                if let Some(value) = value {
+                    let value = value.trim();
+                    if value.is_empty() && matches!(key, "naam" | "subject" | "body" | "vanNaam") {
+                        return Err(Halt::Error(format!("{label} mag niet leeg zijn")));
+                    }
+                    if matches!(key, "vanEmail" | "cc" | "bcc") && !value.is_empty() {
+                        email(value, label)?;
+                    }
+                    object.insert(key.to_owned(), json!(value));
+                    lines.push(line(&format!("{label} wordt"), shown(value)));
+                }
+                Ok(())
+            };
+            set("naam", "Naam", &args.naam, str::to_owned)?;
+            set("subject", "Onderwerp", &args.onderwerp, str::to_owned)?;
+            set("body", "Bericht", &args.bericht, plain_text)?;
+            set("vanNaam", "Naam afzender", &args.van_naam, str::to_owned)?;
+            set("vanEmail", "Adres afzender", &args.van_email, str::to_owned)?;
+            set("cc", "Cc", &args.cc, str::to_owned)?;
+            set("bcc", "Bcc", &args.bcc, str::to_owned)?;
+            if let Some(voor) = &args.voor {
+                let (factuur, offerte) = sjabloon_voor(voor)?;
+                object.insert("useFactuur".into(), json!(factuur));
+                object.insert("useOfferte".into(), json!(offerte));
+                lines.push(line(
+                    "Te kiezen bij",
+                    match (factuur, offerte) {
+                        (true, true) => "facturen en offertes",
+                        (true, false) => "facturen",
+                        _ => "offertes",
+                    },
+                ));
+            }
+            if lines.len() == 1 {
+                return Err(Halt::Error(
+                    "Er is niets gewijzigd: geef aan wat er anders moet".into(),
+                ));
+            }
+            let built = Built {
+                body: sjabloon,
+                title: format!("E-mailsjabloon wijzigen: {old_name}"),
+                lines,
+            };
+            // Where the mail comes from and who gets a copy decides where customers' invoices go: always asked.
+            let redirects = args.cc.is_some() || args.bcc.is_some() || args.van_email.is_some();
+            self.approve(&run, TOOL, &built, redirects).await?;
+            self.change_done(&run, "PUT", "emailsjabloonab", Some(&built.body))
+                .await
+        }
+        .await;
+        Ok(self.end_write(run, "E-mailsjabloon gewijzigd", result))
+    }
+
+    #[tool(
+        description = "Een e-mailsjabloon verwijderen, op id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        annotations(
+            title = "E-mailsjabloon verwijderen",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn emailsjabloon_verwijderen(
+        &self,
+        Parameters(args): Parameters<IdArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "emailsjabloon_verwijderen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let sjabloon = self.fetch(&run, &format!("EmailSjabloonAb/{}", args.id), Vec::new()).await?;
+            let naam = sjabloon.get("naam").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let built = Built {
+                body: Value::Null,
+                title: format!("E-mailsjabloon verwijderen: {naam}"),
+                lines: vec![
+                    line("Sjabloon", &naam),
+                    line("Onderwerp", sjabloon.get("subject").and_then(Value::as_str).unwrap_or_default()),
+                    line("Gevolg", "het sjabloon verdwijnt; facturen en abonnementen die het gebruikten hebben dan geen e-mailsjabloon meer. Niet terug te draaien."),
+                ],
+            };
+            self.approve(&run, TOOL, &built, true).await?;
+            self.change_done(&run, "DELETE", &format!("emailsjabloonab/{}", args.id), None).await
+        }
+        .await;
+        Ok(self.end_write(run, "E-mailsjabloon verwijderd", result))
+    }
+
+    #[tool(
+        description = "De offertes: id, nummer, status, datum, vervaldatum, relatie, kenmerk en bedragen.",
+        annotations(title = "Offertes", read_only_hint = true)
+    )]
+    async fn offertes(
+        &self,
+        Parameters(args): Parameters<ListArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const PATH: &str = "offerte/gridtable";
+        let run = match self.begin(&context, "offertes", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let query = match grid(args.limit, args.offset) {
+            Ok(query) => query,
+            Err(message) => return Ok(self.refuse(run, message)),
+        };
+        let result = self.fetch(&run, PATH, query).await.map(named_rows);
+        Ok(self.end(run, PATH, result))
+    }
+
+    #[tool(
+        description = "Eén offerte met zijn regels, op id (uit offertes), plus de offertestatussen om uit te kiezen.",
+        annotations(title = "Offerte", read_only_hint = true)
+    )]
+    async fn offerte(
+        &self,
+        Parameters(args): Parameters<IdArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let run = match self.begin(&context, "offerte", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let offerte = self.fetch(&run, &format!("offerte/{}", args.id), Vec::new()).await?;
+            let regels = self.fetch(&run, &format!("offerteregel/getbyofferteid/{}", args.id), Vec::new()).await?;
+            let statussen = named_rows(self.fetch(&run, "offertestatus/gridtable", grid(Some(MAX_ROWS), None)?).await?);
+            Ok(json!({"offerte": offerte, "regels": regels, "statussen": statussen.get("data").cloned().unwrap_or(Value::Null)}))
+        }
+        .await;
+        Ok(self.end(run, &format!("offerte/{}", args.id), result))
+    }
+
+    #[tool(
+        description = "Een offerte als pdf ophalen, op id (uit offertes). De pdf wordt op deze computer opgeslagen, standaard in de map Downloads; het antwoord geeft het volledige pad en de pdf zelf als bijlage. Bestaande bestanden worden niet overschreven.",
+        annotations(title = "Offerte als pdf", read_only_hint = true)
+    )]
+    async fn offerte_pdf(
+        &self,
+        Parameters(args): Parameters<PdfArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let run = match self.begin(&context, "offerte_pdf", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let path = format!("offerte/pdf/{}", args.id);
+        let result = self
+            .save_pdf(
+                &run,
+                &path,
+                args.map.as_deref(),
+                &format!("offerte-{}.pdf", args.id),
+            )
+            .await;
+        Ok(self.end_pdf(run, &path, result))
+    }
+
+    #[tool(
+        description = "Een offerte maken voor een relatie. Prijzen per stuk, incl of excl btw; btw op code (HOOG_VERK_21, LAAG_VERK_9, GEEN, ...), de omzetrekening op code. Zonder nummer krijgt de offerte het volgende nummer van e-Boekhouden. De offerte wordt niet verstuurd. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de offerte eerst goed in EB MCP.",
+        annotations(
+            title = "Offerte toevoegen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn offerte_toevoegen(
+        &self,
+        Parameters(args): Parameters<write::OfferteToevoegenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "offerte_toevoegen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let books = self.books(&run).await?;
+            let nummer = self.fetch(&run, "offerte/nummer/next", Vec::new()).await?;
+            let user = self.fetch(&run, "user", Vec::new()).await?;
+            let sjabloon_id = match args.sjabloon_id {
+                Some(id) => id,
+                None => self
+                    .first_active(&run, "offertesjabloon/gridtable")
+                    .await?
+                    .ok_or_else(|| Halt::Error("Deze administratie heeft geen actief offertesjabloon".into()))?,
+            };
+            let status_id = match args.status_id {
+                Some(id) => id,
+                None => self
+                    .first_active(&run, "offertestatus/gridtable")
+                    .await?
+                    .ok_or_else(|| Halt::Error("Deze administratie heeft geen offertestatussen".into()))?,
+            };
+            let offerte_context = write::OfferteContext {
+                volgend_nummer: nummer.as_str().unwrap_or_default().to_owned(),
+                sjabloon_id,
+                status_id,
+                gebruiker_id: user
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| Halt::Error("e-Boekhouden gaf de ingelogde gebruiker niet terug".into()))?,
+                vandaag: today(),
+            };
+            let (built, regels) = write::offerte_nieuw(&args, &offerte_context, &books)?;
+            self.approve(&run, TOOL, &built, false).await?;
+            let made = self.change(&run, "POST", "offerte", Some(&built.body)).await?;
+            let id = made
+                .get("id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| Halt::Error("e-Boekhouden gaf de nieuwe offerte niet terug".into()))?;
+            for (n, mut regel) in regels.into_iter().enumerate() {
+                regel["offerteId"] = json!(id);
+                if let Err(Halt::Error(message) | Halt::Refused(message)) = self.change(&run, "POST", "offerteregel", Some(&regel)).await {
+                    return Err(Halt::Error(format!(
+                        "De offerte is aangemaakt (id {id}), maar regel {} is niet opgeslagen: {message}. Vul de regels aan met offerte_wijzigen.",
+                        n + 1
+                    )));
+                }
+            }
+            // The quote exists; a failed read-back must not look like a failed change (a retry would make a second one).
+            Ok(self
+                .fetch(&run, &format!("offerte/{id}"), Vec::new())
+                .await
+                .unwrap_or(made))
+        }
+        .await;
+        Ok(self.end_write(
+            run,
+            "Offerte toegevoegd; data.id is het id en data.nummer het offertenummer",
+            result,
+        ))
+    }
+
+    #[tool(
+        description = "Een offerte wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. De statussen staan bij de tool offerte. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP.",
+        annotations(
+            title = "Offerte wijzigen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn offerte_wijzigen(
+        &self,
+        Parameters(args): Parameters<write::OfferteWijzigenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "offerte_wijzigen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let now = self.fetch(&run, &format!("offerte/{}", args.id), Vec::new()).await?;
+            let old = self.fetch(&run, &format!("offerteregel/getbyofferteid/{}", args.id), Vec::new()).await?;
+            let books = self.books(&run).await?;
+            let (built, regels) = write::offerte_gewijzigd(&args, &now, &books)?;
+            self.approve(&run, TOOL, &built, false).await?;
+            self.change_done(&run, "PUT", "offerte", Some(&built.body)).await?;
+            if let Some(regels) = regels {
+                // New lines go in before the old ones go out: a failure halfway leaves too many lines, never none.
+                for (n, mut regel) in regels.into_iter().enumerate() {
+                    regel["offerteId"] = json!(args.id);
+                    if let Err(Halt::Error(message) | Halt::Refused(message)) = self.change(&run, "POST", "offerteregel", Some(&regel)).await {
+                        return Err(Halt::Error(format!(
+                            "De offerte is gewijzigd, maar nieuwe regel {} is niet opgeslagen: {message}. De oude regels staan er nog; kijk met offerte wat er nu staat.",
+                            n + 1
+                        )));
+                    }
+                }
+                for regel in old.as_array().cloned().unwrap_or_default() {
+                    if let Some(id) = regel.get("id").and_then(Value::as_u64)
+                        && let Err(Halt::Error(message) | Halt::Refused(message)) =
+                            self.change_done(&run, "DELETE", &format!("offerteregel/{id}"), None).await
+                    {
+                        return Err(Halt::Error(format!(
+                            "De nieuwe regels staan erin, maar een oude regel (id {id}) is niet verwijderd: {message}. Kijk met offerte wat er nu staat."
+                        )));
+                    }
+                }
+            }
+            Ok(self
+                .fetch(&run, &format!("offerte/{}", args.id), Vec::new())
+                .await
+                .unwrap_or_else(|_| json!({"id": args.id})))
+        }
+        .await;
+        Ok(self.end_write(run, "Offerte gewijzigd", result))
+    }
+
+    #[tool(
+        description = "Een offerte verwijderen, op id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        annotations(
+            title = "Offerte verwijderen",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn offerte_verwijderen(
+        &self,
+        Parameters(args): Parameters<IdArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "offerte_verwijderen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let now = self
+                .fetch(&run, &format!("offerte/{}", args.id), Vec::new())
+                .await?;
+            let nummer = now
+                .get("nummer")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let built = Built {
+                body: Value::Null,
+                title: format!("Offerte {nummer} verwijderen"),
+                lines: vec![
+                    line("Offerte", &nummer),
+                    line(
+                        "Relatie",
+                        format!(
+                            "id {}",
+                            now.get("relatieId").and_then(Value::as_u64).unwrap_or(0)
+                        ),
+                    ),
+                    line(
+                        "Totaal incl. btw",
+                        write::euro(now.get("totaalIncl").and_then(Value::as_f64).unwrap_or(0.0)),
+                    ),
+                    line(
+                        "Gevolg",
+                        "de offerte en zijn regels verdwijnen; dit is niet terug te draaien",
+                    ),
+                ],
+            };
+            self.approve(&run, TOOL, &built, true).await?;
+            self.change_done(&run, "DELETE", &format!("offerte/{}", args.id), None)
+                .await
+        }
+        .await;
+        Ok(self.end_write(run, "Offerte verwijderd", result))
+    }
+
+    #[tool(
+        description = "De sjablonen van één soort: factuur (opmaak van de factuur-pdf), offerte (opmaak van de offerte-pdf) of aanmaan (herinneringen en aanmaningen). E-mailsjablonen staan bij emailsjablonen.",
+        annotations(title = "Sjablonen", read_only_hint = true)
+    )]
+    async fn sjablonen(
+        &self,
+        Parameters(args): Parameters<SjablonenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let path = format!("{}/gridtable", args.soort.path());
+        let run = match self.begin(&context, "sjablonen", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            Ok(named_rows(
+                self.fetch(&run, &path, grid(Some(MAX_ROWS), None)?).await?,
+            ))
+        }
+        .await;
+        Ok(self.end(run, &path, result))
+    }
+
+    #[tool(
+        description = "Eén sjabloon lezen, op soort en id. Bij aanmaan: het onderwerp en de tekst. Bij factuur en offerte: de opmaak zoals e-Boekhoudens sjabloon-editor hem kent (`opmaak`: elements met id, tag, plaats x en y, width, height en content als HTML met codes; documentDefinition met het paginaformaat; sjabloon met de algemene instellingen) en `codes`, alle codes die e-Boekhouden invult met hun uitleg. Geef `opmaak` met je wijzigingen terug aan sjabloon_wijzigen.",
+        annotations(title = "Sjabloon", read_only_hint = true)
+    )]
+    async fn sjabloon(
+        &self,
+        Parameters(args): Parameters<SjabloonArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let run = match self.begin(&context, "sjabloon", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let path = format!("{}/{}", args.soort.path(), args.id);
+        let result = async {
+            let sjabloon = self.fetch(&run, &path, Vec::new()).await?;
+            if args.soort == SjabloonSoort::Aanmaan {
+                return Ok(json!({"sjabloon": sjabloon}));
+            }
+            if sjabloon.get("type").and_then(Value::as_str) != Some("E") {
+                return Ok(json!({"sjabloon": sjabloon, "opmaak": Value::Null, "let_op": "Dit sjabloon is een geüpload RTF-bestand; de opmaak daarvan is niet te lezen of te wijzigen via EB MCP."}));
+            }
+            let (hash, opmaak) = self.editor_session(&run, args.soort, args.id).await?;
+            let codes = self
+                .state
+                .api_editor(run.account.id, "GET", &format!("api/sjabloon/codes/{hash}"), None, Some(run.id), &run.client)
+                .await;
+            // Reading opens a session in the editor; it is closed again without saving anything.
+            self.editor_end(&run, &hash, opmaak.clone(), false).await?;
+            Ok(json!({"sjabloon": sjabloon, "opmaak": opmaak, "codes": codes.json.unwrap_or(Value::Null)}))
+        }
+        .await;
+        Ok(self.end(run, &path, result))
+    }
+
+    #[tool(
+        description = "Een sjabloon maken. Factuur en offerte: een kopie van een bestaand sjabloon (kopie_van, standaard het eerste actieve); pas de opmaak daarna aan met sjabloon_wijzigen. Aanmaan: een e-mailtekst met onderwerp en bericht. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP.",
+        annotations(
+            title = "Sjabloon toevoegen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn sjabloon_toevoegen(
+        &self,
+        Parameters(args): Parameters<SjabloonToevoegenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "sjabloon_toevoegen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let naam = args.naam.trim().to_owned();
+            if naam.is_empty() || naam.chars().count() > 50 {
+                return Err(Halt::Error("Geef het sjabloon een naam van hoogstens 50 tekens".into()));
+            }
+            let built = if args.soort == SjabloonSoort::Aanmaan {
+                let given = |value: &Option<String>, what: &str| {
+                    value
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| Halt::Error(format!("Een aanmaansjabloon heeft {what} nodig")))
+                };
+                let (onderwerp, bericht) = (given(&args.onderwerp, "een onderwerp")?, given(&args.bericht, "een bericht")?);
+                Built {
+                    body: json!({"naam": naam, "soort": "E", "onderwerp": onderwerp, "tekstEmail": bericht}),
+                    title: format!("Aanmaansjabloon toevoegen: {naam}"),
+                    lines: vec![line("Naam", &naam), line("Verzendwijze", "per e-mail"), line("Onderwerp", &onderwerp), line("Bericht", plain_text(&bericht))],
+                }
+            } else {
+                let from = match args.kopie_van {
+                    Some(id) => id,
+                    None => self
+                        .first_active(&run, &format!("{}/gridtable", args.soort.path()))
+                        .await?
+                        .ok_or_else(|| Halt::Error("Er is geen actief sjabloon om te kopiëren; geef kopie_van".into()))?,
+                };
+                let source = self.fetch(&run, &format!("{}/{from}", args.soort.path()), Vec::new()).await?;
+                if source.get("type").and_then(Value::as_str) != Some("E") {
+                    return Err(Halt::Error("Het sjabloon om te kopiëren is een RTF-bestand; kies er een dat in de editor is gemaakt".into()));
+                }
+                Built {
+                    body: json!({"naam": naam, "type": "E", "taal": "NL", "inactief": false, "copyFromId": from}),
+                    title: format!("{} toevoegen: {naam}", args.soort.naam()),
+                    lines: vec![
+                        line("Naam", &naam),
+                        line("Opmaak", format!("kopie van \"{}\"", source.get("naam").and_then(Value::as_str).unwrap_or_default())),
+                    ],
+                }
+            };
+            self.approve(&run, TOOL, &built, false).await?;
+            self.change(&run, "POST", args.soort.path(), Some(&built.body)).await
+        }
+        .await;
+        Ok(self.end_write(run, "Sjabloon toegevoegd; data.id is het id", result))
+    }
+
+    #[tool(
+        description = "Een sjabloon wijzigen, op soort en id. Aanmaan: naam, onderwerp of bericht. Factuur en offerte: naam, actief of inactief, en de opmaak: geef dan het hele document `opmaak` uit de tool sjabloon terug met je wijzigingen (tekst in content, plaats in x en y, grootte in width en height; nieuwe elementen krijgen een nieuw id). De gebruiker ziet per element wat er verandert. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP.",
+        annotations(
+            title = "Sjabloon wijzigen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn sjabloon_wijzigen(
+        &self,
+        Parameters(args): Parameters<SjabloonWijzigenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "sjabloon_wijzigen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let path = format!("{}/{}", args.soort.path(), args.id);
+        let result = async {
+            let mut sjabloon = self.fetch(&run, &path, Vec::new()).await?;
+            let old_name = sjabloon.get("naam").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let mut lines = vec![line(args.soort.naam(), &old_name)];
+            let mut meta_changed = false;
+            let object = sjabloon
+                .as_object_mut()
+                .ok_or_else(|| Halt::Error("e-Boekhouden gaf dit sjabloon in een onbekende vorm terug".into()))?;
+            if let Some(naam) = args.naam.as_deref().map(str::trim) {
+                if naam.is_empty() || naam.chars().count() > 50 {
+                    return Err(Halt::Error("Geef het sjabloon een naam van hoogstens 50 tekens".into()));
+                }
+                object.insert("naam".into(), json!(naam));
+                lines.push(line("Naam wordt", naam));
+                meta_changed = true;
+            }
+            let aanmaan = args.soort == SjabloonSoort::Aanmaan;
+            if aanmaan {
+                if args.inactief.is_some() || args.opmaak.is_some() {
+                    return Err(Halt::Error("Een aanmaansjabloon heeft geen opmaak en geen inactief; wijzig naam, onderwerp of bericht".into()));
+                }
+                for (value, key, label) in [(&args.onderwerp, "onderwerp", "Onderwerp"), (&args.bericht, "tekstEmail", "Bericht")] {
+                    if let Some(value) = value.as_deref().map(str::trim) {
+                        if value.is_empty() {
+                            return Err(Halt::Error(format!("{label} mag niet leeg zijn")));
+                        }
+                        object.insert(key.into(), json!(value));
+                        lines.push(line(&format!("{label} wordt"), if key == "tekstEmail" { plain_text(value) } else { value.to_owned() }));
+                        meta_changed = true;
+                    }
+                }
+            } else {
+                if args.onderwerp.is_some() || args.bericht.is_some() {
+                    return Err(Halt::Error("Onderwerp en bericht horen bij een aanmaansjabloon; wijzig hier naam, inactief of opmaak".into()));
+                }
+                if let Some(inactief) = args.inactief {
+                    object.insert("inactief".into(), json!(inactief));
+                    lines.push(line("Wordt", if inactief { "inactief" } else { "actief" }));
+                    meta_changed = true;
+                }
+            }
+            // The layout: compared with what the editor holds now, so the user sees what changes per element.
+            let mut layout = None;
+            if let Some(opmaak) = &args.opmaak {
+                if sjabloon.get("type").and_then(Value::as_str) != Some("E") {
+                    return Err(Halt::Error("Dit sjabloon is een geüpload RTF-bestand; de opmaak daarvan is niet te wijzigen via EB MCP".into()));
+                }
+                let (hash, now) = self.editor_session(&run, args.soort, args.id).await?;
+                let checked = write::opmaak_changes(&now, opmaak);
+                // The session that was opened to compare is closed without saving, whatever comes next.
+                self.editor_end(&run, &hash, now.clone(), false).await?;
+                let changes = checked?;
+                if !changes.is_empty() {
+                    lines.extend(changes);
+                    // What the tool did not send stays as the editor has it.
+                    let mut document = now;
+                    for key in ["elements", "documentDefinition", "sjabloon"] {
+                        if let Some(value) = opmaak.get(key) {
+                            document[key] = value.clone();
+                        }
+                    }
+                    layout = Some(document);
+                }
+            }
+            if !meta_changed && layout.is_none() {
+                return Err(Halt::Error("Er is niets gewijzigd: geef aan wat er anders moet".into()));
+            }
+            let built = Built { body: sjabloon, title: format!("{} wijzigen: {old_name}", args.soort.naam()), lines };
+            self.approve(&run, TOOL, &built, false).await?;
+            if meta_changed {
+                self.change_done(&run, "PUT", args.soort.path(), Some(&built.body)).await?;
+            }
+            if let Some(document) = layout {
+                let (hash, _) = self.editor_session(&run, args.soort, args.id).await.map_err(|e| {
+                    Halt::Error(if meta_changed { format!("Naam of status is gewijzigd, maar de opmaak niet: {e}") } else { e })
+                })?;
+                self.editor_end(&run, &hash, document, true).await.map_err(|e| {
+                    Halt::Error(if meta_changed {
+                        format!("Naam of status is gewijzigd, maar de opmaak niet: {e}")
+                    } else {
+                        e
+                    })
+                })?;
+            }
+            Ok(json!(true))
+        }
+        .await;
+        Ok(self.end_write(run, "Sjabloon gewijzigd", result))
+    }
+
+    #[tool(
+        description = "Een sjabloon verwijderen, op soort en id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        annotations(
+            title = "Sjabloon verwijderen",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn sjabloon_verwijderen(
+        &self,
+        Parameters(args): Parameters<SjabloonArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "sjabloon_verwijderen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let path = format!("{}/{}", args.soort.path(), args.id);
+        let result = async {
+            let sjabloon = self.fetch(&run, &path, Vec::new()).await?;
+            let naam = sjabloon.get("naam").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let built = Built {
+                body: Value::Null,
+                title: format!("{} verwijderen: {naam}", args.soort.naam()),
+                lines: vec![
+                    line(args.soort.naam(), &naam),
+                    line("Gevolg", "het sjabloon verdwijnt; wat het gebruikte heeft dan geen sjabloon meer. Niet terug te draaien."),
+                ],
+            };
+            self.approve(&run, TOOL, &built, true).await?;
+            self.change_done(&run, "DELETE", &path, None).await
+        }
+        .await;
+        Ok(self.end_write(run, "Sjabloon verwijderd", result))
+    }
 }
 
 /// How clients name and picture the server: "e-Boekhouden MCP" with the app icon, sent inline so it
@@ -1968,7 +3538,7 @@ impl ServerHandler for EbMcp {
             .with_server_info(server_info())
             .with_instructions(
                 "Leest de boekhouding in e-Boekhouden van de accounts die in EB MCP zijn ingelogd. \
-                 Wijzigen (mutaties, bestanden, facturen, abonnementen) kan alleen voor accounts waar de gebruiker schrijven heeft aangezet; \
+                 Wijzigen (mutaties, bestanden, facturen, offertes, abonnementen, sjablonen) en facturen mailen kan alleen voor accounts waar de gebruiker schrijven heeft aangezet; \
                  status zegt per account of dat uit staat, met akkoord of zonder akkoord. Met akkoord toont EB MCP elke wijziging eerst aan de gebruiker, \
                  en de tool wacht tot die is goedgekeurd of geweigerd: vertel de gebruiker dat er in EB MCP iets klaarstaat. \
                  Staat er meer dan één account in EB MCP, dan moet elke tool de account-parameter meekrijgen; status zegt welke accounts er zijn.",
@@ -2104,7 +3674,7 @@ mod tests {
 
     #[test]
     fn counts_its_tools_on_the_router() {
-        assert_eq!(tool_count(), 30);
+        assert_eq!(tool_count(), 49);
     }
 
     #[test]
@@ -2227,6 +3797,87 @@ mod tests {
                 .unwrap_err()
                 .contains("leeg")
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn checks_addresses_and_shows_a_message_as_plain_words() {
+        assert_eq!(
+            email(" jan@studionoord.example ", "X").as_deref(),
+            Ok("jan@studionoord.example")
+        );
+        for bad in [
+            "",
+            "jan",
+            "jan@",
+            "@x.nl",
+            "jan@localhost",
+            "jan @x.nl",
+            "jan@x.",
+            "jan@.nl",
+        ] {
+            assert!(
+                email(bad, "De ontvanger")
+                    .unwrap_err()
+                    .contains("De ontvanger"),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            plain_text(
+                "<div>[RELBEDRIJF]<br />\n[RELADRES]<br />\n<br />\nGeachte heer/mevrouw,&nbsp;<br /></div>\n<div><span style=\"x\">[ABBEDRIJF]</span> &amp; co</div>"
+            ),
+            "[RELBEDRIJF]\n[RELADRES]\n\nGeachte heer/mevrouw,\n\n[ABBEDRIJF] & co"
+        );
+        assert_eq!(
+            targets("<a href=\"https://evil.example/x\">https://bank.nl</a> <img SRC='https://t.example/p.gif'> <a href=https://evil.example/x>nog eens</a>").as_deref(),
+            Some("https://evil.example/x\nhttps://t.example/p.gif")
+        );
+        assert_eq!(targets("<p>Geen links</p>"), None);
+        assert_eq!(known(" ".into()), "onbekend");
+        assert_eq!(sjabloon_voor(&[SjabloonVoor::Offerte]), Ok((false, true)));
+        assert!(sjabloon_voor(&[]).is_err());
+    }
+
+    #[test]
+    fn saves_a_download_next_to_what_is_there_already() {
+        let dir = std::env::temp_dir().join(format!("ebmcp-pdf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            write_new(&dir, "F00002.pdf", b"een").unwrap(),
+            dir.join("F00002.pdf")
+        );
+        assert_eq!(
+            write_new(&dir, "F00002.pdf", b"twee").unwrap(),
+            dir.join("F00002 (2).pdf")
+        );
+        assert_eq!(
+            write_new(&dir, "F00002.pdf", b"drie").unwrap(),
+            dir.join("F00002 (3).pdf")
+        );
+        assert_eq!(
+            std::fs::read(dir.join("F00002.pdf")).unwrap(),
+            b"een",
+            "never overwritten"
+        );
+        // A symlink with the wanted name is not followed: the file lands under the next name.
+        #[cfg(unix)]
+        {
+            let elsewhere = dir.join("elders.txt");
+            std::os::unix::fs::symlink(&elsewhere, dir.join("F9.pdf")).unwrap();
+            assert_eq!(
+                write_new(&dir, "F9.pdf", b"x").unwrap(),
+                dir.join("F9 (2).pdf")
+            );
+            assert!(!elsewhere.exists());
+        }
+        assert_eq!(download_dir(Some(dir.to_str().unwrap())), Ok(dir.clone()));
+        assert!(
+            download_dir(Some("Downloads"))
+                .unwrap_err()
+                .contains("volledig pad")
+        );
+        assert!(download_dir(Some(dir.join("weg").to_str().unwrap())).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

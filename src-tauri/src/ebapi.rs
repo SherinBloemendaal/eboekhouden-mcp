@@ -11,14 +11,19 @@ use tokio::time::Instant as TokioInstant;
 use url::Url;
 
 pub const API_BASE: &str = "https://secure20.e-boekhouden.nl/v1/api/";
-/// The same budget EB Sessions keeps (DECISIONS.md, 2026-10-30): 30 reads a minute, 2 at a time.
-const PER_MINUTE: usize = 30;
+/// The same budget EB Sessions keeps (DECISIONS.md, 2026-10-30) for how many run at a time: 2.
+/// 60 starts a minute (Sherin's trial of 0.2.0, 2026-11-11: with the earlier 30 a tool that changes something was
+/// refused on its own reads; it reads a handful of things first). e-Boekhouden's own pages make more calls than
+/// this per page. Shown as the limit line on the Dashboard (LIMIT_PER_MINUTE in DashboardView.vue).
+const PER_MINUTE: usize = 60;
 const AT_ONCE: usize = 2;
 const BACKOFF_START: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a call may wait for its turn under the rate limit before it gives up (Sherin, 2026-11-06).
 const QUEUE_WAIT: Duration = Duration::from_secs(10);
+/// A change was approved by the user: it waits out a full window rather than fail on EB MCP's own limit.
+const CHANGE_WAIT: Duration = Duration::from_secs(75);
 
 /// One call as the request log keeps it. Secrets never get in here.
 #[derive(Clone, Debug, Serialize)]
@@ -43,6 +48,9 @@ impl ApiCall {
 }
 
 /// e-Boekhouden's classic pages, where its login form lives (`inloggen.asp`).
+/// The template editor (factuur- and offertesjablonen): the API sends the browser there with a session hash.
+pub const EDITOR_BASE: &str = "https://editor.e-boekhouden.nl/";
+
 pub const CLASSIC_BASE: &str = "https://secure.e-boekhouden.nl/bh/";
 /// The login form is a browser page; it gets a browser's User-Agent, as the page expects.
 const BROWSER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -50,6 +58,8 @@ const BROWSER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) App
 pub struct EbClient {
     base: Url,
     classic: Url,
+    /// e-Boekhouden's template editor, a site of its own with its own small API.
+    editor: Url,
     http: reqwest::Client,
     limiter: Limiter,
 }
@@ -61,10 +71,13 @@ impl EbClient {
         let classic = Url::parse(base)
             .and_then(|url| url.join("/bh/"))
             .expect("classic base");
-        Self::with_classic(base, classic.as_str())
+        let editor = Url::parse(base)
+            .and_then(|url| url.join("/editor/"))
+            .expect("editor base");
+        Self::with_hosts(base, classic.as_str(), editor.as_str())
     }
 
-    pub fn with_classic(base: &str, classic: &str) -> Self {
+    pub fn with_hosts(base: &str, classic: &str, editor: &str) -> Self {
         let http = reqwest::Client::builder()
             .timeout(TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
@@ -74,13 +87,14 @@ impl EbClient {
         Self {
             base: Url::parse(base).expect("API base"),
             classic: Url::parse(classic).expect("classic base"),
+            editor: Url::parse(editor).expect("editor base"),
             http,
             limiter: Limiter::new(),
         }
     }
 
     pub fn production() -> Self {
-        Self::with_classic(API_BASE, CLASSIC_BASE)
+        Self::with_hosts(API_BASE, CLASSIC_BASE, EDITOR_BASE)
     }
 
     /// GET `path` (relative to /v1/api/) with the given cookies of the account's session.
@@ -92,6 +106,236 @@ impl EbClient {
         query: &[(String, String)],
     ) -> ApiCall {
         self.send(cookies, "GET", path, query, None).await
+    }
+
+    /// Opens a session in the template editor for a factuur- or offertesjabloon. e-Boekhouden's API answers
+    /// `GET <kind>sjabloon/editor/<id>/<taal>` with a redirect to the editor; its `sessionHash` is the key to the
+    /// editor's own API (`editor`). Checked against the real editor on 2026-11-11.
+    pub async fn editor_open(
+        &self,
+        cookies: &[(String, String)],
+        path: &str,
+    ) -> (ApiCall, Option<String>) {
+        let mut call = ApiCall {
+            method: "GET",
+            path: path.to_owned(),
+            query: Vec::new(),
+            status: 0,
+            duration_ms: 0,
+            bytes: 0,
+            rows: None,
+            json: None,
+            error: None,
+        };
+        let url = match self.url(path, &[]) {
+            Ok(url) => url,
+            Err(e) => {
+                call.error = Some(e);
+                return (call, None);
+            }
+        };
+        let _permit = match self.limiter.acquire(QUEUE_WAIT).await {
+            Ok(permit) => permit,
+            Err(busy) => {
+                call.error = Some(busy.message());
+                return (call, None);
+            }
+        };
+        let started = Instant::now();
+        let mut request = self
+            .http
+            .get(url)
+            .header(reqwest::header::COOKIE, cookie_header(cookies));
+        if let Some(token) = auth_token(cookies) {
+            request = request.bearer_auth(token);
+        }
+        let mut hash = None;
+        match request.send().await {
+            Err(_) => call.error = Some("Geen verbinding met e-Boekhouden".into()),
+            Ok(response) => {
+                call.status = response.status().as_u16();
+                let target = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|location| self.editor.join(location).ok());
+                hash = target.as_ref().and_then(|url| {
+                    url.query_pairs()
+                        .find(|(key, _)| key == "sessionHash")
+                        .map(|(_, value)| value.into_owned())
+                        .filter(|value| {
+                            !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric())
+                        })
+                });
+                call.error = match (call.status, &hash) {
+                    (300..=399, Some(_)) => None,
+                    // A redirect anywhere else is the login page.
+                    (300..=399, None) | (401, _) => {
+                        Some("Niet (meer) ingelogd bij e-Boekhouden".into())
+                    }
+                    (404, _) => Some("Dit sjabloon bestaat niet (meer) bij e-Boekhouden".into()),
+                    (status, _) => Some(format!(
+                        "e-Boekhouden opende de sjabloon-editor niet ({status})"
+                    )),
+                };
+            }
+        }
+        call.duration_ms = started.elapsed().as_millis() as u64;
+        (call, hash)
+    }
+
+    /// One call on the template editor's own API (`api/session/<hash>`, `api/sjabloon/codes/<hash>`,
+    /// `api/session/end/<hash>`), with the session's cookies: without them the editor answers 500.
+    pub async fn editor(
+        &self,
+        cookies: &[(String, String)],
+        method: &'static str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> ApiCall {
+        let mut call = ApiCall {
+            method,
+            // The session hash is the key to the session: it stays out of the log.
+            path: match path.rsplit_once('/') {
+                Some((head, _)) => format!("editor/{head}/…"),
+                None => format!("editor/{path}"),
+            },
+            query: Vec::new(),
+            status: 0,
+            duration_ms: 0,
+            bytes: 0,
+            rows: None,
+            json: None,
+            error: None,
+        };
+        let Ok(url) = self.editor.join(path) else {
+            call.error = Some("Ongeldig pad".into());
+            return call;
+        };
+        let started = Instant::now();
+        let verb = if method == "POST" {
+            reqwest::Method::POST
+        } else {
+            reqwest::Method::GET
+        };
+        let mut request = self
+            .http
+            .request(verb, url)
+            .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
+            .header(reqwest::header::COOKIE, cookie_header(cookies));
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        match request.send().await {
+            Err(e) => {
+                call.error = Some(if e.is_timeout() {
+                    "De sjabloon-editor van e-Boekhouden antwoordde niet binnen 30 s".into()
+                } else {
+                    "Geen verbinding met de sjabloon-editor van e-Boekhouden".into()
+                })
+            }
+            Ok(response) => {
+                call.status = response.status().as_u16();
+                let bytes = response.bytes().await.unwrap_or_default();
+                call.bytes = bytes.len();
+                match call.status {
+                    200..=299 => {
+                        call.json = serde_json::from_slice::<Value>(&bytes)
+                            .ok()
+                            .map(|mut json| {
+                                without_session_keys(&mut json);
+                                json
+                            })
+                    }
+                    status => {
+                        call.error = Some(format!(
+                            "De sjabloon-editor van e-Boekhouden gaf een fout ({status})"
+                        ))
+                    }
+                }
+            }
+        }
+        call.duration_ms = started.elapsed().as_millis() as u64;
+        call
+    }
+
+    /// Fetches a file (an invoice's PDF) in the account's session: the call for the log, and on success the
+    /// bytes with the file name e-Boekhouden gives it.
+    pub async fn download(
+        &self,
+        cookies: &[(String, String)],
+        path: &str,
+    ) -> (ApiCall, Option<(Vec<u8>, Option<String>)>) {
+        let mut call = ApiCall {
+            method: "GET",
+            path: path.to_owned(),
+            query: Vec::new(),
+            status: 0,
+            duration_ms: 0,
+            bytes: 0,
+            rows: None,
+            json: None,
+            error: None,
+        };
+        let url = match self.url(path, &[]) {
+            Ok(url) => url,
+            Err(e) => {
+                call.error = Some(e);
+                return (call, None);
+            }
+        };
+        let _permit = match self.limiter.acquire(QUEUE_WAIT).await {
+            Ok(permit) => permit,
+            Err(busy) => {
+                call.error = Some(busy.message());
+                return (call, None);
+            }
+        };
+        let started = Instant::now();
+        let mut request = self.http.get(url);
+        if !cookies.is_empty() {
+            request = request.header(reqwest::header::COOKIE, cookie_header(cookies));
+        }
+        if let Some(token) = auth_token(cookies) {
+            request = request.bearer_auth(token);
+        }
+        let mut file = None;
+        match request.send().await {
+            Err(_) => {
+                self.limiter.failed(None).await;
+                call.error = Some("Geen verbinding met e-Boekhouden".into());
+            }
+            Ok(response) => {
+                call.status = response.status().as_u16();
+                let name = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_DISPOSITION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(file_name_of);
+                let body = response.bytes().await.unwrap_or_default();
+                call.bytes = body.len();
+                if call.status == 429 || call.status >= 500 {
+                    self.limiter.failed(None).await;
+                } else {
+                    self.limiter.succeeded().await;
+                }
+                match call.status {
+                    200..=299 if body.is_empty() => {
+                        call.error = Some("e-Boekhouden gaf een leeg bestand terug".into())
+                    }
+                    200..=299 => file = Some((body.to_vec(), name)),
+                    300..=399 | 401 => {
+                        call.error = Some("Niet (meer) ingelogd bij e-Boekhouden".into())
+                    }
+                    404 => {
+                        call.error = Some("Dit bestand bestaat niet (meer) bij e-Boekhouden".into())
+                    }
+                    status => call.error = Some(format!("e-Boekhouden gaf een fout ({status})")),
+                }
+            }
+        }
+        call.duration_ms = started.elapsed().as_millis() as u64;
+        (call, file)
     }
 
     /// Runs a job on e-Boekhouden's hub (hub.rs) in the account's session and waits for its end. Not rate
@@ -164,7 +408,12 @@ impl EbClient {
                 return call;
             }
         };
-        let _permit = match self.limiter.acquire().await {
+        let patience = if method == "GET" {
+            QUEUE_WAIT
+        } else {
+            CHANGE_WAIT
+        };
+        let _permit = match self.limiter.acquire(patience).await {
             Ok(permit) => permit,
             Err(busy) => {
                 call.error = Some(busy.message());
@@ -501,6 +750,30 @@ impl EbClient {
     }
 }
 
+/// Takes the editor's session keys out of what it answers: they are the keys to an open session and have no
+/// business in a tool's answer, the request log or the debug export.
+pub fn without_session_keys(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("sessionHash");
+            object.remove("sessionKey");
+            object.values_mut().for_each(without_session_keys);
+        }
+        Value::Array(items) => items.iter_mut().for_each(without_session_keys),
+        _ => {}
+    }
+}
+
+/// The file name in a `Content-Disposition` header (`attachment; filename=F00002.pdf`), without any folder.
+pub fn file_name_of(disposition: &str) -> Option<String> {
+    let value = disposition
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("filename="))?;
+    let name = value.trim_matches('"').rsplit(['/', '\\']).next()?.trim();
+    (!name.is_empty() && name != "." && name != "..").then(|| name.to_owned())
+}
+
 pub fn cookie_header(cookies: &[(String, String)]) -> String {
     cookies
         .iter()
@@ -756,7 +1029,7 @@ pub fn count_rows(json: &Value) -> Option<usize> {
 /// Why a call gave up waiting for its turn.
 #[derive(Debug, PartialEq)]
 enum Busy {
-    /// The 30 a minute (or the 2 at a time) are taken.
+    /// The 60 a minute (or the 2 at a time) are taken.
     RateLimit,
     /// EB MCP pauses after errors from e-Boekhouden; this much of the pause is left.
     Paused(Duration),
@@ -765,7 +1038,7 @@ enum Busy {
 impl Busy {
     fn message(&self) -> String {
         match self {
-            Busy::RateLimit => "Te veel aanroepen tegelijk: EB MCP houdt e-Boekhouden rustig (30 per minuut). Probeer het over een minuut opnieuw.".into(),
+            Busy::RateLimit => "Te veel aanroepen tegelijk: EB MCP houdt e-Boekhouden rustig (60 per minuut). Probeer het over een minuut opnieuw.".into(),
             Busy::Paused(left) => format!(
                 "e-Boekhouden gaf net fouten, dus EB MCP wacht nog {} met nieuwe aanroepen. Probeer het daarna opnieuw.",
                 wait_text(*left)
@@ -785,7 +1058,7 @@ fn wait_text(wait: Duration) -> String {
     }
 }
 
-/// 30 starts per minute, 2 at a time, and a growing pause after errors.
+/// 60 starts per minute, 2 at a time, and a growing pause after errors.
 struct Limiter {
     slots: Semaphore,
     state: Mutex<LimiterState>,
@@ -809,9 +1082,9 @@ impl Limiter {
         }
     }
 
-    /// A place under the limit, or why none came free within QUEUE_WAIT.
-    async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, Busy> {
-        if let Ok(permit) = tokio::time::timeout(QUEUE_WAIT, self.wait_for_turn()).await {
+    /// A place under the limit, or why none came free within `patience`.
+    async fn acquire(&self, patience: Duration) -> Result<tokio::sync::SemaphorePermit<'_>, Busy> {
+        if let Ok(permit) = tokio::time::timeout(patience, self.wait_for_turn()).await {
             return Ok(permit);
         }
         let state = self.state.lock().await;
@@ -1043,11 +1316,14 @@ mod tests {
         let limiter = Limiter::new();
         let start = tokio::time::Instant::now();
         for _ in 0..PER_MINUTE {
-            assert!(limiter.acquire().await.is_ok());
+            assert!(limiter.acquire(QUEUE_WAIT).await.is_ok());
         }
         assert!(start.elapsed() < Duration::from_secs(1));
-        // The 31st waits at most 10 s for a place, then gives up instead of hanging for the rest of the minute.
-        assert_eq!(limiter.acquire().await.err(), Some(Busy::RateLimit));
+        // The next one over the limit waits at most 10 s for a place, then gives up instead of hanging for the rest of the minute.
+        assert_eq!(
+            limiter.acquire(QUEUE_WAIT).await.err(),
+            Some(Busy::RateLimit)
+        );
         let waited = start.elapsed();
         assert!(
             waited >= Duration::from_secs(10) && waited < Duration::from_secs(11),
@@ -1060,15 +1336,15 @@ mod tests {
         let limiter = Limiter::new();
         limiter.failed(None).await;
         let start = tokio::time::Instant::now();
-        assert!(limiter.acquire().await.is_ok());
+        assert!(limiter.acquire(QUEUE_WAIT).await.is_ok());
         assert!(start.elapsed() >= Duration::from_secs(2));
         limiter.failed(Some(Duration::from_secs(6))).await;
         let start = tokio::time::Instant::now();
-        assert!(limiter.acquire().await.is_ok());
+        assert!(limiter.acquire(QUEUE_WAIT).await.is_ok());
         assert!(start.elapsed() >= Duration::from_secs(6));
         // A pause longer than the queue wait fails the call instead of holding it for minutes, and says so.
         limiter.failed(Some(Duration::from_secs(120))).await;
-        let Err(Busy::Paused(left)) = limiter.acquire().await else {
+        let Err(Busy::Paused(left)) = limiter.acquire(QUEUE_WAIT).await else {
             panic!("the call should give up because of the pause")
         };
         assert!(
@@ -1079,11 +1355,11 @@ mod tests {
 
     #[test]
     fn says_why_a_call_gave_up_waiting() {
-        assert!(Busy::RateLimit.message().contains("30 per minuut"));
+        assert!(Busy::RateLimit.message().contains("60 per minuut"));
         let paused = Busy::Paused(Duration::from_millis(109_400)).message();
         assert!(paused.contains("e-Boekhouden gaf net fouten"), "{paused}");
         assert!(paused.contains("nog 2 minuten"), "{paused}");
-        assert!(!paused.contains("30 per minuut"), "{paused}");
+        assert!(!paused.contains("60 per minuut"), "{paused}");
         assert_eq!(wait_text(Duration::from_millis(300)), "1 seconde");
         assert_eq!(wait_text(Duration::from_millis(11_200)), "12 seconden");
         assert_eq!(wait_text(Duration::from_secs(60)), "1 minuut");
@@ -1184,6 +1460,34 @@ mod tests {
             "asking for the code is no error"
         );
         assert!(code.notes.join(" ").contains("txtCode"), "{:?}", code.notes);
+    }
+
+    #[test]
+    fn keeps_the_editors_session_keys_to_itself() {
+        let mut answer = json!({"sessionKey": "k", "taal": "NL", "sjabloon": {"sessionHash": "h", "elements": [{"id": 1, "sessionHash": "x"}]}});
+        without_session_keys(&mut answer);
+        assert_eq!(
+            answer,
+            json!({"taal": "NL", "sjabloon": {"elements": [{"id": 1}]}})
+        );
+    }
+
+    #[test]
+    fn reads_a_download_file_name_without_any_folder() {
+        assert_eq!(
+            file_name_of("attachment; filename=F00002.pdf").as_deref(),
+            Some("F00002.pdf")
+        );
+        assert_eq!(
+            file_name_of("attachment; filename=\"Factuur 12.pdf\"").as_deref(),
+            Some("Factuur 12.pdf")
+        );
+        assert_eq!(
+            file_name_of("attachment; filename=../../etc/x.pdf").as_deref(),
+            Some("x.pdf")
+        );
+        assert_eq!(file_name_of("attachment; filename=..").as_deref(), None);
+        assert_eq!(file_name_of("inline"), None);
     }
 
     #[tokio::test]

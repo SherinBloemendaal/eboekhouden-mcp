@@ -60,6 +60,9 @@ pub enum AppEvent {
     ApprovalsChanged,
 }
 
+/// The cookies of a live session and the account's label.
+type SessionCookies = (Vec<(String, String)>, String);
+
 pub struct AppState {
     pub accounts: AccountStore,
     pub client: EbClient,
@@ -212,6 +215,119 @@ impl AppState {
     ) -> ApiCall {
         self.api_send(account_id, "GET", path, query, None, parent, client)
             .await
+    }
+
+    /// The cookies of an account's live session and its label, or the call that says it is not signed in.
+    fn session_cookies(
+        &self,
+        account_id: Uuid,
+        path: &str,
+    ) -> Result<SessionCookies, Box<(ApiCall, String)>> {
+        let session = self.sessions.read().unwrap().get(&account_id).cloned();
+        let label = session
+            .as_ref()
+            .map(|s| s.label.clone())
+            .unwrap_or_else(|| self.label_of(account_id));
+        match session
+            .filter(|s| !s.expired)
+            .and_then(|s| self.jar.cookies(&s.key).ok())
+        {
+            Some(cookies) => {
+                self.note_use(account_id);
+                Ok((cookies, label))
+            }
+            None => Err(Box::new((not_signed_in(path, &[], &label), label))),
+        }
+    }
+
+    fn log_call(
+        &self,
+        call: &ApiCall,
+        account_id: Uuid,
+        label: String,
+        parent: Option<u64>,
+        client: &str,
+        had_session: bool,
+    ) {
+        self.log
+            .add_eb(call, parent, client, Some((account_id, label)), had_session);
+        let _ = self.events.send(AppEvent::LogChanged);
+    }
+
+    /// Opens a template editor session in the account's session (ebapi.rs, `editor_open`): the call and the session hash.
+    pub async fn api_editor_open(
+        &self,
+        account_id: Uuid,
+        path: &str,
+        parent: Option<u64>,
+        client: &str,
+    ) -> (ApiCall, Option<String>) {
+        match self.session_cookies(account_id, path) {
+            Err(refused) => {
+                let (call, label) = *refused;
+                self.log_call(&call, account_id, label, parent, client, false);
+                (call, None)
+            }
+            Ok((cookies, label)) => {
+                let (call, hash) = self.client.editor_open(&cookies, path).await;
+                if call.error.is_some() && matches!(call.status, 300..=399 | 401) {
+                    self.mark_expired(account_id);
+                }
+                self.log_call(&call, account_id, label, parent, client, true);
+                (call, hash)
+            }
+        }
+    }
+
+    /// One call on the template editor's API in the account's session, logged like any other call.
+    pub async fn api_editor(
+        &self,
+        account_id: Uuid,
+        method: &'static str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        parent: Option<u64>,
+        client: &str,
+    ) -> ApiCall {
+        // The last part of an editor path is the session's hash: it never goes into the log.
+        let shown = path.rsplit_once('/').map_or(path, |(head, _)| head);
+        match self.session_cookies(account_id, shown) {
+            Err(refused) => {
+                let (call, label) = *refused;
+                self.log_call(&call, account_id, label, parent, client, false);
+                call
+            }
+            Ok((cookies, label)) => {
+                let call = self.client.editor(&cookies, method, path, body).await;
+                self.log_call(&call, account_id, label, parent, client, true);
+                call
+            }
+        }
+    }
+
+    /// A file from e-Boekhouden in the session of `account_id`, logged like any other call.
+    pub async fn api_download(
+        &self,
+        account_id: Uuid,
+        path: &str,
+        parent: Option<u64>,
+        client: &str,
+    ) -> (ApiCall, Option<(Vec<u8>, Option<String>)>) {
+        match self.session_cookies(account_id, path) {
+            Err(refused) => {
+                let (call, label) = *refused;
+                self.log_call(&call, account_id, label, parent, client, false);
+                (call, None)
+            }
+            Ok((cookies, label)) => {
+                let (call, file) = self.client.download(&cookies, path).await;
+                if matches!(call.status, 300..=399 | 401) {
+                    self.mark_expired(account_id);
+                }
+                self.log_call(&call, account_id, label, parent, client, true);
+                (call, file)
+            }
+        }
     }
 
     /// A job on e-Boekhouden's hub in the session of `account_id`, logged like any other call.

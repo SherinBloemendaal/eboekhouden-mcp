@@ -267,6 +267,13 @@ mod tests {
             "factuur",
             "abonnementen",
             "abonnement",
+            "factuur_pdf",
+            "emailsjablonen",
+            "offertes",
+            "offerte",
+            "offerte_pdf",
+            "sjablonen",
+            "sjabloon",
         ] {
             assert!(names.contains(&want), "{want} missing from {names:?}");
         }
@@ -284,8 +291,26 @@ mod tests {
             "abonnement_wijzigen",
             "abonnement_verwijderen",
             "abonnementen_factureren",
+            "mutatie_verwijderen",
+            "archief_verwijderen",
+            "factuur_mailen",
+            "emailsjabloon_toevoegen",
+            "emailsjabloon_wijzigen",
+            "emailsjabloon_verwijderen",
+            "offerte_toevoegen",
+            "offerte_wijzigen",
+            "offerte_verwijderen",
+            "sjabloon_toevoegen",
+            "sjabloon_wijzigen",
+            "sjabloon_verwijderen",
         ];
         let destructive = [
+            "offerte_verwijderen",
+            "sjabloon_verwijderen",
+            "mutatie_verwijderen",
+            "archief_verwijderen",
+            "factuur_mailen",
+            "emailsjabloon_verwijderen",
             "factuur_verwijderen",
             "factuur_crediteren",
             "abonnement_verwijderen",
@@ -303,7 +328,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(names.len(), 18 + writes.len());
+        assert_eq!(names.len(), 25 + writes.len());
         assert_eq!(crate::tools::tool_count(), names.len());
 
         let call = message(
@@ -528,6 +553,341 @@ mod tests {
         assert!(!is_error, "{text}");
         assert_eq!(seen.lock().unwrap().len(), 2);
         assert_eq!(state.approvals.count(), 0);
+    }
+
+    /// What the stand-in for e-Boekhouden below was asked to change, in order.
+    type Changes = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A stand-in for e-Boekhouden with a mutatie, two archive files (one linked) and a template in the editor.
+    async fn books_mock(changes: Changes) -> String {
+        use axum::extract::Path;
+        use axum::routing::{delete, get, post};
+        use serde_json::json;
+        let note = |changes: &Changes, what: String| changes.lock().unwrap().push(what);
+        let (c1, c2, c3) = (changes.clone(), changes.clone(), changes.clone());
+        let app = axum::Router::new()
+            .route("/v1/api/mutatie/nr/16/model", get(|| async { axum::Json(json!({"mutatie": {"nr": 16, "datum": "2026-11-11T00:00:00", "omschrijving": "Proef", "soort": 6}, "mutatieRegels": []})) }))
+            .route(
+                "/v1/api/mutatie/gridtable",
+                get(|| async {
+                    axum::Json(json!({"colMetadata": [{"name": "id", "readerIndex": 0}, {"name": "mutatieNr", "readerIndex": 1}, {"name": "soort", "readerIndex": 2}, {"name": "bedrag", "readerIndex": 3}],
+                                      "data": [[777, 16, "Geld uit", 2.42]]}))
+                }),
+            )
+            .route(
+                "/v1/api/mutatie/bulk/delete",
+                post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let changes = c1.clone();
+                    async move {
+                        note(&changes, format!("delete mutaties {body}"));
+                        axum::Json(json!({"removedIds": body, "errorMessages": [], "notFoundIds": []}))
+                    }
+                }),
+            )
+            .route(
+                "/v1/api/folder/{id}",
+                get(|Path(id): Path<u64>| async move { axum::Json(json!({"id": id, "naam": format!("bon-{id}.pdf"), "soort": "F", "isDeleted": id == 3, "koppelCount": 0})) }).delete(
+                    move |Path(id): Path<u64>| {
+                        let changes = c2.clone();
+                        async move {
+                            note(&changes, format!("delete file {id}"));
+                            axum::Json(json!(true))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/v1/api/folder/{id}/koppel",
+                get(|Path(id): Path<u64>| async move {
+                    // File 2 is linked to a mutatie; the API gives lists.
+                    axum::Json(json!({"koppelImport": [], "koppelMutatie": if id == 2 { json!([{"mutNr": 16}]) } else { json!([]) }, "koppelOfferte": [], "koppelRelatie": []}))
+                }),
+            )
+            .route("/v1/api/factuursjabloon/9", get(|| async { axum::Json(json!({"id": 9, "naam": "Factuursjabloon", "inactief": false, "type": "E"})) }))
+            .route("/v1/api/factuursjabloon/9/language", get(|| async { axum::Json(json!("NL")) }))
+            .route(
+                "/v1/api/factuursjabloon/editor/9/NL",
+                get(|| async { (axum::http::StatusCode::FOUND, [(axum::http::header::LOCATION, "/editor/?sessionHash=abc123")]) }),
+            )
+            .route(
+                "/editor/api/session/abc123",
+                get(|headers: HeaderMap| async move {
+                    if !headers.get("cookie").and_then(|v| v.to_str().ok()).is_some_and(|c| c.contains("auth-token=jwt")) {
+                        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    axum::Json(json!({"sessionKey": "geheim", "sjabloon": {"sessionHash": "ouder", "elements": [{"id": 1, "tag": "text", "x": 1, "y": 2, "width": 3, "height": 4, "content": "<h1>FACTUUR</h1>"}], "documentDefinition": {"width": 840}}})).into_response()
+                }),
+            )
+            .route("/editor/api/sjabloon/codes/abc123", get(|| async { axum::Json(json!([{"category": "Factuur", "code": "[NUMMER]", "description": "Het factuurnummer"}])) }))
+            .route(
+                "/editor/api/session/end/abc123",
+                post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let changes = c3.clone();
+                    async move {
+                        note(&changes, format!("editor end save={} hash={}", body["saveChanges"], body["saveData"]["sessionHash"]));
+                        ""
+                    }
+                }),
+            )
+            .route("/v1/api/folder/x", delete(|| async { "" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://127.0.0.1:{port}/v1/api/")
+    }
+
+    #[tokio::test]
+    async fn what_cannot_be_undone_always_asks_and_reading_a_template_saves_nothing() {
+        use crate::accounts::{AccountInput, Store, WriteMode};
+        let changes: Changes = Arc::default();
+        let jar = Arc::new(crate::state::testing::FakeJar::default());
+        let state = Arc::new(crate::state::testing::state_with(
+            jar,
+            &books_mock(changes.clone()).await,
+        ));
+        let input = |mode: WriteMode| AccountInput {
+            label: "Studio Noord".into(),
+            username: "lisa@studionoord.example".into(),
+            store: Store::System,
+            op_ref: None,
+            op_title: None,
+            op_vault: None,
+            write: mode,
+        };
+        let account = state.accounts.add(input(WriteMode::Off)).unwrap();
+        state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
+        state.add_session(account.id, &account.label, "sessie");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mcp = router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
+        tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{PATH}");
+        let post = |body: serde_json::Value, session: Option<String>| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&body);
+            if let Some(s) = session {
+                request = request.header("mcp-session-id", s);
+            }
+            request.send()
+        };
+        let init = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        let call = |tool: &'static str, arguments: serde_json::Value| {
+            let request = post(
+                serde_json::json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}),
+                session.clone(),
+            );
+            async move {
+                let body = request.await.unwrap().text().await.unwrap();
+                let answer = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .unwrap_or_else(|| {
+                        body.lines()
+                            .filter_map(|l| l.strip_prefix("data:"))
+                            .filter_map(|d| {
+                                serde_json::from_str::<serde_json::Value>(d.trim()).ok()
+                            })
+                            .find(|v| v.get("id").is_some())
+                            .unwrap_or_else(|| panic!("no JSON-RPC answer in {body}"))
+                    });
+                (
+                    answer["result"]["isError"] == true,
+                    answer["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            }
+        };
+        // Answers the one proposal that comes up, after checking it is marked as not undoable.
+        let decide = |approve: bool, title: &'static str| {
+            let state = state.clone();
+            async move {
+                for _ in 0..300 {
+                    if let Some(proposal) = state.approvals.list().into_iter().next() {
+                        assert_eq!(proposal.title, title);
+                        assert!(proposal.danger, "{title} must be shown as not undoable");
+                        assert!(state.approvals.decide(proposal.id, approve));
+                        return proposal;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("no proposal came up for {title}");
+            }
+        };
+        let made = || changes.lock().unwrap().clone();
+
+        // A read-only account: the new tools are refused before anything is asked or sent.
+        for (tool, arguments) in [
+            ("mutatie_verwijderen", serde_json::json!({"nr": 16})),
+            ("archief_verwijderen", serde_json::json!({"bestand_id": 1})),
+            (
+                "sjabloon_verwijderen",
+                serde_json::json!({"soort": "factuur", "id": 9}),
+            ),
+            (
+                "factuur_mailen",
+                serde_json::json!({"id": 1, "aan": "jan@example.com"}),
+            ),
+            ("offerte_verwijderen", serde_json::json!({"id": 1})),
+        ] {
+            let (is_error, text) = call(tool, arguments).await;
+            assert!(is_error && text.contains("alleen-lezen"), "{tool}: {text}");
+        }
+        assert_eq!(state.approvals.count(), 0);
+        assert!(made().is_empty());
+
+        // An account that needs no approval for ordinary changes still asks before a mutatie is deleted.
+        state
+            .accounts
+            .update(account.id, input(WriteMode::Auto))
+            .unwrap();
+        let ((is_error, text), proposal) = tokio::join!(
+            call("mutatie_verwijderen", serde_json::json!({"nr": 16})),
+            decide(false, "Mutatie 16 verwijderen")
+        );
+        assert!(is_error && text.contains("geweigerd"), "{text}");
+        assert!(
+            proposal.lines.iter().any(|l| l.value.contains("afgeraden")),
+            "{:?}",
+            proposal.lines
+        );
+        assert!(made().is_empty(), "refused: nothing was deleted");
+        let ((is_error, text), _) = tokio::join!(
+            call("mutatie_verwijderen", serde_json::json!({"nr": 16})),
+            decide(true, "Mutatie 16 verwijderen")
+        );
+        assert!(!is_error, "{text}");
+        assert_eq!(
+            made(),
+            vec!["delete mutaties [777]"],
+            "by the id the list gives for that number"
+        );
+
+        // A file nothing hangs on goes without asking on this account; a linked one always asks, with a warning.
+        let (is_error, text) =
+            call("archief_verwijderen", serde_json::json!({"bestand_id": 1})).await;
+        assert!(!is_error, "{text}");
+        assert_eq!(made().last().unwrap(), "delete file 1");
+        let ((is_error, text), proposal) = tokio::join!(
+            call("archief_verwijderen", serde_json::json!({"bestand_id": 2})),
+            decide(false, "Bestand verwijderen: bon-2.pdf")
+        );
+        assert!(is_error && text.contains("geweigerd"), "{text}");
+        assert!(
+            proposal.lines.iter().any(|l| l.value.contains("1 mutatie")),
+            "{:?}",
+            proposal.lines
+        );
+        assert_eq!(made().len(), 2, "the linked file is still there");
+        // A file that is in the bin already is left alone.
+        let (is_error, text) =
+            call("archief_verwijderen", serde_json::json!({"bestand_id": 3})).await;
+        assert!(is_error && text.contains("prullenbak"), "{text}");
+
+        // Reading a layout opens the editor and closes it without saving; the session's keys stay inside.
+        let (is_error, text) =
+            call("sjabloon", serde_json::json!({"soort": "factuur", "id": 9})).await;
+        assert!(!is_error, "{text}");
+        assert!(
+            text.contains("FACTUUR") && text.contains("[NUMMER]"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("sessionHash") && !text.contains("abc123") && !text.contains("geheim"),
+            "{text}"
+        );
+        assert_eq!(
+            made().last().unwrap(),
+            "editor end save=false hash=\"abc123\""
+        );
+        let logged = serde_json::to_string(&state.log.list()).unwrap()
+            + &state
+                .log
+                .list()
+                .iter()
+                .filter_map(|e| {
+                    serde_json::to_string(&state.log.get(match e {
+                        crate::reqlog::Entry::Mcp(m) => m.id,
+                        crate::reqlog::Entry::Eb(b) => b.id,
+                    }))
+                    .ok()
+                })
+                .collect::<String>();
+        assert!(
+            !logged.contains("abc123") && !logged.contains("geheim"),
+            "the session's keys are not in the log"
+        );
+
+        // A changed layout says what changes, and is saved in a new session only after the user's word.
+        state
+            .accounts
+            .update(account.id, input(WriteMode::Ask))
+            .unwrap();
+        let opmaak = serde_json::json!({"elements": [{"id": 1, "tag": "text", "x": 1, "y": 2, "width": 3, "height": 4, "content": "<h1>FACTUUR 2</h1>"}]});
+        let answer = async {
+            for _ in 0..300 {
+                if let Some(proposal) = state.approvals.list().into_iter().next() {
+                    assert!(
+                        proposal
+                            .lines
+                            .iter()
+                            .any(|l| l.label == "Tekst van text 1 was" && l.value == "FACTUUR"),
+                        "{:?}",
+                        proposal.lines
+                    );
+                    assert!(
+                        proposal
+                            .lines
+                            .iter()
+                            .any(|l| l.label == "Tekst van text 1 wordt" && l.value == "FACTUUR 2"),
+                        "{:?}",
+                        proposal.lines
+                    );
+                    assert_eq!(
+                        made().last().unwrap(),
+                        "editor end save=false hash=\"abc123\"",
+                        "nothing saved before the answer"
+                    );
+                    assert!(state.approvals.decide(proposal.id, true));
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("no proposal for the layout");
+        };
+        let ((is_error, text), ()) = tokio::join!(
+            call(
+                "sjabloon_wijzigen",
+                serde_json::json!({"soort": "factuur", "id": 9, "opmaak": opmaak})
+            ),
+            answer
+        );
+        assert!(!is_error, "{text}");
+        assert_eq!(
+            made().last().unwrap(),
+            "editor end save=true hash=\"abc123\""
+        );
     }
 
     #[test]

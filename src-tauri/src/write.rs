@@ -1385,6 +1385,452 @@ pub fn factuur_credit(
     })
 }
 
+// ---------------------------------------------------------------- offertes
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct OfferteToevoegenArgs {
+    /// Id van de relatie (de klant).
+    pub relatie_id: u64,
+    /// Offertedatum, JJJJ-MM-DD (standaard vandaag).
+    pub datum: Option<String>,
+    /// Vervaldatum, JJJJ-MM-DD (standaard een maand na de offertedatum).
+    pub vervaldatum: Option<String>,
+    /// Offertenummer (standaard het volgende nummer dat e-Boekhouden voorstelt).
+    pub nummer: Option<String>,
+    /// Kenmerk van de klant.
+    pub kenmerk: Option<String>,
+    /// Notitie voor de klant, op de offerte.
+    pub notitie: Option<String>,
+    /// Interne notitie.
+    pub interne_notitie: Option<String>,
+    /// Zijn de prijzen incl of excl btw (standaard excl).
+    pub bedragen: Option<InEx>,
+    /// De producten of diensten op de offerte.
+    pub regels: Vec<FactuurRegelArg>,
+    /// Id van het offertesjabloon (standaard het eerste actieve).
+    pub sjabloon_id: Option<u64>,
+    /// Id van de offertestatus (standaard de eerste, "Ingevoerd").
+    pub status_id: Option<u64>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct OfferteWijzigenArgs {
+    /// Id van de offerte (uit offertes).
+    pub id: u64,
+    /// Nieuwe offertedatum, JJJJ-MM-DD.
+    pub datum: Option<String>,
+    /// Nieuwe vervaldatum, JJJJ-MM-DD.
+    pub vervaldatum: Option<String>,
+    /// Nieuw offertenummer.
+    pub nummer: Option<String>,
+    /// Nieuw kenmerk.
+    pub kenmerk: Option<String>,
+    /// Nieuwe notitie voor de klant.
+    pub notitie: Option<String>,
+    /// Nieuwe interne notitie.
+    pub interne_notitie: Option<String>,
+    /// Nieuwe status (id uit de lijst met offertestatussen).
+    pub status_id: Option<u64>,
+    /// Prijzen incl of excl btw. Alleen samen met `regels`.
+    pub bedragen: Option<InEx>,
+    /// Vervangt alle regels van de offerte. Laat weg om ze te houden.
+    pub regels: Option<Vec<FactuurRegelArg>>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+/// What a new quote takes from the administration.
+#[derive(Clone, Debug)]
+pub struct OfferteContext {
+    /// `offerte/nummer/next`.
+    pub volgend_nummer: String,
+    /// The first active `offertesjabloon`.
+    pub sjabloon_id: u64,
+    /// The first `offertestatus`.
+    pub status_id: u64,
+    /// The signed-in user's id (`user.id`), who the quote is "in behandeling bij".
+    pub gebruiker_id: u64,
+    pub vandaag: Date,
+}
+
+/// The same day a month later, as e-Boekhouden's form proposes for the vervaldatum (kept within every month).
+fn month_later((y, m, d): Date) -> Date {
+    let (y, m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    // The last day of the target month that still parses is the longest it has.
+    let day = (28..=d.max(28))
+        .rev()
+        .find(|day| parse_date(&dashed((y, m, *day))).is_ok())
+        .unwrap_or(28);
+    (y, m, day.min(d.max(1)))
+}
+
+/// The lines of a quote, each as `POST offerteregel` takes it (without the quote's id, which the caller adds).
+pub fn offerte_regels(
+    regels: &[FactuurRegelArg],
+    in_ex: InEx,
+    books: &Books,
+) -> Result<(Vec<Value>, Vec<Line>), String> {
+    let (items, lines) = factuur_items(regels, in_ex, books)?;
+    let regels = items
+        .into_iter()
+        .map(|item| {
+            let mut regel = Map::new();
+            regel.insert("id".into(), json!(0));
+            regel.insert("volgorde".into(), Value::Null);
+            for (from, to) in [
+                ("aantal", "aantal"),
+                ("omschrijving", "omschrijving"),
+                ("prijsExcl", "prijsExcl"),
+                ("prijsIncl", "prijsIncl"),
+                ("btw", "btwCode"),
+                ("grootboekId", "grootboekId"),
+                ("kortingIsPerc", "kortingIsPerc"),
+                ("code", "code"),
+            ] {
+                if let Some(value) = item.get(from) {
+                    regel.insert(to.into(), value.clone());
+                }
+            }
+            Value::Object(regel)
+        })
+        .collect();
+    Ok((regels, lines))
+}
+
+/// A new quote: the body for `POST offerte`, its lines for `POST offerteregel`, and the summary.
+pub fn offerte_nieuw(
+    args: &OfferteToevoegenArgs,
+    context: &OfferteContext,
+    books: &Books,
+) -> Result<(Built, Vec<Value>), String> {
+    let in_ex = args.bedragen.unwrap_or(InEx::Excl);
+    let datum = args
+        .datum
+        .as_deref()
+        .map(parse_date)
+        .transpose()?
+        .unwrap_or(context.vandaag);
+    let vervalt = args
+        .vervaldatum
+        .as_deref()
+        .map(parse_date)
+        .transpose()?
+        .unwrap_or_else(|| month_later(datum));
+    if vervalt < datum {
+        return Err("De vervaldatum ligt voor de offertedatum".into());
+    }
+    let nummer = text(&args.nummer).unwrap_or_else(|| context.volgend_nummer.clone());
+    if nummer.is_empty() {
+        return Err("Geef een offertenummer".into());
+    }
+    let (regels, regel_lines) = offerte_regels(&args.regels, in_ex, books)?;
+    let mut offerte = Map::new();
+    offerte.insert(
+        "statusId".into(),
+        json!(args.status_id.unwrap_or(context.status_id)),
+    );
+    offerte.insert("nummer".into(), json!(nummer));
+    offerte.insert("behandelGebruikerId".into(), json!(context.gebruiker_id));
+    offerte.insert("relatieId".into(), json!(args.relatie_id));
+    offerte.insert(
+        "kenmerk".into(),
+        json!(text(&args.kenmerk).unwrap_or_default()),
+    );
+    offerte.insert("datum".into(), date_object(datum));
+    offerte.insert("vervaldatum".into(), date_object(vervalt));
+    offerte.insert(
+        "sjabloonId".into(),
+        json!(args.sjabloon_id.unwrap_or(context.sjabloon_id)),
+    );
+    offerte.insert("factuurEmailsjabloonId".into(), json!(""));
+    offerte.insert(
+        "notitiePubliek".into(),
+        json!(text(&args.notitie).unwrap_or_default()),
+    );
+    if let Some(intern) = text(&args.interne_notitie) {
+        offerte.insert("notitieIntern".into(), json!(intern));
+    }
+    offerte.insert("inEx".into(), json!(in_ex.code()));
+    let mut lines = vec![
+        line("Relatie", format!("id {}", args.relatie_id)),
+        line("Offertenummer", &nummer),
+        line("Datum", dutch(datum)),
+        line("Vervaldatum", dutch(vervalt)),
+    ];
+    if let Some(kenmerk) = text(&args.kenmerk) {
+        lines.push(line("Kenmerk", kenmerk));
+    }
+    if let Some(notitie) = text(&args.notitie) {
+        lines.push(line("Notitie voor de klant", notitie));
+    }
+    lines.extend(regel_lines);
+    Ok((
+        Built {
+            body: Value::Object(offerte),
+            title: format!("Offerte {nummer} toevoegen"),
+            lines,
+        },
+        regels,
+    ))
+}
+
+/// An edited quote: the body for `PUT offerte` (the quote as it is, with the named changes) and, when the lines
+/// are replaced, the new ones.
+pub fn offerte_gewijzigd(
+    args: &OfferteWijzigenArgs,
+    now: &Value,
+    books: &Books,
+) -> Result<(Built, Option<Vec<Value>>), String> {
+    let mut offerte = now
+        .as_object()
+        .cloned()
+        .ok_or("e-Boekhouden gaf deze offerte in een onbekende vorm terug")?;
+    let nummer = offerte
+        .get("nummer")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let mut lines = vec![line("Offerte", &nummer)];
+    let date_at = |offerte: &Map<String, Value>, key: &str| offerte.get(key).and_then(date_of);
+    if let Some(datum) = &args.datum {
+        let datum = parse_date(datum)?;
+        offerte.insert("datum".into(), date_object(datum));
+        lines.push(line("Datum wordt", dutch(datum)));
+    }
+    if let Some(datum) = &args.vervaldatum {
+        let datum = parse_date(datum)?;
+        offerte.insert("vervaldatum".into(), date_object(datum));
+        lines.push(line("Vervaldatum wordt", dutch(datum)));
+    }
+    if let (Some(datum), Some(vervalt)) =
+        (date_at(&offerte, "datum"), date_at(&offerte, "vervaldatum"))
+        && vervalt < datum
+    {
+        return Err("De vervaldatum ligt voor de offertedatum".into());
+    }
+    for (value, key, label) in [
+        (&args.nummer, "nummer", "Offertenummer"),
+        (&args.kenmerk, "kenmerk", "Kenmerk"),
+        (&args.notitie, "notitiePubliek", "Notitie voor de klant"),
+        (&args.interne_notitie, "notitieIntern", "Interne notitie"),
+    ] {
+        if let Some(value) = value {
+            let value = value.trim();
+            if key == "nummer" && value.is_empty() {
+                return Err("Het offertenummer mag niet leeg zijn".into());
+            }
+            offerte.insert(key.into(), json!(value));
+            lines.push(line(&format!("{label} wordt"), value));
+        }
+    }
+    if let Some(status) = args.status_id {
+        offerte.insert("statusId".into(), json!(status));
+        lines.push(line("Status wordt", format!("id {status}")));
+    }
+    let regels = match &args.regels {
+        Some(regels) => {
+            let in_ex = args.bedragen.unwrap_or_else(|| {
+                InEx::from_code(offerte.get("inEx").and_then(Value::as_str).unwrap_or("EX"))
+            });
+            offerte.insert("inEx".into(), json!(in_ex.code()));
+            let (regels, regel_lines) = offerte_regels(regels, in_ex, books)?;
+            lines.push(line("Regels", "alle regels worden vervangen door:"));
+            lines.extend(regel_lines);
+            Some(regels)
+        }
+        None if args.bedragen.is_some() => {
+            return Err("Incl of excl btw wijzigen kan alleen samen met nieuwe regels".into());
+        }
+        None => None,
+    };
+    if lines.len() == 1 {
+        return Err("Er is niets gewijzigd: geef aan wat er anders moet".into());
+    }
+    Ok((
+        Built {
+            body: Value::Object(offerte),
+            title: format!("Offerte {nummer} wijzigen"),
+            lines,
+        },
+        regels,
+    ))
+}
+
+// ---------------------------------------------------------------- sjablonen
+
+/// What changes between a template's layout as it is and as a tool wants it: one line per element that is new,
+/// gone or different, in words. The layout is e-Boekhouden's editor document (`sjabloon.elements`).
+pub fn opmaak_changes(now: &Value, new: &Value) -> Result<Vec<Line>, String> {
+    let elements = |doc: &Value| -> Result<Vec<Value>, String> {
+        doc.get("elements")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| "De opmaak heeft geen elements: geef het hele document zoals sjabloon het teruggaf, met je wijzigingen".to_owned())
+    };
+    let (old, new_elements) = (elements(now)?, elements(new)?);
+    if new_elements.is_empty() {
+        return Err(
+            "De opmaak heeft geen enkel element; een leeg sjabloon slaat EB MCP niet op".into(),
+        );
+    }
+    let id = |e: &Value| e.get("id").and_then(Value::as_i64);
+    let name = |e: &Value| {
+        let tag = e.get("tag").and_then(Value::as_str).unwrap_or("element");
+        let words: String = e
+            .get("content")
+            .and_then(Value::as_str)
+            .map(strip_tags)
+            .unwrap_or_default()
+            .chars()
+            .take(60)
+            .collect();
+        if words.is_empty() {
+            format!("{tag} {}", id(e).unwrap_or(0))
+        } else {
+            format!("{tag} {} \"{words}\"", id(e).unwrap_or(0))
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut lines = Vec::new();
+    for element in &new_elements {
+        let Some(element_id) = id(element) else {
+            return Err("Elk element heeft een id nodig".into());
+        };
+        if !seen.insert(element_id) {
+            return Err(format!("Element-id {element_id} komt twee keer voor"));
+        }
+        for key in ["x", "y", "width", "height"] {
+            if !element.get(key).is_some_and(Value::is_number) {
+                return Err(format!("Element {element_id} mist {key}"));
+            }
+        }
+        match old.iter().find(|e| id(e) == Some(element_id)) {
+            None => lines.push(line("Nieuw", name(element))),
+            Some(before) if before != element => {
+                let words = |e: &Value| {
+                    e.get("content")
+                        .and_then(Value::as_str)
+                        .map(strip_tags)
+                        .unwrap_or_default()
+                };
+                let label = format!(
+                    "{} {element_id}",
+                    element
+                        .get("tag")
+                        .and_then(Value::as_str)
+                        .unwrap_or("element")
+                );
+                if before.get("content") != element.get("content") {
+                    // Both texts in full: the user must be able to see a changed IBAN or amount, not just "tekst".
+                    lines.push(line(&format!("Tekst van {label} was"), cut(&words(before))));
+                    lines.push(line(
+                        &format!("Tekst van {label} wordt"),
+                        cut(&words(element)),
+                    ));
+                    if words(before) == words(element) {
+                        lines.push(line(&format!("Opmaak van {label}"), "de tekst blijft gelijk, de opmaak ervan (lettertype, kleur, links) verandert"));
+                    }
+                }
+                let moved: Vec<String> = ["x", "y", "width", "height", "page", "section"]
+                    .iter()
+                    .filter(|k| before.get(**k) != element.get(**k))
+                    .map(|k| {
+                        format!(
+                            "{k} {} wordt {}",
+                            before.get(*k).unwrap_or(&Value::Null),
+                            element.get(*k).unwrap_or(&Value::Null)
+                        )
+                    })
+                    .collect();
+                if !moved.is_empty() {
+                    lines.push(line(&format!("Plaats van {label}"), moved.join(", ")));
+                }
+                let other: Vec<&str> = match (before.as_object(), element.as_object()) {
+                    (Some(b), Some(e)) => {
+                        let mut keys: Vec<&str> =
+                            b.keys().chain(e.keys()).map(String::as_str).collect();
+                        keys.sort_unstable();
+                        keys.dedup();
+                        keys.into_iter()
+                            .filter(|k| {
+                                !["content", "x", "y", "width", "height", "page", "section"]
+                                    .contains(k)
+                            })
+                            .filter(|k| b.get(*k) != e.get(*k))
+                            .collect()
+                    }
+                    _ => vec!["alles"],
+                };
+                if !other.is_empty() {
+                    lines.push(line(
+                        &format!("Instellingen van {label}"),
+                        format!("gewijzigd: {}", other.join(", ")),
+                    ));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    for element in &old {
+        if !id(element).is_some_and(|i| seen.contains(&i)) {
+            lines.push(line("Verwijderd", name(element)));
+        }
+    }
+    for key in ["documentDefinition", "sjabloon"] {
+        if new.get(key).is_some() && now.get(key) != new.get(key) {
+            lines.push(line(
+                "Gewijzigd",
+                if key == "sjabloon" {
+                    "algemene instellingen (lettertype, kop- en voettekst, pagina's)"
+                } else {
+                    "paginaformaat of marges"
+                },
+            ));
+        }
+    }
+    Ok(lines)
+}
+
+/// A text for the approval window, whole unless it is very long.
+fn cut(text: &str) -> String {
+    const MAX: usize = 600;
+    if text.chars().count() <= MAX {
+        return if text.is_empty() {
+            "(leeg)".to_owned()
+        } else {
+            text.to_owned()
+        };
+    }
+    format!(
+        "{} … (ingekort, {} tekens)",
+        text.chars().take(MAX).collect::<String>(),
+        text.chars().count()
+    )
+}
+
+/// The words of an HTML fragment on one line.
+pub fn strip_tags(html: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => {
+                in_tag = true;
+                out.push(' ');
+            }
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&nbsp;", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// How often a subscription is invoiced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -2300,6 +2746,148 @@ mod tests {
                 .contains("geen abonnementen")
         );
         assert_eq!(Venster::TweeWeken.count_key(), "twoWeeks");
+    }
+
+    #[test]
+    fn makes_a_quote_as_e_boekhoudens_form_does() {
+        let context = OfferteContext {
+            volgend_nummer: "OF-00001".into(),
+            sjabloon_id: 446945,
+            status_id: 2023411,
+            gebruiker_id: 532387,
+            vandaag: (2026, 11, 11),
+        };
+        let args = OfferteToevoegenArgs {
+            relatie_id: 46484769,
+            datum: None,
+            vervaldatum: None,
+            nummer: None,
+            kenmerk: Some("Proef".into()),
+            notitie: Some("Notitie".into()),
+            interne_notitie: None,
+            bedragen: None,
+            regels: vec![factuurregel()],
+            sjabloon_id: None,
+            status_id: None,
+            account: None,
+        };
+        let (built, regels) = offerte_nieuw(&args, &context, &books()).unwrap();
+        // The body the web form posted to `offerte`.
+        assert_eq!(
+            built.body,
+            json!({"statusId": 2023411, "nummer": "OF-00001", "behandelGebruikerId": 532387, "relatieId": 46484769, "kenmerk": "Proef",
+                   "datum": {"day": 11, "month": 11, "year": 2026}, "vervaldatum": {"day": 11, "month": 12, "year": 2026},
+                   "sjabloonId": 446945, "factuurEmailsjabloonId": "", "notitiePubliek": "Notitie", "inEx": "EX"})
+        );
+        // And the line it posted to `offerteregel`, without the quote's id.
+        assert_eq!(
+            regels,
+            vec![
+                json!({"id": 0, "aantal": 1.0, "volgorde": null, "omschrijving": "Advies", "prijsExcl": 1.0, "prijsIncl": 1.09,
+                        "btwCode": "LAAG_VERK_9", "grootboekId": 26852146, "kortingIsPerc": true})
+            ]
+        );
+        assert_eq!(month_later((2026, 12, 31)), (2027, 1, 31));
+        assert_eq!(month_later((2026, 3, 30)), (2026, 4, 30));
+        assert_eq!(month_later((2026, 1, 31)), (2026, 2, 28));
+        assert_eq!(month_later((2026, 11, 11)), (2026, 12, 11));
+        let mut early = args;
+        early.vervaldatum = Some("2026-11-01".into());
+        assert!(offerte_nieuw(&early, &context, &books()).is_err());
+    }
+
+    #[test]
+    fn a_quote_edit_sends_the_quote_back_with_the_named_change() {
+        let now = json!({"id": 2587158, "nummer": "OF-00001", "relatieId": 46484769, "kenmerk": "Proef", "inEx": "EX", "statusId": 2023411,
+                         "datum": {"day": 11, "month": 11, "year": 2026}, "vervaldatum": {"day": 11, "month": 12, "year": 2026}, "sjabloonId": 446945});
+        let mut args = OfferteWijzigenArgs {
+            id: 2587158,
+            datum: None,
+            vervaldatum: None,
+            nummer: None,
+            kenmerk: None,
+            notitie: None,
+            interne_notitie: None,
+            status_id: None,
+            bedragen: None,
+            regels: None,
+            account: None,
+        };
+        assert!(offerte_gewijzigd(&args, &now, &books()).is_err());
+        args.kenmerk = Some(" Gewijzigd ".into());
+        let (built, regels) = offerte_gewijzigd(&args, &now, &books()).unwrap();
+        assert_eq!(built.body["kenmerk"], "Gewijzigd");
+        assert_eq!(built.body["id"], 2587158);
+        assert_eq!(built.body["sjabloonId"], 446945);
+        assert!(regels.is_none(), "the lines stay");
+        args.regels = Some(vec![factuurregel()]);
+        assert_eq!(
+            offerte_gewijzigd(&args, &now, &books())
+                .unwrap()
+                .1
+                .unwrap()
+                .len(),
+            1
+        );
+        args.vervaldatum = Some("2026-10-01".into());
+        assert!(offerte_gewijzigd(&args, &now, &books()).is_err());
+    }
+
+    #[test]
+    fn says_what_changes_in_a_template_layout() {
+        let element = |id: i64, content: &str, x: i64| json!({"id": id, "tag": "text", "x": x, "y": 10, "width": 100, "height": 20, "content": content, "style": {}});
+        let now = json!({"elements": [element(1, "<h1>FACTUUR</h1>", 3), element(2, "<p>[DATUM]</p>", 5), element(3, "<p>weg</p>", 5)], "documentDefinition": {"width": 840}});
+        let same = opmaak_changes(&now, &now).unwrap();
+        assert!(same.is_empty(), "{same:?}");
+        let new = json!({"elements": [element(1, "<h1>FACTUUR PROEF</h1>", 3), element(2, "<p>[DATUM]</p>", 50), element(8, "<p>Nieuw <b>blok</b></p>", 5)], "documentDefinition": {"width": 840}});
+        let shown: Vec<String> = opmaak_changes(&now, &new)
+            .unwrap()
+            .iter()
+            .map(|l| format!("{}: {}", l.label, l.value))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                "Tekst van text 1 was: FACTUUR",
+                "Tekst van text 1 wordt: FACTUUR PROEF",
+                "Plaats van text 2: x 5 wordt 50",
+                "Nieuw: text 8 \"Nieuw blok\"",
+                "Verwijderd: text 3 \"weg\"",
+            ]
+        );
+        // A change that leaves the words alone (a link's target, a colour) is still named.
+        let mut restyled = now.clone();
+        restyled["elements"][0]["content"] =
+            json!("<h1><a href=\"https://x.example\">FACTUUR</a></h1>");
+        restyled["elements"][1]["style"] = json!({"zindex": 3});
+        let shown: Vec<String> = opmaak_changes(&now, &restyled)
+            .unwrap()
+            .iter()
+            .map(|l| format!("{}: {}", l.label, l.value))
+            .collect();
+        assert!(
+            shown.iter().any(|l| l.starts_with("Opmaak van text 1")),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(&"Instellingen van text 2: gewijzigd: style".to_owned()),
+            "{shown:?}"
+        );
+        assert!(opmaak_changes(&now, &json!({"elements": []})).is_err());
+        assert!(opmaak_changes(&now, &json!({})).is_err());
+        assert!(
+            opmaak_changes(
+                &now,
+                &json!({"elements": [element(1, "a", 1), element(1, "b", 1)]})
+            )
+            .unwrap_err()
+            .contains("twee keer")
+        );
+        assert!(
+            opmaak_changes(&now, &json!({"elements": [{"id": 1, "tag": "text"}]}))
+                .unwrap_err()
+                .contains("mist")
+        );
     }
 
     #[test]

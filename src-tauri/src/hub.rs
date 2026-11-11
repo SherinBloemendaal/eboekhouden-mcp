@@ -105,7 +105,9 @@ pub async fn invoke(
     let mut negotiate = address.clone();
     negotiate.set_path(&format!("{}/negotiate", address.path()));
     negotiate.set_query(Some("negotiateVersion=1"));
-    let answer = tokio::time::timeout(STEP, signed(http.post(negotiate)).send())
+    // An empty POST must say so: e-Boekhouden's front door answers 411 Length Required otherwise (seen live).
+    let negotiate = signed(http.post(negotiate)).header(reqwest::header::CONTENT_LENGTH, "0");
+    let answer = tokio::time::timeout(STEP, negotiate.send())
         .await
         .map_err(|_| "e-Boekhouden antwoordde niet binnen 30 s".to_owned())?
         .map_err(|_| lost())?;
@@ -289,6 +291,10 @@ mod tests {
                         .unwrap_or_default();
                     if cookie.is_empty() {
                         return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    // As e-Boekhouden's front door: an empty POST without a length is refused.
+                    if headers.get("content-length").and_then(|v| v.to_str().ok()) != Some("0") {
+                        return axum::http::StatusCode::LENGTH_REQUIRED.into_response();
                     }
                     axum::Json(json!({"negotiateVersion": 1, "connectionToken": "tok en/1"}))
                         .into_response()
