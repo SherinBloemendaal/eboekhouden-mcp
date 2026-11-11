@@ -75,30 +75,16 @@ pub struct Trace {
     pub lines: Vec<TraceLine>,
 }
 
-/// The administration's name from `administratie/uwgegevens`, whatever its exact shape.
-pub fn administration_name(json: &Value) -> Option<String> {
-    const KEYS: [&str; 6] = [
-        "bedrijfsnaam",
-        "administratienaam",
-        "naam",
-        "companyname",
-        "name",
-        "administratie",
-    ];
-    let pick = |object: &serde_json::Map<String, Value>| {
-        KEYS.iter().find_map(|key| {
-            object
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                .and_then(|(_, v)| v.as_str())
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_owned)
-        })
-    };
-    let object = json.as_object()?;
-    pick(object).or_else(|| object.values().filter_map(Value::as_object).find_map(pick))
+/// The administration's name from the answer to `POST auth` (`administratieBedrijf`), where e-Boekhouden's
+/// own app reads it too.
+pub fn administration_name(auth: &Value) -> Option<String> {
+    auth.get("administratieBedrijf")?
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
 }
+
 struct Pending {
     cancel: Arc<AtomicBool>,
     code: Option<oneshot::Sender<String>>,
@@ -351,7 +337,9 @@ async fn run(
     };
     drop(credentials);
 
-    // The check e-Boekhouden's own app makes at startup: does the API accept this session?
+    // The check e-Boekhouden's own app makes at startup: does the API accept this session? Its answer also
+    // names the administration.
+    emit(app, account_id, Step::Administration, None);
     let check = state.client.auth(&cookies).await;
     state.log_signin_call(&check, account_id, &account.label);
     let valid = crate::ebapi::valid_session(&check);
@@ -378,22 +366,15 @@ async fn run(
     state.add_session(account_id, &account.label, &key);
     signins.trace(account_id, "Ingelogd; sessie staat alleen in het geheugen");
 
-    emit(app, account_id, Step::Administration, None);
-    let query = [("adm".to_owned(), "true".to_owned())];
-    let call = state
-        .api_get(
+    match check.json.as_ref().and_then(administration_name) {
+        Some(name) => {
+            state.set_administration(account_id, &name);
+            signins.trace(account_id, "Administratienaam gelezen uit de API-controle");
+        }
+        None => signins.trace(
             account_id,
-            "administratie/uwgegevens",
-            &query,
-            None,
-            "EB MCP",
-        )
-        .await;
-    if let Some(error) = &call.error {
-        signins.trace(account_id, format!("Administratie ophalen: {error}"));
-    }
-    if let Some(name) = call.json.as_ref().and_then(administration_name) {
-        state.set_administration(account_id, &name);
+            "Administratienaam: niet in het antwoord van de API-controle",
+        ),
     }
     (
         Step::Done,
@@ -461,15 +442,20 @@ mod tests {
 
     #[test]
     fn finds_the_administration_name() {
+        let auth = json!({"valid": true, "abId": 1, "administratieBedrijf": " Studio Noord B.V. "});
         assert_eq!(
-            administration_name(&json!({"Bedrijfsnaam": "Studio Noord B.V."})).as_deref(),
+            administration_name(&auth).as_deref(),
             Some("Studio Noord B.V.")
         );
+        assert_eq!(administration_name(&json!({"valid": true})), None);
         assert_eq!(
-            administration_name(&json!({"gegevens": {"naam": "Demo Holding B.V."}})).as_deref(),
-            Some("Demo Holding B.V.")
+            administration_name(&json!({"administratieBedrijf": "  "})),
+            None
         );
-        assert_eq!(administration_name(&json!({"naam": "  "})), None);
+        assert_eq!(
+            administration_name(&json!({"administratieBedrijf": 7})),
+            None
+        );
         assert_eq!(administration_name(&json!([1])), None);
     }
 

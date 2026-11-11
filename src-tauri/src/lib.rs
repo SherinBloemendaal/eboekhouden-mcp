@@ -232,7 +232,7 @@ fn account_remove(
     id: Uuid,
 ) -> Result<(), String> {
     signins.cancel(id);
-    app_state.sign_out(id);
+    app_state.sign_out(id, "account verwijderd");
     creds::delete_password(id)?;
     app_state.accounts.remove(id)?;
     let _ = app_state.events.send(state::AppEvent::SessionsChanged);
@@ -272,12 +272,12 @@ fn signin_code(signins: Shared<'_, Signins>, id: Uuid, code: String) -> Result<(
 
 #[tauri::command]
 fn sign_out(app_state: Shared<'_, AppState>, id: Uuid) {
-    app_state.sign_out(id);
+    app_state.sign_out(id, "Uitloggen gekozen");
 }
 
 #[tauri::command]
 fn sign_out_all(app_state: Shared<'_, AppState>) {
-    app_state.sign_out_all();
+    app_state.sign_out_all("Alles uitloggen gekozen");
 }
 
 /// The request log, newest first and without bodies.
@@ -425,7 +425,7 @@ async fn prepare_update_restart(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     // Sessions are only in memory, so forgetting them is immediate.
-    app_state.sign_out_all();
+    app_state.sign_out_all("herstart voor een update");
     Ok(())
 }
 
@@ -566,7 +566,7 @@ async fn quit(app: AppHandle, app_state: Shared<'_, AppState>) -> Result<(), Str
 }
 
 async fn quit_now(app: &AppHandle, app_state: &AppState) {
-    app_state.sign_out_all();
+    app_state.sign_out_all("EB MCP afgesloten");
     app.exit(0);
 }
 

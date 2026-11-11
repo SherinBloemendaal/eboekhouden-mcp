@@ -155,19 +155,21 @@ impl AppState {
     }
 
     /// Forgets the session and its token. e-Boekhouden's API has no sign-out; the token ends there when it expires.
-    pub fn sign_out(&self, account_id: Uuid) -> bool {
+    /// `why` goes to the log, so a session that is gone can always be traced to what ended it.
+    pub fn sign_out(&self, account_id: Uuid, why: &str) -> bool {
         let removed = self.sessions.write().unwrap().remove(&account_id);
         if let Some(session) = &removed {
+            log::info!("uitgelogd {}: {why}", session.label);
             self.jar.sign_out(&session.key);
             let _ = self.events.send(AppEvent::SessionsChanged);
         }
         removed.is_some()
     }
 
-    pub fn sign_out_all(&self) {
+    pub fn sign_out_all(&self, why: &str) {
         let ids: Vec<Uuid> = self.sessions.read().unwrap().keys().copied().collect();
         for id in ids {
-            self.sign_out(id);
+            self.sign_out(id, why);
         }
     }
 
@@ -182,7 +184,10 @@ impl AppState {
             .map(|s| s.account_id)
             .collect();
         for id in &stale {
-            self.sign_out(*id);
+            self.sign_out(
+                *id,
+                &format!("{} minuten niet gebruikt", idle.as_secs() / 60),
+            );
         }
         stale
     }
@@ -259,6 +264,10 @@ impl AppState {
                 return;
             }
             s.expired = true;
+            log::info!(
+                "sessie verlopen {}: e-Boekhouden kent hem niet meer",
+                s.label
+            );
             s.label.clone()
         };
         let _ = self
@@ -351,7 +360,7 @@ mod tests {
         let id = Uuid::new_v4();
         state.add_session(id, "Studio Noord", "eb-1");
         assert_eq!(state.session_count(), 1);
-        assert!(state.sign_out(id));
+        assert!(state.sign_out(id, "test"));
         assert_eq!(state.session_count(), 0);
         assert_eq!(*jar.signed_out.lock().unwrap(), vec!["eb-1".to_owned()]);
     }
