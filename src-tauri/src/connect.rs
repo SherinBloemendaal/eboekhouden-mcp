@@ -33,8 +33,8 @@ pub enum Client {
 }
 
 /// How Claude Desktop starts EB MCP: the bridge next to the app. Release builds
-/// let it read the token from the Keychain; development builds point it at the
-/// dev token file (secrets::DevFileStore). Claude's config never holds the token.
+/// let it find the app's token file by itself; development builds point it at the
+/// dev token file (secrets::token_file). Claude's config never holds the token.
 pub struct Bridge {
     pub path: PathBuf,
     pub token_file: Option<PathBuf>,

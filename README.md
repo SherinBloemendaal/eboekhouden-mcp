@@ -23,7 +23,7 @@ npm install
 npm run tauri dev
 ```
 
-`tauri dev` first fetches Sparkle (pinned, SHA-256 checked) and builds the bridge. Debug builds keep the MCP token in `dev-token.json` in the app's config folder, because every rebuild would otherwise ask for Keychain access again. Release builds keep it in the Keychain.
+`tauri dev` first fetches Sparkle (pinned, SHA-256 checked) and builds the bridge. The MCP token lives in a file in the app's config folder that only the user can read: `token.json` in release builds, `dev-token.json` in debug builds. It is not in the Keychain, because the ad-hoc signed app would otherwise ask for the Keychain password at every start after each update, and the bridge reads the same file without a prompt. A release that finds a token from an older version in the Keychain moves it to the file once.
 
 ## Checks
 
