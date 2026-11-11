@@ -1,20 +1,29 @@
-//! The request log and the run's statistics, in memory only.
+//! The request log and its statistics, kept in memory and saved to disk.
 //!
 //! The log keeps the last 1000 calls: MCP tool calls and the e-Boekhouden
 //! calls they caused, linked by id. Cookies, the auth-token and passwords are
 //! never stored: request headers are kept masked, and nothing else carries them.
-//! The statistics count from the start of the run and survive Leegmaken. They
-//! count AI traffic only: the sign-in's own calls show in the log but not in
-//! the statistics, as they are not rate limited and no AI client made them.
+//! The statistics survive Leegmaken. They count AI traffic only: the sign-in's
+//! own calls show in the log but not in the statistics, as they are not rate
+//! limited and no AI client made them.
+//!
+//! Both survive a restart and an update: `open` loads them from a gzip file in
+//! the app's config folder (logstore.rs) and `save` writes them back when they
+//! changed. The statistics therefore count since `started_at`, the start of the
+//! first run that this file knows: the first start with persistence, or the
+//! first start after the file was missing, damaged or of an unknown format.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::ebapi::ApiCall;
+use crate::logstore;
 use crate::state::now_ms;
 
 pub const CAPACITY: usize = 1000;
@@ -23,8 +32,15 @@ const BODY_LIMIT: usize = 256 * 1024;
 const DURATIONS_KEPT: usize = 500;
 const MINUTES_KEPT: u64 = 24 * 60;
 pub const MASK: &str = "••••••••";
+/// The app version that made an entry.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The format of the file `save` writes. A file with another number is not read.
+pub const FORMAT: u32 = 1;
+/// The error of an MCP call that still ran when EB MCP stopped.
+pub const RESTARTED: &str =
+    "EB MCP is opnieuw gestart terwijl deze aanroep liep, dus hij is niet afgemaakt.";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Outcome {
     Running,
@@ -33,11 +49,14 @@ pub enum Outcome {
     Refused,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpEntry {
     pub id: u64,
     pub at: u64,
+    /// The app version that made the entry; empty for entries saved before versions were kept.
+    #[serde(default)]
+    pub version: String,
     pub client: String,
     pub tool: String,
     pub args: Value,
@@ -51,15 +70,19 @@ pub struct McpEntry {
     pub result: Option<Value>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EbEntry {
     pub id: u64,
     pub at: u64,
+    /// The app version that made the entry; empty for entries saved before versions were kept.
+    #[serde(default)]
+    pub version: String,
     pub parent: Option<u64>,
     pub client: String,
     pub account: Option<String>,
-    pub method: &'static str,
+    /// An owned copy of `ApiCall::method`, so entries read back from disk need no static string.
+    pub method: String,
     pub path: String,
     pub query: Vec<(String, String)>,
     pub status: u16,
@@ -75,7 +98,7 @@ pub struct EbEntry {
     pub signin: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Entry {
     Mcp(McpEntry),
@@ -105,7 +128,8 @@ impl Entry {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 struct Endpoint {
     count: u32,
     total_ms: u64,
@@ -114,15 +138,16 @@ struct Endpoint {
     bytes: u64,
 }
 
-#[derive(Default, Clone, Copy, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Minute {
     pub eb: u32,
     pub mcp: u32,
     pub errors: u32,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 struct Stats {
     started_at: u64,
     mcp: u32,
@@ -179,10 +204,36 @@ pub struct StatsView {
     pub statuses: Vec<Named>,
 }
 
+/// What the log file holds (logstore.rs): the entries, oldest first, and the statistics.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Snapshot {
+    format: u32,
+    /// The app version that wrote the file.
+    app_version: String,
+    saved_at: u64,
+    next: u64,
+    entries: Vec<Entry>,
+    stats: Stats,
+}
+
+impl Snapshot {
+    pub fn format(&self) -> u32 {
+        self.format
+    }
+}
+
 pub struct RequestLog {
     entries: Mutex<VecDeque<Entry>>,
     next: Mutex<u64>,
     stats: Mutex<Stats>,
+    /// Counts every change; `saved` holds the count the file on disk has.
+    changes: AtomicU64,
+    saved: AtomicU64,
+    /// The file `save` writes, set once by `open`. Without it the log lives in memory only.
+    file: OnceLock<PathBuf>,
+    /// Held by `save` from the copy to the rename, so an older copy never lands after a newer one.
+    saving: Mutex<()>,
 }
 
 impl Default for RequestLog {
@@ -194,6 +245,10 @@ impl Default for RequestLog {
                 started_at: now_ms(),
                 ..Default::default()
             }),
+            changes: AtomicU64::new(0),
+            saved: AtomicU64::new(0),
+            file: OnceLock::new(),
+            saving: Mutex::new(()),
         }
     }
 }
@@ -206,12 +261,138 @@ impl RequestLog {
         id
     }
 
+    fn changed(&self) {
+        self.changes.fetch_add(1, Ordering::SeqCst);
+    }
+
     fn push(&self, entry: Entry) {
-        let mut entries = self.entries.lock().unwrap();
-        entries.push_back(entry);
-        while entries.len() > CAPACITY {
-            entries.pop_front();
+        {
+            let mut entries = self.entries.lock().unwrap();
+            entries.push_back(entry);
+            while entries.len() > CAPACITY {
+                entries.pop_front();
+            }
         }
+        self.changed();
+    }
+
+    /// Loads the log and the statistics from `file` and saves to it from now on. A missing,
+    /// damaged or unknown file leaves the log empty and is replaced at the next save; it never
+    /// stops the app. Called once, at startup, before any call is logged.
+    pub fn open(&self, file: PathBuf) {
+        match logstore::read(&file) {
+            Ok(Some(snapshot)) => {
+                let restored = self.restore(snapshot);
+                log::info!(
+                    "request log: {restored} entries loaded from {}",
+                    file.display()
+                );
+            }
+            Ok(None) => log::info!(
+                "request log: no file yet at {}, starting empty",
+                file.display()
+            ),
+            Err(e) => {
+                // The unreadable file is set aside, not overwritten: it may still be worth a look.
+                let aside = file.with_extension("gz.damaged");
+                let _ = std::fs::rename(&file, &aside);
+                log::warn!(
+                    "request log: {} not read ({e}), set aside as {}, starting empty",
+                    file.display(),
+                    aside.display()
+                );
+            }
+        }
+        if self.file.set(file).is_err() {
+            log::warn!("request log: opened twice, the first file stays in use");
+        }
+    }
+
+    /// Takes over a saved log. An MCP call that still ran when the app stopped becomes an error,
+    /// counted in the statistics as `finish_mcp` would have. Returns how many entries were loaded.
+    fn restore(&self, snapshot: Snapshot) -> usize {
+        let Snapshot {
+            next,
+            entries: saved,
+            stats: mut saved_stats,
+            ..
+        } = snapshot;
+        let mut interrupted = Vec::new();
+        let mut restored: VecDeque<Entry> = saved
+            .into_iter()
+            .map(|mut entry| {
+                if let Entry::Mcp(e) = &mut entry
+                    && e.outcome == Outcome::Running
+                {
+                    e.outcome = Outcome::Error;
+                    e.error = Some(RESTARTED.to_owned());
+                    interrupted.push(e.clone());
+                }
+                entry
+            })
+            .collect();
+        while restored.len() > CAPACITY {
+            restored.pop_front();
+        }
+        let highest = restored.iter().map(Entry::id).max().unwrap_or(0);
+        if saved_stats.started_at == 0 {
+            saved_stats.started_at = now_ms();
+        }
+        for e in &interrupted {
+            saved_stats.count_mcp(e);
+        }
+        saved_stats.prune(now_ms());
+        let count = restored.len();
+        *self.entries.lock().unwrap() = restored;
+        *self.next.lock().unwrap() = next.max(highest + 1).max(1);
+        *self.stats.lock().unwrap() = saved_stats;
+        if !interrupted.is_empty() {
+            // The interrupted calls are errors now: the file should say so too.
+            self.changed();
+        }
+        count
+    }
+
+    /// A copy of everything `save` writes. Holds each mutex only for the copy.
+    fn snapshot(&self) -> Snapshot {
+        let entries: Vec<Entry> = self.entries.lock().unwrap().iter().cloned().collect();
+        let next = *self.next.lock().unwrap();
+        let stats = self.stats.lock().unwrap().clone();
+        Snapshot {
+            format: FORMAT,
+            app_version: APP_VERSION.to_owned(),
+            saved_at: now_ms(),
+            next,
+            entries,
+            stats,
+        }
+    }
+
+    /// Whether something changed since the last save.
+    pub fn dirty(&self) -> bool {
+        self.changes.load(Ordering::SeqCst) != self.saved.load(Ordering::SeqCst)
+    }
+
+    /// Writes the log and the statistics to the file `open` gave, when something changed since
+    /// the last save. Compressing happens outside the log's mutexes, but it takes time for a full
+    /// log: async code calls this through `spawn_blocking`. `Ok(true)` when a file was written.
+    pub fn save(&self) -> Result<bool, String> {
+        let Some(file) = self.file.get() else {
+            return Ok(false);
+        };
+        let _saving = self.saving.lock().unwrap_or_else(|e| e.into_inner());
+        let changes = self.changes.load(Ordering::SeqCst);
+        if changes == self.saved.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        logstore::write(file, &self.snapshot())?;
+        self.saved.store(changes, Ordering::SeqCst);
+        Ok(true)
+    }
+
+    /// Every entry with its bodies, oldest first, for the debug export.
+    pub fn export_entries(&self) -> Vec<Entry> {
+        self.entries.lock().unwrap().iter().cloned().collect()
     }
 
     pub fn start_mcp(&self, client: &str, tool: &str, args: Value, account: Option<String>) -> u64 {
@@ -219,9 +400,11 @@ impl RequestLog {
         self.push(Entry::Mcp(McpEntry {
             id,
             at: now_ms(),
+            version: APP_VERSION.to_owned(),
             client: client.to_owned(),
             tool: tool.to_owned(),
-            args,
+            // A tool can be handed a whole layout document or a long message: the log keeps a short copy.
+            args: shorten(&args).0,
             account,
             outcome: Outcome::Running,
             duration_ms: 0,
@@ -253,21 +436,8 @@ impl RequestLog {
             }
         }
         if let Some(e) = done {
-            let mut s = self.stats.lock().unwrap();
-            s.mcp += 1;
-            s.bytes_out += e.bytes as u64;
-            if outcome != Outcome::Ok {
-                s.errors += 1;
-            }
-            s.minute(e.at).mcp += 1;
-            if outcome != Outcome::Ok {
-                s.minute(e.at).errors += 1;
-            }
-            *s.tools.entry(e.tool.clone()).or_default() += 1;
-            s.clients.entry(e.client.clone()).or_default().0 += 1;
-            if outcome == Outcome::Refused {
-                *s.statuses.entry("Geweigerd".into()).or_default() += 1;
-            }
+            self.stats.lock().unwrap().count_mcp(&e);
+            self.changed();
         }
     }
 
@@ -322,10 +492,11 @@ impl RequestLog {
         self.push(Entry::Eb(EbEntry {
             id,
             at,
+            version: APP_VERSION.to_owned(),
             parent,
             client: client.to_owned(),
             account: label.clone(),
-            method: call.method,
+            method: call.method.to_owned(),
             path: call.path.clone(),
             query: call.query.clone(),
             status: call.status,
@@ -373,6 +544,9 @@ impl RequestLog {
             }
             *s.statuses.entry(call.status.to_string()).or_default() += 1;
         }
+        // Once more after the link to the parent and the statistics, so a save that copied the
+        // log in between is followed by another.
+        self.changed();
         id
     }
 
@@ -410,9 +584,15 @@ impl RequestLog {
         self.entries.lock().unwrap().len()
     }
 
-    /// Leegmaken: the log only. The statistics keep counting.
+    /// Leegmaken: the log only, in memory and on disk. The statistics keep counting. Saves right
+    /// away, so the cleared entries do not come back after a restart; with an empty log that file
+    /// is small, but the save may wait for one that runs: async code calls this through `spawn_blocking`.
     pub fn clear(&self) {
         self.entries.lock().unwrap().clear();
+        self.changed();
+        if let Err(e) = self.save() {
+            log::warn!("request log: the cleared log could not be saved: {e}");
+        }
     }
 
     pub fn stats(&self) -> StatsView {
@@ -477,7 +657,13 @@ impl RequestLog {
 
 impl Stats {
     fn minute(&mut self, at_ms: u64) -> &mut Minute {
-        let minute = at_ms / 60_000;
+        self.prune(at_ms);
+        self.minutes.entry(at_ms / 60_000).or_default()
+    }
+
+    /// Drops the minute buckets older than a day before `now_ms`.
+    fn prune(&mut self, now_ms: u64) {
+        let minute = now_ms / 60_000;
         while self
             .minutes
             .first_key_value()
@@ -485,7 +671,26 @@ impl Stats {
         {
             self.minutes.pop_first();
         }
-        self.minutes.entry(minute).or_default()
+    }
+
+    /// Counts a finished MCP call.
+    fn count_mcp(&mut self, e: &McpEntry) {
+        let failed = e.outcome != Outcome::Ok;
+        self.mcp += 1;
+        self.bytes_out += e.bytes as u64;
+        if failed {
+            self.errors += 1;
+        }
+        let minute = self.minute(e.at);
+        minute.mcp += 1;
+        if failed {
+            minute.errors += 1;
+        }
+        *self.tools.entry(e.tool.clone()).or_default() += 1;
+        self.clients.entry(e.client.clone()).or_default().0 += 1;
+        if e.outcome == Outcome::Refused {
+            *self.statuses.entry("Geweigerd".into()).or_default() += 1;
+        }
     }
 }
 

@@ -4,6 +4,7 @@ mod connect;
 mod creds;
 mod ebapi;
 mod hub;
+mod logstore;
 mod mcp;
 mod reqlog;
 mod secrets;
@@ -327,10 +328,110 @@ fn log_get(app_state: Shared<'_, AppState>, id: u64) -> Option<reqlog::Entry> {
     app_state.log.get(id)
 }
 
+/// Leegmaken empties the log on disk too, so it waits off the main thread for a save that may be running.
 #[tauri::command]
-fn log_clear(app_state: Shared<'_, AppState>) {
-    app_state.log.clear();
+async fn log_clear(app_state: Shared<'_, AppState>) -> Result<(), String> {
+    let state = app_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.log.clear())
+        .await
+        .map_err(|e| format!("Leegmaken lukte niet: {e}"))?;
     let _ = app_state.events.send(state::AppEvent::LogChanged);
+    Ok(())
+}
+
+/// How often the request log is saved at most, when it changed.
+const LOG_SAVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Saves the request log when it changed, compressing it off the async runtime's threads.
+async fn save_log(app_state: &Arc<AppState>) {
+    if !app_state.log.dirty() {
+        return;
+    }
+    let state = Arc::clone(app_state);
+    match tauri::async_runtime::spawn_blocking(move || state.log.save()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => log::warn!("request log not saved: {e}"),
+        Err(e) => log::warn!("request log not saved: {e}"),
+    }
+}
+
+/// A debug export of the request log for a bug report: one gzip file in Downloads (or, when that
+/// fails, the app's config folder) with the log, the statistics and the last sign-ins. Returns its
+/// absolute path. Accounts appear by label only.
+#[tauri::command]
+async fn log_export(
+    app: AppHandle,
+    app_state: Shared<'_, AppState>,
+    signins: Shared<'_, Signins>,
+) -> Result<String, String> {
+    let sessions = app_state.sessions();
+    let mut hidden = Vec::new();
+    let accounts: Vec<logstore::ExportAccount> = app_state
+        .accounts
+        .list()
+        .into_iter()
+        .map(|account| {
+            hidden.push(account.username.clone());
+            hidden.extend(account.op_ref.clone());
+            logstore::ExportAccount {
+                signed_in: sessions
+                    .iter()
+                    .any(|s| s.account_id == account.id && !s.expired),
+                label: account.label,
+                administration: account.administration,
+                store: account.store,
+                write: account.write,
+            }
+        })
+        .collect();
+    // Oldest first, like the entries.
+    let mut traces = signins.traces();
+    traces.reverse();
+    let dirs: Vec<std::path::PathBuf> = [app.path().download_dir(), app.path().app_config_dir()]
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect();
+    if dirs.is_empty() {
+        return Err("Er is geen map gevonden om de export in te bewaren.".into());
+    }
+    let state = app_state.inner().clone();
+    let written = tauri::async_runtime::spawn_blocking(move || {
+        let input = logstore::ExportInput {
+            accounts: &accounts,
+            traces: &traces,
+            hidden: &hidden,
+            exported_at: chrono::Local::now(),
+        };
+        let mut failures = Vec::new();
+        for dir in &dirs {
+            match logstore::export(dir, &state.log, &input) {
+                Ok(path) => return Ok(path),
+                Err(e) => {
+                    log::warn!("debug export not written: {e}");
+                    failures.push(e);
+                }
+            }
+        }
+        Err(failures.join("; "))
+    })
+    .await
+    .map_err(|e| format!("De export kon niet worden gemaakt: {e}"))?;
+    written
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|e| format!("De export kon niet worden bewaard: {e}"))
+}
+
+/// Shows a debug export from `log_export` in Finder or Explorer. Only those files: any other path is refused.
+#[tauri::command]
+fn log_export_reveal(app: AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let path = std::path::PathBuf::from(path);
+    if !logstore::is_export(&path) {
+        return Err("Dit exportbestand bestaat niet meer.".into());
+    }
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| format!("Het exportbestand kon niet worden getoond: {e}"))
 }
 
 #[tauri::command]
@@ -461,6 +562,8 @@ async fn prepare_update_restart(
     }
     // Sessions are only in memory, so forgetting them is immediate.
     app_state.sign_out_all("herstart voor een update");
+    // The request log and its statistics carry over into the new version.
+    save_log(app_state.inner()).await;
     Ok(())
 }
 
@@ -596,12 +699,14 @@ fn open_main(app: AppHandle, route: Option<String>) {
 /// Quitting signs every session out at e-Boekhouden first.
 #[tauri::command]
 async fn quit(app: AppHandle, app_state: Shared<'_, AppState>) -> Result<(), String> {
-    quit_now(&app, &app_state).await;
+    quit_now(&app, app_state.inner()).await;
     Ok(())
 }
 
-async fn quit_now(app: &AppHandle, app_state: &AppState) {
+/// Signs every session out and saves the request log, then quits.
+async fn quit_now(app: &AppHandle, app_state: &Arc<AppState>) {
     app_state.sign_out_all("EB MCP afgesloten");
+    save_log(app_state).await;
     app.exit(0);
 }
 
@@ -896,6 +1001,8 @@ pub fn run() {
             log_list,
             log_get,
             log_clear,
+            log_export,
+            log_export_reveal,
             stats,
             token_reveal,
             token_renew,
@@ -947,9 +1054,20 @@ pub fn run() {
                 EbClient::production(),
                 Arc::new(SessionJar::default()),
             ));
+            // The request log and its statistics of earlier runs, before the server takes its first call.
+            app_state.log.open(logstore::log_file(&dir));
             app.manage(app_state.clone());
             app.manage(settings.clone());
             app.manage(Arc::new(Signins::default()));
+
+            // The request log is saved when it changed, at most every LOG_SAVE_INTERVAL, and at quit.
+            let saving = app_state.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(LOG_SAVE_INTERVAL).await;
+                    save_log(&saving).await;
+                }
+            });
 
             // Forward state changes to every window.
             let mut events = app_state.events.subscribe();
@@ -1078,18 +1196,23 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("EB MCP kon niet starten")
-        .run(|app, event| {
+        .run(|app, event| match event {
+            // Any other way out (an updater's relaunch, the system ending the app): the request log
+            // is saved once more when it changed since the last save.
+            tauri::RunEvent::Exit => {
+                if let Some(state) = app.try_state::<Arc<AppState>>()
+                    && let Err(e) = state.log.save()
+                {
+                    log::warn!("request log not saved at exit: {e}");
+                }
+            }
             // A click on the Dock icon (when it shows) opens the window again.
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen {
+            tauri::RunEvent::Reopen {
                 has_visible_windows: false,
                 ..
-            } = event
-            {
-                open_main(app.clone(), None);
-            }
-            #[cfg(not(target_os = "macos"))]
-            let _ = (app, event);
+            } => open_main(app.clone(), None),
+            _ => {}
         });
 }
 

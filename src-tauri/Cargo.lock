@@ -1139,6 +1139,7 @@ dependencies = [
  "base64 0.22.1",
  "block2",
  "chrono",
+ "flate2",
  "futures-util",
  "http-body-util",
  "keyring",
