@@ -143,6 +143,79 @@ fn grid(limit: Option<u32>, offset: Option<u32>) -> Result<Vec<(String, String)>
     ])
 }
 
+/// The query for `import/gridtable`, with the filters of e-Boekhouden's own grids: `search<KIND><column>`.
+/// Checked against a real administration on 2026-11-11: `BETWE` takes ISO dates and includes both ends,
+/// `CONTA` matches part of the text. A date outside the calendar never goes out (the API answers 500 on one).
+fn bankregels_query(args: &BankregelsArgs) -> Result<Vec<(String, String)>, String> {
+    let mut query = grid(args.limit, args.offset)?;
+    let van = args.van.as_deref().map(parse_date).transpose()?;
+    let tot = args.tot.as_deref().map(parse_date).transpose()?;
+    if let (Some(van), Some(tot)) = (van, tot)
+        && van > tot
+    {
+        return Err("van ligt na tot".into());
+    }
+    if van.is_some() || tot.is_some() {
+        // The grid has no open-ended date filter that includes its bound, so a missing end becomes a far one.
+        let van = van.map(dashed).unwrap_or_else(|| "1900-01-01".into());
+        let tot = tot.map(dashed).unwrap_or_else(|| "9999-12-31".into());
+        query.push(("searchBETWEmutDatum".into(), format!("{van}<->{tot}")));
+    }
+    push(
+        &mut query,
+        "searchCONTAmutOmschrijving",
+        args.omschrijving.as_ref(),
+    );
+    Ok(query)
+}
+
+/// A grid answer with its rows as objects. e-Boekhouden sends each row as a list of values and the column
+/// names apart (`colMetadata`); here every row carries its names, so nobody has to count columns.
+/// An answer of another shape comes back unchanged.
+fn named_rows(mut grid: Value) -> Value {
+    let names: Option<Vec<(usize, String)>> = grid
+        .get("colMetadata")
+        .and_then(Value::as_array)
+        .map(|columns| {
+            columns
+                .iter()
+                .filter_map(|column| {
+                    let index = column
+                        .get("readerIndex")
+                        .or(column.get("index"))?
+                        .as_u64()?;
+                    Some((index as usize, column.get("name")?.as_str()?.to_owned()))
+                })
+                .collect()
+        });
+    let Some(names) = names.filter(|names| !names.is_empty()) else {
+        return grid;
+    };
+    let Some(rows) = grid.get_mut("data").and_then(Value::as_array_mut) else {
+        return grid;
+    };
+    if !rows.iter().all(Value::is_array) {
+        return grid;
+    }
+    for row in rows.iter_mut() {
+        let values = row.as_array().cloned().unwrap_or_default();
+        let named: serde_json::Map<String, Value> = names
+            .iter()
+            .map(|(index, name)| {
+                (
+                    name.clone(),
+                    values.get(*index).cloned().unwrap_or(Value::Null),
+                )
+            })
+            .collect();
+        *row = Value::Object(named);
+    }
+    if let Some(object) = grid.as_object_mut() {
+        object.remove("colMetadata");
+    }
+    grid
+}
+
 fn push(query: &mut Vec<(String, String)>, key: &str, value: Option<impl ToString>) {
     if let Some(value) = value {
         let value = value.to_string();
@@ -186,6 +259,22 @@ pub struct MutatiesArgs {
     pub omschrijving: Option<String>,
     /// Factuurnummer.
     pub factuur: Option<String>,
+    /// Aantal rijen, 1 tot 200 (standaard 50).
+    pub limit: Option<u32>,
+    /// Vanaf welke rij (standaard 0).
+    pub offset: Option<u32>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct BankregelsArgs {
+    /// Vanaf boekdatum van de bankregel, JJJJ-MM-DD.
+    pub van: Option<String>,
+    /// Tot en met boekdatum van de bankregel, JJJJ-MM-DD.
+    pub tot: Option<String>,
+    /// Zoek in de omschrijving; daar staan ook de naam en het IBAN van de tegenpartij in.
+    pub omschrijving: Option<String>,
     /// Aantal rijen, 1 tot 200 (standaard 50).
     pub limit: Option<u32>,
     /// Vanaf welke rij (standaard 0).
@@ -645,24 +734,25 @@ impl EbMcp {
     // The list behind Boekhouden > Importeren in e-Boekhouden's own app (`import/gridtable`). Only the read: the
     // paths that process, book or delete these lines (`import/verwerk`, `import/bulk/wegboeken`) are never called.
     #[tool(
-        description = "Geïmporteerde bankregels (afschriftregels) die nog niet verwerkt zijn tot een mutatie: datum, bedrag, omschrijving, rekening en tegenrekening. Alleen lezen: verwerken of wegboeken kan EB MCP niet.",
+        description = "Geïmporteerde bankregels (afschriftregels) die nog niet verwerkt zijn tot een mutatie. Per regel: id, datum (van de import), rekening (IBAN van de eigen bankrekening), mutDatum (boekdatum), mutBedrag (negatief is af), mutOmschrijving (met naam en IBAN van de tegenpartij), mutFactuur, grootboekId, opmerking, hasFiles en verwerkFailureReason. Te filteren op boekdatum en omschrijving. Alleen lezen: verwerken of wegboeken kan EB MCP niet.",
         annotations(title = "Bankregels", read_only_hint = true)
     )]
     async fn bankregels(
         &self,
-        Parameters(args): Parameters<ListArgs>,
+        Parameters(args): Parameters<BankregelsArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let query = grid(args.limit, args.offset);
-        self.simple(
-            &context,
-            "bankregels",
-            &args,
-            args.account.as_deref(),
-            "import/gridtable",
-            query,
-        )
-        .await
+        const PATH: &str = "import/gridtable";
+        let run = match self.begin(&context, "bankregels", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let query = match bankregels_query(&args) {
+            Ok(query) => query,
+            Err(message) => return Ok(self.refuse(run, message)),
+        };
+        let result = self.fetch(&run, PATH, query).await.map(named_rows);
+        Ok(self.end(run, PATH, result))
     }
 
     #[tool(
@@ -1082,6 +1172,88 @@ mod tests {
     #[test]
     fn counts_its_tools_on_the_router() {
         assert_eq!(tool_count(), 13);
+    }
+
+    #[test]
+    fn asks_for_bank_lines_the_way_e_boekhoudens_grid_filters() {
+        let pair = |key: &str, value: &str| (key.to_owned(), value.to_owned());
+        assert_eq!(
+            bankregels_query(&BankregelsArgs::default()).unwrap(),
+            grid(None, None).unwrap(),
+            "no filter unless asked"
+        );
+        let both = BankregelsArgs {
+            van: Some("2026-11-03".into()),
+            tot: Some("2026-11-06".into()),
+            omschrijving: Some(" bakker ".into()),
+            limit: Some(20),
+            ..Default::default()
+        };
+        let query = bankregels_query(&both).unwrap();
+        assert!(query.contains(&pair("limit", "20")));
+        assert!(query.contains(&pair("searchBETWEmutDatum", "2026-11-03<->2026-11-06")));
+        assert!(query.contains(&pair("searchCONTAmutOmschrijving", "bakker")));
+        // One bound alone still includes that day.
+        let from = BankregelsArgs {
+            van: Some("2026-11-06".into()),
+            ..Default::default()
+        };
+        assert!(
+            bankregels_query(&from)
+                .unwrap()
+                .contains(&pair("searchBETWEmutDatum", "2026-11-06<->9999-12-31"))
+        );
+        let until = BankregelsArgs {
+            tot: Some("2026-11-06".into()),
+            ..Default::default()
+        };
+        assert!(
+            bankregels_query(&until)
+                .unwrap()
+                .contains(&pair("searchBETWEmutDatum", "1900-01-01<->2026-11-06"))
+        );
+        // Nothing goes out for a date that is none, or for a period that ends before it starts.
+        let bad = BankregelsArgs {
+            van: Some("06-11-2026".into()),
+            ..Default::default()
+        };
+        assert!(bankregels_query(&bad).is_err());
+        let backwards = BankregelsArgs {
+            van: Some("2026-11-06".into()),
+            tot: Some("2026-11-03".into()),
+            ..Default::default()
+        };
+        assert_eq!(bankregels_query(&backwards).unwrap_err(), "van ligt na tot");
+    }
+
+    #[test]
+    fn names_the_columns_of_a_grid_row() {
+        // The shape of import/gridtable, with made-up values.
+        let grid = json!({
+            "colMetadata": [
+                {"index": 0, "name": "id", "readerIndex": 0},
+                {"index": 1, "name": "mutDatum", "readerIndex": 1},
+                {"index": 2, "name": "mutBedrag", "readerIndex": 2},
+                {"index": 3, "name": "opmerking", "readerIndex": 3}
+            ],
+            "data": [[101, "2026-11-06T00:00:00", -77.58, null], [102, "2026-11-07T00:00:00", 12.0]],
+            "rowCount": 2, "limit": 50, "offset": 0
+        });
+        let named = named_rows(grid);
+        assert_eq!(
+            named["data"],
+            json!([
+                {"id": 101, "mutDatum": "2026-11-06T00:00:00", "mutBedrag": -77.58, "opmerking": null},
+                {"id": 102, "mutDatum": "2026-11-07T00:00:00", "mutBedrag": 12.0, "opmerking": null}
+            ])
+        );
+        assert_eq!(named["rowCount"], 2);
+        assert!(named.get("colMetadata").is_none());
+        assert_eq!(crate::ebapi::count_rows(&named), Some(2));
+        // Another shape is left alone.
+        let other = json!({"data": [{"id": 1}], "colMetadata": [{"name": "id", "readerIndex": 0}]});
+        assert_eq!(named_rows(other.clone()), other);
+        assert_eq!(named_rows(json!({"valid": true})), json!({"valid": true}));
     }
 
     #[test]
