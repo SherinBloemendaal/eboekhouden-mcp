@@ -65,6 +65,8 @@ struct AccountView {
     account: Account,
     session: Option<SessionView>,
     signing_in: bool,
+    /// The newest step of this account's latest sign-in since EB MCP started, its end state included.
+    signin: Option<signin::SigninEvent>,
 }
 
 type Shared<'a, T> = State<'a, Arc<T>>;
@@ -109,13 +111,17 @@ fn accounts_list(
         .accounts
         .list()
         .into_iter()
-        .map(|account| AccountView {
-            session: sessions
-                .iter()
-                .find(|s| s.account_id == account.id)
-                .cloned(),
-            signing_in: signins.is_running(account.id),
-            account,
+        .map(|account| {
+            let (signing_in, signin) = signins.state_of(account.id);
+            AccountView {
+                session: sessions
+                    .iter()
+                    .find(|s| s.account_id == account.id)
+                    .cloned(),
+                signing_in,
+                signin,
+                account,
+            }
         })
         .collect()
 }
@@ -235,6 +241,7 @@ fn account_remove(
     app_state.sign_out(id, "account verwijderd");
     creds::delete_password(id)?;
     app_state.accounts.remove(id)?;
+    signins.forget(id);
     let _ = app_state.events.send(state::AppEvent::SessionsChanged);
     Ok(())
 }

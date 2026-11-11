@@ -24,6 +24,8 @@ export interface AccountView {
   administration: string | null
   session: SessionView | null
   signingIn: boolean
+  /** The newest step of this account's latest sign-in since EB MCP started, its end state included. */
+  signin: SigninEvent | null
 }
 
 export interface AccountInput {
@@ -96,8 +98,10 @@ export const store = reactive({
 let refreshSeq = 0
 
 /**
- * Reloads the accounts. Only the newest call writes: a list read before a sign-in event arrived would otherwise
- * undo what that event showed.
+ * Reloads the accounts and, with them, the newest step of each account's latest sign-in. The app keeps that step,
+ * its end state included, so a window that missed an event (it opened later, or was asleep) still shows what
+ * happened. Only the newest call writes: a list read before a sign-in event arrived would otherwise undo what that
+ * event showed.
  */
 export async function refresh(): Promise<void> {
   const seq = ++refreshSeq
@@ -106,19 +110,28 @@ export async function refresh(): Promise<void> {
   store.accounts = accounts
   store.loaded = true
   for (const account of accounts) {
-    const event = store.signins[account.id]
-    if (account.signingIn && !event) {
-      // This window opened while a sign-in ran: show it as running, so the row offers Annuleren and not an idle Inloggen.
-      store.signins[account.id] = { accountId: account.id, step: 'submit', message: null }
-    } else if (!account.signingIn && event && isRunning(event.step)) {
-      // The sign-in stopped and its last step never reached this window.
+    if (account.signin) take(account.signin)
+    else {
       delete store.signins[account.id]
       codeAsked.delete(account.id)
     }
   }
 }
 
-/** Sign-ins this window started (or added the account for). Only these keep their end state until Sluiten. */
+/** Stores an account's newest sign-in step and keeps track of a running sign-in that asked for a code. */
+function take(event: SigninEvent): void {
+  if (event.step === 'code') codeAsked.add(event.accountId)
+  else if (!isRunning(event.step)) codeAsked.delete(event.accountId)
+  store.signins[event.accountId] = event
+}
+
+/** Whether a sign-in of this account runs: by its newest step when this window knows one, else as the app said. */
+export function signingIn(account: AccountView): boolean {
+  const event = store.signins[account.id]
+  return event ? isRunning(event.step) : account.signingIn
+}
+
+/** Sign-ins this window started (or added the account for): it shows their steps, until Sluiten. */
 const startedSet = reactive(new Set<string>())
 /** Running sign-ins that asked this window for a code: it shows their steps wherever they started. */
 const codeAsked = reactive(new Set<string>())
@@ -138,20 +151,12 @@ export function askedCode(id: string): boolean {
 }
 
 /**
- * Takes in one `signin` event. Every window gets every event: running steps are kept for every account, so each
- * window shows the account as busy. An end state is kept only where the sign-in started; elsewhere it is dropped,
- * so no finished steps linger in a window that never asked for them.
+ * Takes in one `signin` event. Every window gets every event and keeps the newest one per account, the end state
+ * too: which window shows the steps is each window's own choice (the one that started or follows the sign-in),
+ * but none may be left showing a step that is no longer the newest.
  */
 export function receiveSignin(event: SigninEvent): void {
-  const id = event.accountId
-  if (isRunning(event.step)) {
-    if (event.step === 'code') codeAsked.add(id)
-    store.signins[id] = event
-    return
-  }
-  codeAsked.delete(id)
-  if (startedSet.delete(id)) store.signins[id] = event
-  else delete store.signins[id]
+  take(event)
 }
 
 let listening = false
@@ -180,7 +185,8 @@ export const updateAccount = (id: string, input: AccountInput, password: string 
   invoke<AccountView>('account_update', { id, input, password }).finally(refresh)
 export const removeAccount = (id: string) => invoke('account_remove', { id }).finally(refresh)
 export const signIn = (id: string) => {
-  delete store.signins[id]
+  // Shown at once, in place of an earlier sign-in's end state; the app's own first step follows.
+  store.signins[id] = { accountId: id, step: 'credentials', message: null }
   markStarted(id)
   return invoke('signin_start', { id })
 }
@@ -207,8 +213,8 @@ export const signOutAll = () => invoke('sign_out_all').finally(refresh)
 export const getSettings = () => (inApp() ? invoke<Settings>('settings_get') : Promise.resolve<Settings>({ idleMinutes: 30, appearance: 'system', showInDock: true }))
 export const saveSettings = (value: Settings) => invoke('settings_set', { value })
 
+/** Closes this window's view of a sign-in. Its newest step stays known, here and in other windows. */
 export function dismissSignin(id: string): void {
-  delete store.signins[id]
   startedSet.delete(id)
   codeAsked.delete(id)
 }

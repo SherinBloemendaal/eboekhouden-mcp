@@ -8,7 +8,7 @@ import Icon from '../components/Icon.vue'
 import Sheet from '../components/Sheet.vue'
 import SigninSteps from '../components/SigninSteps.vue'
 import {
-  cancelSignIn, connect, dismissSignin, getSettings, isRunning, opLabel, removeAccount, sessionAge, signIn, signOut, store,
+  cancelSignIn, connect, dismissSignin, getSettings, isRunning, opLabel, removeAccount, sessionAge, signIn, signingIn, signOut, store,
   type AccountView,
 } from '../lib/accounts'
 import { unlockName } from '../lib/server'
@@ -38,7 +38,7 @@ const ended = computed(() => !!watchedEvent.value && !isRunning(watchedEvent.val
 
 /** A sign-in this window did not start (from the menu-bar panel) and does not show yet: the row offers to follow it. */
 function followable(account: AccountView): boolean {
-  return (account.signingIn || isRunning(store.signins[account.id]?.step)) && watching.value !== account.id
+  return signingIn(account) && watching.value !== account.id
 }
 
 /** Shows the steps and the code field of a running sign-in, without starting a new one. */
@@ -60,9 +60,7 @@ function onSaved(account: AccountView, added: boolean) {
 
 function closeSignin() {
   if (!watching.value) return
-  // Without a step yet (followed from the panel before this window heard one), the account says whether it runs.
-  const running = watchedEvent.value ? isRunning(watchedEvent.value.step) : !!watched.value?.signingIn
-  if (running) void cancelSignIn(watching.value)
+  if (watched.value && signingIn(watched.value)) void cancelSignIn(watching.value)
   dismissSignin(watching.value)
   watching.value = null
 }
@@ -79,7 +77,7 @@ async function confirmRemove() {
 }
 
 function sessionText(account: AccountView): { tone: string; text: string } {
-  if (account.signingIn || isRunning(store.signins[account.id]?.step)) return { tone: 'run', text: 'Bezig met inloggen…' }
+  if (signingIn(account)) return { tone: 'run', text: 'Bezig met inloggen…' }
   if (account.session?.expired) return { tone: 'bad', text: 'Sessie verlopen' }
   if (account.session) return { tone: 'on', text: sessionAge(account.session.startedAt, now.value) }
   return { tone: 'off', text: account.administration ? 'Niet ingelogd' : 'Nog nooit ingelogd' }

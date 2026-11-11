@@ -6,7 +6,7 @@ import App from '../App.vue'
 import Alert from '../components/Alert.vue'
 import ClientIcon from '../components/ClientIcon.vue'
 import Sheet from '../components/Sheet.vue'
-import { store, type AccountView } from '../lib/accounts'
+import { receiveSignin, store, type AccountView } from '../lib/accounts'
 import { CLIENT_NAMES, SERVER_NAMES, usesBridge, type Client } from '../lib/connect'
 import { unlockName } from '../lib/server'
 
@@ -64,7 +64,7 @@ describe('views', () => {
 function account(over: Partial<AccountView>): AccountView {
   return {
     id: 'a1', label: 'Studio Noord', username: 'jan@studionoord.example', store: 'system', opRef: null, opTitle: null, opVault: null,
-    administration: 'Studio Noord B.V.', session: null, signingIn: false, ...over,
+    administration: 'Studio Noord B.V.', session: null, signingIn: false, signin: null, ...over,
   }
 }
 
@@ -104,6 +104,25 @@ describe('accounts page', () => {
     const sheet = wrapper.find('[role="dialog"]')
     expect(sheet.attributes('aria-label')).toBe('Inloggen bij Studio Noord')
     expect(sheet.text()).toContain('Tweestapsverificatie')
+    wrapper.unmount()
+  })
+
+  it('shows the end of a followed sign-in and keeps its diagnosis within reach', async () => {
+    const wrapper = await mountAt('/accounts')
+    store.accounts = [account({ signingIn: true })]
+    store.signins = { a1: { accountId: 'a1', step: 'administration', message: null } }
+    await flushPromises()
+    await wrapper.find('.actions .btn').trigger('click')
+    await flushPromises()
+    const sheet = wrapper.find('[role="dialog"]')
+    expect(sheet.find('li.run').text()).toBe('Administratie ophalen')
+    // This window did not start the sign-in; its end reaches it all the same.
+    receiveSignin({ accountId: 'a1', step: 'done', message: 'Studio Noord B.V.' })
+    await flushPromises()
+    expect(sheet.findAll('li.run')).toHaveLength(0)
+    expect(sheet.findAll('li.done')).toHaveLength(3)
+    expect(sheet.text()).toContain('Ingelogd bij Studio Noord B.V.')
+    expect(sheet.find('.debug .btn').text()).toBe('Details')
     wrapper.unmount()
   })
 

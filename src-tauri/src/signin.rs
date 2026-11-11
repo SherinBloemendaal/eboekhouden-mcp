@@ -94,6 +94,10 @@ struct Pending {
 #[derive(Default)]
 pub struct Signins {
     pending: Mutex<HashMap<Uuid, Pending>>,
+    /// The newest step of each account's latest sign-in, its end state included, until the next sign-in or
+    /// the end of the app. Every window reads it with the accounts, so none depends on having heard each event.
+    /// Locked only while `pending` is held or on its own, never the other way round.
+    last: Mutex<HashMap<Uuid, SigninEvent>>,
     traces: Mutex<VecDeque<(Instant, Trace)>>,
 }
 
@@ -157,8 +161,29 @@ impl Signins {
             .collect()
     }
 
-    pub fn is_running(&self, id: Uuid) -> bool {
-        self.pending.lock().unwrap().contains_key(&id)
+    /// Whether a sign-in of this account runs, and the newest step of its latest one, read together so a
+    /// window never sees a finished sign-in that still counts as running.
+    pub fn state_of(&self, id: Uuid) -> (bool, Option<SigninEvent>) {
+        let pending = self.pending.lock().unwrap();
+        let last = self.last.lock().unwrap().get(&id).cloned();
+        (pending.contains_key(&id), last)
+    }
+
+    /// Records a step of a running sign-in.
+    fn note(&self, event: SigninEvent) {
+        self.last.lock().unwrap().insert(event.account_id, event);
+    }
+
+    /// Ends a sign-in: it no longer runs and `event` is its end state, both at once.
+    fn finish(&self, event: SigninEvent) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.remove(&event.account_id);
+        self.last.lock().unwrap().insert(event.account_id, event);
+    }
+
+    /// Drops what is known about an account's sign-ins, when the account is removed.
+    pub fn forget(&self, id: Uuid) {
+        self.last.lock().unwrap().remove(&id);
     }
 
     /// Whether any sign-in is still running, for any account.
@@ -194,16 +219,15 @@ impl Signins {
     }
 }
 
-fn emit(app: &AppHandle, account_id: Uuid, step: Step, message: Option<String>) {
-    crate::to_our_windows(
-        app,
-        "signin",
-        SigninEvent {
-            account_id,
-            step,
-            message,
-        },
-    );
+/// Records a running sign-in's step and tells every window.
+fn emit(app: &AppHandle, signins: &Signins, account_id: Uuid, step: Step, message: Option<String>) {
+    let event = SigninEvent {
+        account_id,
+        step,
+        message,
+    };
+    signins.note(event.clone());
+    crate::to_our_windows(app, "signin", event);
 }
 
 /// Runs one sign-in to the end, reporting each step. Never retries on its own.
@@ -226,6 +250,12 @@ pub async fn sign_in(
                 code: None,
             },
         );
+        // From here the account's newest step is this sign-in's, not the end of an earlier one.
+        signins.note(SigninEvent {
+            account_id,
+            step: Step::Credentials,
+            message: None,
+        });
     }
     let label = state
         .accounts
@@ -259,8 +289,13 @@ pub async fn sign_in(
             None => format!("{step:?}"),
         },
     );
-    signins.pending.lock().unwrap().remove(&account_id);
-    emit(&app, account_id, step, message);
+    let event = SigninEvent {
+        account_id,
+        step,
+        message,
+    };
+    signins.finish(event.clone());
+    crate::to_our_windows(&app, "signin", event);
     // The panel stayed open for this sign-in; if the user has moved on meanwhile, it closes now.
     crate::hide_unfocused_panel(&app);
 }
@@ -277,7 +312,7 @@ async fn run(
     let Some(account) = state.accounts.get(account_id) else {
         return (Step::Failed, Some("Dit account bestaat niet meer".into()));
     };
-    emit(app, account_id, Step::Credentials, None);
+    emit(app, signins, account_id, Step::Credentials, None);
     signins.trace(
         account_id,
         format!("Gegevens lezen uit {:?}", account.store),
@@ -297,7 +332,7 @@ async fn run(
         return (Step::Cancelled, None);
     }
 
-    emit(app, account_id, Step::Submit, None);
+    emit(app, signins, account_id, Step::Submit, None);
     signins.trace(account_id, "Inloggen bij e-Boekhouden (inlogformulier)");
     *called = true;
     let login = state
@@ -339,7 +374,7 @@ async fn run(
 
     // The check e-Boekhouden's own app makes at startup: does the API accept this session? Its answer also
     // names the administration.
-    emit(app, account_id, Step::Administration, None);
+    emit(app, signins, account_id, Step::Administration, None);
     let check = state.client.auth(&cookies).await;
     state.log_signin_call(&check, account_id, &account.label);
     let valid = crate::ebapi::valid_session(&check);
@@ -505,9 +540,41 @@ mod tests {
             },
         );
         assert!(signins.any_running());
-        assert!(signins.is_running(id));
+        assert!(signins.state_of(id).0);
         signins.pending.lock().unwrap().remove(&id);
         assert!(!signins.any_running());
+    }
+
+    #[test]
+    fn keeps_the_newest_step_of_a_sign_in_past_its_end() {
+        let signins = Signins::default();
+        let id = Uuid::new_v4();
+        let event = |step, message: Option<&str>| SigninEvent {
+            account_id: id,
+            step,
+            message: message.map(str::to_owned),
+        };
+        assert!(matches!(signins.state_of(id), (false, None)));
+        signins.pending.lock().unwrap().insert(
+            id,
+            Pending {
+                cancel: Arc::new(AtomicBool::new(false)),
+                code: None,
+            },
+        );
+        signins.note(event(Step::Administration, None));
+        let (running, last) = signins.state_of(id);
+        assert!(running);
+        assert_eq!(last.unwrap().step, Step::Administration);
+        // The end takes the sign-in out of the running ones and leaves its outcome, for any window that asks later.
+        signins.finish(event(Step::Done, Some("Studio Noord B.V.")));
+        let (running, last) = signins.state_of(id);
+        assert!(!running);
+        let last = last.unwrap();
+        assert_eq!(last.step, Step::Done);
+        assert_eq!(last.message.as_deref(), Some("Studio Noord B.V."));
+        signins.forget(id);
+        assert!(matches!(signins.state_of(id), (false, None)));
     }
 
     #[test]

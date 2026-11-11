@@ -13,10 +13,12 @@ const code = ref('')
 const codeError = ref<string | null>(null)
 const sending = ref(false)
 const lastIndex = ref(0)
+/** Whether this sign-in asked for a two-step code: only then the list has that row. */
+const codeSeen = ref(false)
 
 function indexOf(step: string): number {
   // Sending the two-step code is still the code step.
-  if (step === 'submit') return lastIndex.value >= 2 ? 2 : 1
+  if (step === 'submit') return codeSeen.value ? 2 : 1
   const i = ORDER.indexOf(step as (typeof ORDER)[number])
   return i < 0 ? lastIndex.value : i
 }
@@ -24,6 +26,9 @@ function indexOf(step: string): number {
 watch(
   () => props.event?.step,
   (step) => {
+    // A sign-in starts by reading the credentials: whatever an earlier one asked no longer counts.
+    if (step === 'credentials') codeSeen.value = false
+    if (step === 'code') codeSeen.value = true
     if (step && !['done', 'failed', 'unknown', 'cancelled'].includes(step)) lastIndex.value = indexOf(step)
     if (step === 'code') {
       code.value = ''
@@ -33,7 +38,7 @@ watch(
   { immediate: true },
 )
 
-const asked = computed(() => lastIndex.value >= 2 || props.event?.step === 'code')
+const asked = computed(() => codeSeen.value)
 const rows = computed(() => {
   const step = props.event?.step
   const labels = [
@@ -44,7 +49,8 @@ const rows = computed(() => {
   ]
   const at = asked.value ? lastIndex.value : lastIndex.value >= 3 ? 2 : lastIndex.value
   return labels.map((label, i) => {
-    let state: 'done' | 'run' | 'wait' | 'fail' = i < at ? 'done' : i === at ? 'run' : 'wait'
+    // Without a known step nothing runs: no mark may spin for a sign-in this window knows nothing of.
+    let state: 'done' | 'run' | 'wait' | 'fail' = !step ? 'wait' : i < at ? 'done' : i === at ? 'run' : 'wait'
     if (step === 'done') state = 'done'
     if ((step === 'failed' || step === 'unknown') && i === at) state = 'fail'
     if (step === 'cancelled' && i >= at) state = 'wait'

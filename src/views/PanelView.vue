@@ -5,7 +5,7 @@ import Avatar from '../components/Avatar.vue'
 import Icon from '../components/Icon.vue'
 import SigninSteps from '../components/SigninSteps.vue'
 import {
-  askedCode, cancelSignIn, connect, dismissSignin, isRunning, sessionAge, signIn, signOut, signOutAll, startedHere, store,
+  askedCode, cancelSignIn, connect, dismissSignin, isRunning, sessionAge, signIn, signingIn, signOut, signOutAll, startedHere, store,
   type AccountView,
 } from '../lib/accounts'
 import { fitPanel, isMac, modKey, openMain, quitApp, runningCalls, server, watchServer } from '../lib/server'
@@ -56,17 +56,16 @@ function sessionLine(account: AccountView): string | null {
 
 /** Running here or elsewhere: a sign-in started in the main window (or before this window loaded) counts too. */
 function busy(account: AccountView): boolean {
-  return account.signingIn || isRunning(store.signins[account.id]?.step)
+  return signingIn(account)
 }
 
 /**
- * The steps open only for a sign-in started in this panel, or one that needs a code, wherever it started. Other
- * windows' sign-ins show as a busy row; their end state never reaches this window's store.
+ * The steps open only for a sign-in started in this panel, or one that needs a code, wherever it started, and
+ * stay open with their end state and diagnosis until Sluiten. Other windows' sign-ins show as a busy row.
  */
 function showSteps(account: AccountView): boolean {
-  const event = store.signins[account.id]
-  if (!event) return false
-  return !isRunning(event.step) || startedHere(account.id) || askedCode(account.id)
+  if (!store.signins[account.id]) return false
+  return startedHere(account.id) || askedCode(account.id)
 }
 
 /** macOS: Sparkle's own window. Windows: the main window shows the update card after a fresh check. */
