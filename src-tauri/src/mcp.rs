@@ -262,17 +262,49 @@ mod tests {
             "uren",
             "digitaal_archief",
             "get",
+            "mutatie",
+            "facturen",
+            "factuur",
+            "abonnementen",
+            "abonnement",
         ] {
             assert!(names.contains(&want), "{want} missing from {names:?}");
         }
-        assert_eq!(names.len(), 13);
+        // The tools that change the books say so; the three that cannot be undone say that too.
+        let writes = [
+            "mutatie_toevoegen",
+            "mutatie_wijzigen",
+            "archief_uploaden",
+            "archief_koppelen",
+            "factuur_toevoegen",
+            "factuur_wijzigen",
+            "factuur_verwijderen",
+            "factuur_crediteren",
+            "abonnement_toevoegen",
+            "abonnement_wijzigen",
+            "abonnement_verwijderen",
+            "abonnementen_factureren",
+        ];
+        let destructive = [
+            "factuur_verwijderen",
+            "factuur_crediteren",
+            "abonnement_verwijderen",
+            "abonnementen_factureren",
+        ];
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let writes_it = writes.contains(&name);
+            assert_eq!(tool["annotations"]["readOnlyHint"], !writes_it, "{name}");
+            if writes_it {
+                assert_eq!(
+                    tool["annotations"]["destructiveHint"],
+                    destructive.contains(&name),
+                    "{name}"
+                );
+            }
+        }
+        assert_eq!(names.len(), 18 + writes.len());
         assert_eq!(crate::tools::tool_count(), names.len());
-        assert!(
-            tools
-                .iter()
-                .all(|t| t["annotations"]["readOnlyHint"] == true),
-            "every tool is read-only"
-        );
 
         let call = message(
             post(serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "status", "arguments": {}}}), session.clone())
@@ -301,6 +333,201 @@ mod tests {
                 .unwrap()
                 .contains("nog geen account")
         );
+    }
+
+    /// A stand-in for e-Boekhouden's API with the three calls a new mutatie needs, keeping what it was sent.
+    async fn eboekhouden(seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>>) -> String {
+        use axum::routing::{get, post};
+        let app = axum::Router::new()
+            .route(
+                "/v1/api/grootboekrekening/gridtable",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "colMetadata": [{"name": "id"}, {"name": "code"}, {"name": "omschrijving"}, {"name": "categorie"}, {"name": "inactief"}],
+                        "data": [[11, "1010", "Bank", "Betalingsmiddelen", false], [45, "4550", "Bankkosten", "Winst en Verlies", false]]
+                    }))
+                }),
+            )
+            .route(
+                "/v1/api/btwinfo/all",
+                get(|| async { axum::Json(serde_json::json!([{"code": "GEEN", "omschrijving": "Geen btw", "percentage": 0, "soort": ""}])) }),
+            )
+            .route(
+                "/v1/api/mutatie",
+                post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().unwrap().push(body);
+                        axum::Json(serde_json::json!({"mutNr": 3908, "mutId": 4770877556u64}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://127.0.0.1:{port}/v1/api/")
+    }
+
+    #[tokio::test]
+    async fn a_change_waits_for_the_user_and_goes_out_only_when_approved() {
+        use crate::accounts::{AccountInput, Store, WriteMode};
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jar = Arc::new(crate::state::testing::FakeJar::default());
+        let state = Arc::new(crate::state::testing::state_with(
+            jar.clone(),
+            &eboekhouden(seen.clone()).await,
+        ));
+        let account = state
+            .accounts
+            .add(AccountInput {
+                label: "Studio Noord".into(),
+                username: "lisa@studionoord.example".into(),
+                store: Store::System,
+                op_ref: None,
+                op_title: None,
+                op_vault: None,
+                write: WriteMode::Off,
+            })
+            .unwrap();
+        state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
+        state.add_session(account.id, &account.label, "sessie");
+        let set_write = |mode: WriteMode| {
+            state
+                .accounts
+                .update(
+                    account.id,
+                    AccountInput {
+                        label: "Studio Noord".into(),
+                        username: "lisa@studionoord.example".into(),
+                        store: Store::System,
+                        op_ref: None,
+                        op_title: None,
+                        op_vault: None,
+                        write: mode,
+                    },
+                )
+                .unwrap();
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mcp = router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
+        tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{PATH}");
+        let post = |body: serde_json::Value, session: Option<String>| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&body);
+            if let Some(s) = session {
+                request = request.header("mcp-session-id", s);
+            }
+            request.send()
+        };
+        let init = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "title": "Claude", "version": "1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        let book = |id: u32| {
+            let call = post(
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "mutatie_toevoegen", "arguments": {
+                    "soort": "geld_uitgegeven", "datum": "2026-11-06", "rekening": "1010", "omschrijving": "Parkeergarage",
+                    "regels": [{"tegenrekening": "4550", "bedrag": 2}], "bankregel_id": 465233844u64
+                }}}),
+                session.clone(),
+            );
+            async move {
+                let body = call.await.unwrap().text().await.unwrap();
+                let answer = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .unwrap_or_else(|| {
+                        body.lines()
+                            .filter_map(|l| l.strip_prefix("data:"))
+                            .filter_map(|d| {
+                                serde_json::from_str::<serde_json::Value>(d.trim()).ok()
+                            })
+                            .find(|v| v.get("id").is_some())
+                            .unwrap_or_else(|| panic!("no JSON-RPC answer in {body}"))
+                    });
+                (
+                    answer["result"]["isError"] == true,
+                    answer["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            }
+        };
+        // The user's answer in the app, given once the proposal is up.
+        let answer_with = |approve: bool| {
+            let state = state.clone();
+            async move {
+                for _ in 0..200 {
+                    if let Some(proposal) = state.approvals.list().into_iter().next() {
+                        assert_eq!(proposal.title, "Mutatie toevoegen: Geld uitgegeven");
+                        assert_eq!(proposal.client, "Claude");
+                        assert!(!proposal.danger);
+                        assert!(
+                            proposal.lines.iter().any(|l| l.label == "Regel 1"
+                                && l.value == "4550 Bankkosten: 2,00 (Geen btw)"),
+                            "{:?}",
+                            proposal.lines
+                        );
+                        assert!(state.approvals.decide(proposal.id, approve));
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("no proposal came up");
+            }
+        };
+
+        // Writing is off: refused, and nothing was even read from e-Boekhouden.
+        let (is_error, text) = book(2).await;
+        assert!(is_error && text.contains("alleen-lezen"), "{text}");
+        assert_eq!(state.approvals.count(), 0);
+
+        // With approval, and the user says no: nothing goes out.
+        set_write(WriteMode::Ask);
+        let ((is_error, text), ()) = tokio::join!(book(3), answer_with(false));
+        assert!(is_error && text.contains("geweigerd"), "{text}");
+        assert!(seen.lock().unwrap().is_empty());
+
+        // The user approves: exactly the request e-Boekhouden's own screen sends.
+        let ((is_error, text), ()) = tokio::join!(book(4), answer_with(true));
+        assert!(!is_error, "{text}");
+        assert!(text.contains("\"mutNr\":3908"), "{text}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![serde_json::json!({
+                "mutatie": {"rekening": 11, "datum": "2026-11-06", "soort": 6, "inEx": "IN", "omschrijving": "Parkeergarage"},
+                "mutatieRegels": [{"index": 0, "tegenRekening": 45, "btwCode": "GEEN", "bedrag": 2.0}],
+                "importId": 465233844u64
+            })]
+        );
+        assert_eq!(state.approvals.count(), 0, "an answered proposal is gone");
+
+        // Without approval the booking goes straight through.
+        set_write(WriteMode::Auto);
+        let (is_error, text) = book(5).await;
+        assert!(!is_error, "{text}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_eq!(state.approvals.count(), 0);
     }
 
     #[test]

@@ -84,14 +84,70 @@ impl EbClient {
     }
 
     /// GET `path` (relative to /v1/api/) with the given cookies of the account's session.
+    #[cfg(test)]
     pub async fn get(
         &self,
         cookies: &[(String, String)],
         path: &str,
         query: &[(String, String)],
     ) -> ApiCall {
+        self.send(cookies, "GET", path, query, None).await
+    }
+
+    /// Runs a job on e-Boekhouden's hub (hub.rs) in the account's session and waits for its end. Not rate
+    /// limited with the other calls: it is one long connection, made at most once per approved tool call.
+    pub async fn hub(
+        &self,
+        cookies: &[(String, String)],
+        hub: &str,
+        target: &str,
+        argument: &Value,
+    ) -> ApiCall {
+        let started = Instant::now();
         let mut call = ApiCall {
-            method: "GET",
+            method: "HUB",
+            path: format!("hub/{hub}"),
+            query: vec![("target".into(), target.to_owned())],
+            status: 0,
+            duration_ms: 0,
+            bytes: 0,
+            rows: None,
+            json: None,
+            error: None,
+        };
+        match crate::hub::invoke(&self.base, cookies, hub, target, argument).await {
+            Ok(crate::hub::Outcome::Done(result)) => {
+                call.status = 200;
+                call.json = Some(result);
+            }
+            Ok(crate::hub::Outcome::Refused(said)) => {
+                call.status = 400;
+                call.error = Some(format!("e-Boekhouden weigert dit: {said}"));
+            }
+            Err(error) => {
+                if error.contains("ingelogd") {
+                    call.status = 401;
+                }
+                call.error = Some(error);
+            }
+        }
+        call.duration_ms = started.elapsed().as_millis() as u64;
+        call
+    }
+
+    /// One call on e-Boekhouden's API in the account's session: GET to read, or POST, PUT or DELETE (with a
+    /// JSON body where the API takes one) to change something. Who may change what is decided before this
+    /// is called (tools.rs, approvals.rs); here it is one request, never retried.
+    pub async fn send(
+        &self,
+        cookies: &[(String, String)],
+        method: &'static str,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<&Value>,
+    ) -> ApiCall {
+        let mut call = ApiCall {
+            method,
             path: path.to_owned(),
             query: query.to_vec(),
             status: 0,
@@ -116,10 +172,19 @@ impl EbClient {
             }
         };
         let started = Instant::now();
+        let verb = match method {
+            "POST" => reqwest::Method::POST,
+            "PUT" => reqwest::Method::PUT,
+            "DELETE" => reqwest::Method::DELETE,
+            _ => reqwest::Method::GET,
+        };
         let mut request = self
             .http
-            .get(url)
+            .request(verb, url)
             .header(reqwest::header::ACCEPT, "application/json");
+        if let Some(body) = body {
+            request = request.json(body);
+        }
         if !cookies.is_empty() {
             request = request.header(reqwest::header::COOKIE, cookie_header(cookies));
         }
@@ -154,6 +219,8 @@ impl EbClient {
                     self.limiter.succeeded().await;
                 }
                 match call.status {
+                    // A change may be answered without a body: that is a success with nothing to read.
+                    200..=299 if body.is_empty() => {}
                     200..=299 => match serde_json::from_slice::<Value>(&body) {
                         Ok(json) => {
                             call.rows = count_rows(&json);
@@ -172,7 +239,24 @@ impl EbClient {
                     }
                     404 => call.error = Some("Dit pad bestaat niet (meer) bij e-Boekhouden".into()),
                     429 => call.error = Some("e-Boekhouden vraagt om rustiger aan te doen".into()),
-                    status => call.error = Some(format!("e-Boekhouden gaf een fout ({status})")),
+                    // What e-Boekhouden says about a request it refuses ("Onbekend grootboekrekening voor regel.")
+                    // is the useful part; a server fault only carries its own error code.
+                    status => {
+                        let said = serde_json::from_slice::<Value>(&body).ok().and_then(|json| {
+                            json.get("message")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|message| !message.is_empty())
+                                .map(str::to_owned)
+                        });
+                        call.error = Some(match said {
+                            Some(message) if status == 400 => {
+                                format!("e-Boekhouden weigert dit: {message}")
+                            }
+                            Some(message) => format!("e-Boekhouden gaf een fout ({status}): {message}"),
+                            None => format!("e-Boekhouden gaf een fout ({status})"),
+                        });
+                    }
                 }
             }
         }

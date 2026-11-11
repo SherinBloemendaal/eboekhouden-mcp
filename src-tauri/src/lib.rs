@@ -1,7 +1,9 @@
 mod accounts;
+mod approvals;
 mod connect;
 mod creds;
 mod ebapi;
+mod hub;
 mod mcp;
 mod reqlog;
 mod secrets;
@@ -10,6 +12,7 @@ mod signin;
 mod state;
 mod tools;
 mod updates;
+mod write;
 
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -219,6 +222,10 @@ fn account_update(
         return Err("Vul het wachtwoord in voor de sleutelhanger".into());
     }
     let account = app_state.accounts.update(id, input)?;
+    // Writing turned off: whatever this account still had waiting for approval is refused.
+    if account.write == accounts::WriteMode::Off && app_state.approvals.refuse_account(id) > 0 {
+        let _ = app_state.events.send(state::AppEvent::ApprovalsChanged);
+    }
     match account.store {
         Store::System => {
             if let Some(password) = password.filter(|p| !p.is_empty()) {
@@ -239,11 +246,32 @@ fn account_remove(
 ) -> Result<(), String> {
     signins.cancel(id);
     app_state.sign_out(id, "account verwijderd");
+    if app_state.approvals.refuse_account(id) > 0 {
+        let _ = app_state.events.send(state::AppEvent::ApprovalsChanged);
+    }
     creds::delete_password(id)?;
     app_state.accounts.remove(id)?;
     signins.forget(id);
     let _ = app_state.events.send(state::AppEvent::SessionsChanged);
     Ok(())
+}
+
+/// The changes AI clients asked for that wait for the user's approval, oldest first.
+#[tauri::command]
+fn approvals_list(app_state: Shared<'_, AppState>) -> Vec<approvals::Proposal> {
+    app_state.approvals.list()
+}
+
+/// The user's answer to one of them. Only Goedkeuren (`approve`) lets the request go to e-Boekhouden.
+#[tauri::command]
+fn approval_decide(app_state: Shared<'_, AppState>, id: u64, approve: bool) -> Result<(), String> {
+    let answered = app_state.approvals.decide(id, approve);
+    let _ = app_state.events.send(state::AppEvent::ApprovalsChanged);
+    if answered {
+        Ok(())
+    } else {
+        Err("Dit voorstel wacht niet meer: het is al beantwoord of verlopen".into())
+    }
 }
 
 #[tauri::command]
@@ -861,6 +889,8 @@ pub fn run() {
             open_eboekhouden,
             op_items,
             signin_traces,
+            approvals_list,
+            approval_decide,
             open_log_dir,
             open_op_install,
             log_list,
@@ -924,8 +954,19 @@ pub fn run() {
             // Forward state changes to every window.
             let mut events = app_state.events.subscribe();
             let handle = app.handle().clone();
+            let waiting = app_state.clone();
             tauri::async_runtime::spawn(async move {
                 while let Ok(event) = events.recv().await {
+                    // A change waits for the user's word: the main window comes up, where the proposal is shown.
+                    // The AI client is waiting meanwhile, so this may take the focus.
+                    if matches!(event, state::AppEvent::ApprovalsChanged)
+                        && waiting.approvals.count() > 0
+                        && let Some(main) = handle.get_webview_window(MAIN)
+                    {
+                        let _ = main.show();
+                        let _ = main.unminimize();
+                        let _ = main.set_focus();
+                    }
                     to_our_windows(&handle, "state", event);
                 }
             });

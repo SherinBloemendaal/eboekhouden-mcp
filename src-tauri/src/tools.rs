@@ -19,9 +19,11 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::accounts::Account;
+use crate::accounts::{Account, WriteMode};
+use crate::approvals::{self, Ask, line};
 use crate::reqlog::Outcome;
 use crate::state::{AppEvent, AppState};
+use crate::write::{self, Books, Built};
 
 const MAX_ROWS: u32 = 200;
 const GET_PATHS: &str = include_str!("../data/get-paths.txt");
@@ -101,7 +103,7 @@ pub fn parse_date(text: &str) -> Result<(i32, u32, u32), String> {
 }
 
 /// Today on this computer's calendar, so default periods turn over at local midnight, not at UTC's.
-fn today() -> (i32, u32, u32) {
+pub(crate) fn today() -> (i32, u32, u32) {
     let now = chrono::Local::now();
     date_at(now.timestamp_millis(), now.offset().local_minus_utc())
 }
@@ -126,7 +128,7 @@ fn compact((y, m, d): (i32, u32, u32)) -> String {
     format!("{y:04}{m:02}{d:02}")
 }
 
-fn dashed((y, m, d): (i32, u32, u32)) -> String {
+pub(crate) fn dashed((y, m, d): (i32, u32, u32)) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
@@ -279,6 +281,40 @@ pub struct BankregelsArgs {
     pub limit: Option<u32>,
     /// Vanaf welke rij (standaard 0).
     pub offset: Option<u32>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct MutatieArgs {
+    /// Mutatienummer.
+    pub nr: u64,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ArchiefUploadenArgs {
+    /// Volledig pad van het bestand op deze computer, bijvoorbeeld /Users/naam/Downloads/bon.pdf. Hoogstens 5 MB.
+    pub pad: String,
+    /// Naam in het archief (standaard de bestandsnaam).
+    pub naam: Option<String>,
+    /// Id van de map in het digitaal archief (standaard de Basismap).
+    pub map_id: Option<u64>,
+    /// Mutatienummer om het bestand meteen aan te koppelen.
+    pub mutatie_nr: Option<u64>,
+    /// Een bestaand bestand met dezelfde naam overschrijven (standaard niet).
+    pub overschrijven: Option<bool>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ArchiefKoppelenArgs {
+    /// Id van het bestand in het digitaal archief (uit digitaal_archief).
+    pub bestand_id: u64,
+    /// Mutatienummer waar het bestand bij hoort.
+    pub mutatie_nr: u64,
     /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
@@ -569,6 +605,257 @@ impl EbMcp {
     }
 }
 
+/// Why a tool that changes the books stopped before or at its change.
+enum Halt {
+    /// The user said no, or the account does not allow it: nothing went to e-Boekhouden.
+    Refused(String),
+    /// Wrong input, or e-Boekhouden refused or failed.
+    Error(String),
+}
+
+impl From<String> for Halt {
+    fn from(message: String) -> Self {
+        Self::Error(message)
+    }
+}
+
+/// Takes a proposal down when its tool call ends without an answer (the AI client gave up, or the wait ran out).
+struct Withdraw<'a> {
+    state: &'a AppState,
+    id: u64,
+}
+
+impl Drop for Withdraw<'_> {
+    fn drop(&mut self) {
+        self.state.approvals.withdraw(self.id);
+        let _ = self.state.events.send(AppEvent::ApprovalsChanged);
+    }
+}
+
+/// What a tool args struct says about writing, for the user who reads `status`.
+fn write_mode_name(mode: WriteMode) -> &'static str {
+    match mode {
+        WriteMode::Off => "uit",
+        WriteMode::Ask => "met akkoord",
+        WriteMode::Auto => "zonder akkoord",
+    }
+}
+
+/// A file from this computer for the digitaal archief: its name and its bytes in base64, as `folder/upload` takes them.
+fn read_upload(path: &str, name: Option<&str>) -> Result<(String, String, u64), String> {
+    use base64::Engine;
+    /// The web app's own limit.
+    const MAX: u64 = 5120 * 1024;
+    let path = std::path::Path::new(path.trim());
+    if !path.is_absolute() {
+        return Err("Geef het volledige pad van het bestand op deze computer".into());
+    }
+    let meta = std::fs::metadata(path)
+        .map_err(|_| format!("Geen bestand gevonden op {}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} is geen bestand", path.display()));
+    }
+    if meta.len() == 0 {
+        return Err("Het bestand is leeg".into());
+    }
+    if meta.len() > MAX {
+        return Err(
+            "Het bestand is groter dan 5 MB; dat neemt het digitaal archief niet aan".into(),
+        );
+    }
+    let file_name = name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+        .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .ok_or("Het bestand heeft geen naam")?;
+    if file_name.chars().count() > 195 || file_name.contains(['/', '\\']) {
+        return Err("De bestandsnaam is te lang of bevat een schuine streep".into());
+    }
+    let bytes = std::fs::read(path).map_err(|_| format!("{} is niet te lezen", path.display()))?;
+    Ok((
+        file_name,
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+        meta.len(),
+    ))
+}
+
+impl EbMcp {
+    /// Starts a tool that changes the books. The account must allow that; reading alone is not enough.
+    fn begin_write(
+        &self,
+        context: &RequestContext<RoleServer>,
+        tool: &str,
+        args: &impl Serialize,
+        account: Option<&str>,
+    ) -> Result<Run, CallToolResult> {
+        let run = self.begin(context, tool, args, account)?;
+        if run.account.write == WriteMode::Off {
+            let message = format!(
+                "{} is alleen-lezen in EB MCP: er is niets gewijzigd. De gebruiker kan schrijven aanzetten in EB MCP onder Accounts, bij het bewerken van het account.",
+                run.account.label
+            );
+            return Err(self.refuse(run, message));
+        }
+        Ok(run)
+    }
+
+    /// The rekeningschema and btw codes of the account's administration.
+    async fn books(&self, run: &Run) -> Result<Books, String> {
+        let all = vec![
+            ("offset".to_owned(), "0".to_owned()),
+            ("limit".to_owned(), "2000".to_owned()),
+            ("orderBy".to_owned(), String::new()),
+            ("sortDirection".to_owned(), String::new()),
+        ];
+        let grootboek = self.fetch(run, "grootboekrekening/gridtable", all).await?;
+        let btw = self.fetch(run, "btwinfo/all", Vec::new()).await?;
+        Books::from_api(&grootboek, &btw)
+    }
+
+    /// Puts the change in front of the user and waits for the answer. An account that needs no approval skips
+    /// this, except for `danger` (deleting, crediting, invoicing in bulk): those always ask.
+    async fn approve(
+        &self,
+        run: &Run,
+        tool: &str,
+        built: &Built,
+        danger: bool,
+    ) -> Result<(), Halt> {
+        if run.account.write == WriteMode::Auto && !danger {
+            return Ok(());
+        }
+        let (proposal, answer) = self.state.approvals.ask(
+            Ask {
+                account_id: run.account.id,
+                account: run.account.label.clone(),
+                client: run.client.clone(),
+                tool: tool.to_owned(),
+                title: built.title.clone(),
+                lines: built.lines.clone(),
+                danger,
+            },
+            crate::state::now_ms(),
+        );
+        let _ = self.state.events.send(AppEvent::ApprovalsChanged);
+        let _withdraw = Withdraw {
+            state: &self.state,
+            id: proposal.id,
+        };
+        match tokio::time::timeout(approvals::WAIT, answer).await {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => Err(Halt::Refused(
+                "De gebruiker heeft dit geweigerd in EB MCP. Er is niets gewijzigd.".into(),
+            )),
+            Ok(Err(_)) => Err(Halt::Refused("Het voorstel is ingetrokken. Er is niets gewijzigd.".into())),
+            Err(_) => Err(Halt::Refused(
+                "De gebruiker heeft niet binnen 5 minuten gereageerd in EB MCP. Er is niets gewijzigd.".into(),
+            )),
+        }
+    }
+
+    /// One change on e-Boekhouden, after the approval. `Null` when it answers without a body.
+    async fn change(
+        &self,
+        run: &Run,
+        method: &'static str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, Halt> {
+        let call = self
+            .state
+            .api_send(
+                run.account.id,
+                method,
+                path,
+                &[],
+                body,
+                Some(run.id),
+                &run.client,
+            )
+            .await;
+        if call.ok() {
+            return Ok(call.json.unwrap_or(Value::Null));
+        }
+        Err(Halt::Error(call.error.unwrap_or_else(|| {
+            format!("e-Boekhouden gaf {} op {path}", call.status)
+        })))
+    }
+
+    /// A change that e-Boekhouden answers with `true` when it did it.
+    async fn change_done(
+        &self,
+        run: &Run,
+        method: &'static str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, Halt> {
+        match self.change(run, method, path, body).await? {
+            Value::Bool(false) => Err(Halt::Error(
+                "e-Boekhouden meldt dat dit niet gelukt is".into(),
+            )),
+            done => Ok(done),
+        }
+    }
+
+    fn end_write(&self, run: Run, done: &str, result: Result<Value, Halt>) -> CallToolResult {
+        let answer = match result {
+            Ok(data) => {
+                let value = json!({ "account": run.account.label, "administratie": run.account.administration, "gedaan": done, "data": data });
+                self.state
+                    .log
+                    .finish_mcp(run.id, Outcome::Ok, Some(&value), None);
+                CallToolResult::success(vec![ContentBlock::text(value.to_string())])
+            }
+            Err(halt) => {
+                let (outcome, message) = match halt {
+                    Halt::Refused(message) => (Outcome::Refused, message),
+                    Halt::Error(message) => (Outcome::Error, message),
+                };
+                self.state
+                    .log
+                    .finish_mcp(run.id, outcome, None, Some(message.clone()));
+                CallToolResult::error(vec![ContentBlock::text(message)])
+            }
+        };
+        let _ = self.state.events.send(AppEvent::LogChanged);
+        answer
+    }
+
+    /// What a new invoice takes from the administration: its next number, its sjabloon and whether it books at once.
+    async fn factuur_context(&self, run: &Run) -> Result<write::FactuurContext, String> {
+        let nummer = self
+            .fetch(run, "factuur/nextfactuurnummer", Vec::new())
+            .await?;
+        let setting = self.fetch(run, "factuursetting", Vec::new()).await?;
+        Ok(write::FactuurContext {
+            volgend_nummer: nummer.as_str().unwrap_or_default().to_owned(),
+            sjabloon_id: setting
+                .get("factuurSjabloonId")
+                .and_then(Value::as_u64)
+                .ok_or("Deze administratie heeft geen factuursjabloon ingesteld")?,
+            verwerken: setting
+                .get("verwerken")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            vandaag: today(),
+        })
+    }
+
+    /// An invoice or subscription with its lines, as the tools that read or change one need it.
+    async fn with_items(&self, run: &Run, path: &str, id: u64) -> Result<(Value, Value), String> {
+        let now = self.fetch(run, &format!("{path}/{id}"), Vec::new()).await?;
+        let items = self
+            .fetch(
+                run,
+                "factuuritem/griditems",
+                vec![("factid".to_owned(), id.to_string())],
+            )
+            .await?;
+        Ok((now, items))
+    }
+}
+
 /// How many tools the server offers, counted on its tool router.
 pub fn tool_count() -> usize {
     EbMcp::tool_router().list_all().len()
@@ -584,11 +871,17 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Welke e-Boekhouden-accounts er in EB MCP staan en welke is ingelogd. Gebruik dit eerst als er meer dan één account kan zijn, of als een andere tool zegt dat er niemand is ingelogd.",
+        description = "Welke e-Boekhouden-accounts er in EB MCP staan, welke is ingelogd en of er per account geboekt mag worden (schrijven: uit, met akkoord of zonder akkoord). Gebruik dit eerst als er meer dan één account kan zijn, of als een andere tool zegt dat er niemand is ingelogd.",
         annotations(title = "Status", read_only_hint = true, open_world_hint = false)
     )]
     async fn status(&self) -> Result<CallToolResult, McpError> {
         let sessions = self.state.sessions();
+        let can_write = self
+            .state
+            .accounts
+            .list()
+            .iter()
+            .any(|a| a.write != WriteMode::Off);
         let accounts: Vec<Value> = self
             .state
             .accounts
@@ -599,6 +892,7 @@ impl EbMcp {
                 json!({
                     "account": a.label,
                     "administratie": a.administration,
+                    "schrijven": write_mode_name(a.write),
                     "ingelogd": session.is_some_and(|s| !s.expired),
                     "verlopen": session.is_some_and(|s| s.expired),
                 })
@@ -607,9 +901,15 @@ impl EbMcp {
         let value = json!({
             "app": "EB MCP",
             "versie": env!("CARGO_PKG_VERSION"),
-            "alleen_lezen": true,
+            "alleen_lezen": !can_write,
             "accounts": accounts,
-            "let_op": if self.state.session_count() == 0 { "Nog niemand ingelogd. Vraag de gebruiker in te loggen via EB MCP in de menubalk." } else { "Alleen lezen: EB MCP kan niets boeken, opslaan of verwijderen." },
+            "let_op": if self.state.session_count() == 0 {
+                "Nog niemand ingelogd. Vraag de gebruiker in te loggen via EB MCP in de menubalk."
+            } else if can_write {
+                "Per account staat bij schrijven of er geboekt mag worden: uit (alleen lezen), met akkoord (de gebruiker keurt elke wijziging goed in EB MCP) of zonder akkoord. Verwijderen, crediteren en abonnementen factureren vragen altijd akkoord."
+            } else {
+                "Alleen lezen: schrijven staat voor elk account uit. De gebruiker kan het per account aanzetten in EB MCP onder Accounts."
+            },
         });
         Ok(CallToolResult::success(vec![ContentBlock::text(
             value.to_string(),
@@ -1011,6 +1311,633 @@ impl EbMcp {
         let result = self.fetch(&run, &path, query).await;
         Ok(self.end(run, &path, result))
     }
+
+    // ------------------------------------------------------------ changes
+    //
+    // From here on the tools can change an account's books. Each one stops unless the account allows writing
+    // (Accounts, per account), shows the user what it will do unless the account needs no approval, and sends
+    // exactly one change. The request shapes are in write.rs.
+
+    #[tool(
+        description = "Eén mutatie met al zijn regels, op mutatienummer.",
+        annotations(title = "Mutatie", read_only_hint = true)
+    )]
+    async fn mutatie(
+        &self,
+        Parameters(args): Parameters<MutatieArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let path = format!("mutatie/nr/{}/model", args.nr);
+        self.simple(
+            &context,
+            "mutatie",
+            &args,
+            args.account.as_deref(),
+            &path,
+            Ok(Vec::new()),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Een mutatie boeken, zoals op de schermen Invoeren > Facturen, Afschrift/bonnetjes en Memoriaal: factuur ontvangen of verstuurd, factuurbetaling ontvangen of verstuurd, geld ontvangen of uitgegeven, of memoriaal. Met bankregel_id wordt een onverwerkte bankregel daarmee verwerkt. Rekeningen gaan op code (zie grootboek), btw op code (GEEN, HOOG_VERK_21, HOOG_INK_21, LAAG_VERK_9, ...); e-Boekhouden rekent de btw zelf uit. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de boeking eerst goed in EB MCP.",
+        annotations(
+            title = "Mutatie toevoegen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn mutatie_toevoegen(
+        &self,
+        Parameters(args): Parameters<write::MutatieToevoegenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "mutatie_toevoegen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let books = self.books(&run).await?;
+            let built = write::mutatie_nieuw(&args, &books)?;
+            self.approve(&run, TOOL, &built, false).await?;
+            self.change(&run, "POST", "mutatie", Some(&built.body))
+                .await
+        }
+        .await;
+        Ok(self.end_write(
+            run,
+            "Mutatie toegevoegd; data.mutNr is het mutatienummer",
+            result,
+        ))
+    }
+
+    #[tool(
+        description = "Een bestaande mutatie wijzigen, op mutatienummer. Wat je niet noemt blijft zoals het is; regels of betalingen die je meegeeft vervangen alle bestaande. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP.",
+        annotations(
+            title = "Mutatie wijzigen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn mutatie_wijzigen(
+        &self,
+        Parameters(args): Parameters<write::MutatieWijzigenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "mutatie_wijzigen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let model = self
+                .fetch(&run, &format!("mutatie/nr/{}/model", args.nr), Vec::new())
+                .await?;
+            let books = self.books(&run).await?;
+            let built = write::mutatie_gewijzigd(&args, &model, &books)?;
+            self.approve(&run, TOOL, &built, false).await?;
+            self.change(&run, "PUT", "mutatie", Some(&built.body)).await
+        }
+        .await;
+        Ok(self.end_write(run, "Mutatie gewijzigd", result))
+    }
+
+    #[tool(
+        description = "Een bestand van deze computer in het digitaal archief zetten, en het naar wens meteen aan een mutatie koppelen (mutatie_nr). Geef het volledige pad; hoogstens 5 MB. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP.",
+        annotations(
+            title = "Bestand uploaden",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn archief_uploaden(
+        &self,
+        Parameters(args): Parameters<ArchiefUploadenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "archief_uploaden";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let (name, data, size) = read_upload(&args.pad, args.naam.as_deref())?;
+            let mut lines = vec![
+                line("Bestand", args.pad.trim()),
+                line("Naam in het archief", &name),
+                line("Grootte", format!("{} kB", size.div_ceil(1024))),
+                line("Map", args.map_id.map_or("Basismap".to_owned(), |id| format!("id {id}"))),
+            ];
+            if args.overschrijven == Some(true) {
+                lines.push(line("Bestaand bestand", "wordt overschreven"));
+            }
+            if let Some(nr) = args.mutatie_nr {
+                // Before anything is uploaded: a mutatie that does not exist would leave a loose file behind.
+                self.fetch(&run, &format!("mutatie/nr/{nr}/model"), Vec::new()).await?;
+                lines.push(line("Koppelen aan", format!("mutatie {nr}")));
+            }
+            let built = Built { body: Value::Null, title: format!("Bestand uploaden: {name}"), lines };
+            self.approve(&run, TOOL, &built, false).await?;
+            let body = json!({"fileName": name, "data": data, "overwrite": args.overschrijven.unwrap_or(false), "folderId": args.map_id.unwrap_or(0)});
+            let uploaded = self.change(&run, "POST", "folder/upload", Some(&body)).await?;
+            if let Some(error) = uploaded.get("errorMessage").and_then(Value::as_str).filter(|e| !e.is_empty()) {
+                return Err(Halt::Error(format!("e-Boekhouden weigert het bestand: {error}")));
+            }
+            let id = uploaded
+                .get("folderId")
+                .and_then(Value::as_u64)
+                .filter(|_| uploaded.get("saved").and_then(Value::as_bool) != Some(false))
+                .ok_or_else(|| Halt::Error("e-Boekhouden heeft het bestand niet opgeslagen".into()))?;
+            let mut done = json!({"bestand_id": id, "naam": name, "gekoppeld_aan_mutatie": Value::Null});
+            if let Some(nr) = args.mutatie_nr {
+                let link = json!({"koppelId": nr, "folders": [{"id": id, "soort": "F"}], "koppelType": "MUT"});
+                match self.change_done(&run, "POST", "folderkoppel/koppel/item", Some(&link)).await {
+                    Ok(_) => done["gekoppeld_aan_mutatie"] = json!(nr),
+                    Err(Halt::Error(message) | Halt::Refused(message)) => {
+                        return Err(Halt::Error(format!(
+                            "Het bestand staat in het archief (id {id}), maar koppelen aan mutatie {nr} lukte niet: {message}"
+                        )));
+                    }
+                }
+            }
+            Ok(done)
+        }
+        .await;
+        Ok(self.end_write(run, "Bestand geüpload", result))
+    }
+
+    #[tool(
+        description = "Een bestand dat al in het digitaal archief staat aan een mutatie koppelen. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP.",
+        annotations(
+            title = "Bestand koppelen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn archief_koppelen(
+        &self,
+        Parameters(args): Parameters<ArchiefKoppelenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "archief_koppelen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let file = self.fetch(&run, &format!("folder/{}", args.bestand_id), Vec::new()).await?;
+            let name = file.get("naam").and_then(Value::as_str).unwrap_or("bestand").to_owned();
+            if file.get("soort").and_then(Value::as_str) != Some("F") {
+                return Err(Halt::Error(format!("{name} is een map, geen bestand")));
+            }
+            self.fetch(&run, &format!("mutatie/nr/{}/model", args.mutatie_nr), Vec::new()).await?;
+            let built = Built {
+                body: json!({"koppelId": args.mutatie_nr, "folders": [{"id": args.bestand_id, "soort": "F"}], "koppelType": "MUT"}),
+                title: format!("Bestand koppelen: {name}"),
+                lines: vec![line("Bestand", &name), line("Koppelen aan", format!("mutatie {}", args.mutatie_nr))],
+            };
+            self.approve(&run, TOOL, &built, false).await?;
+            self.change_done(&run, "POST", "folderkoppel/koppel/item", Some(&built.body)).await
+        }
+        .await;
+        Ok(self.end_write(run, "Bestand gekoppeld aan de mutatie", result))
+    }
+
+    #[tool(
+        description = "De verkoopfacturen uit e-Boekhouden: id, nummer, datum, relatie, bedragen en of de factuur verwerkt is.",
+        annotations(title = "Facturen", read_only_hint = true)
+    )]
+    async fn facturen(
+        &self,
+        Parameters(args): Parameters<ListArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const PATH: &str = "factuur/normaal/gridtable";
+        let run = match self.begin(&context, "facturen", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let query = match grid(args.limit, args.offset) {
+            Ok(query) => query,
+            Err(message) => return Ok(self.refuse(run, message)),
+        };
+        let result = self.fetch(&run, PATH, query).await.map(named_rows);
+        Ok(self.end(run, PATH, result))
+    }
+
+    #[tool(
+        description = "Eén verkoopfactuur met zijn regels, op id (uit facturen).",
+        annotations(title = "Factuur", read_only_hint = true)
+    )]
+    async fn factuur(
+        &self,
+        Parameters(args): Parameters<IdArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let run = match self.begin(&context, "factuur", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = self
+            .with_items(&run, "factuur", args.id)
+            .await
+            .map(|(factuur, regels)| json!({"factuur": factuur, "regels": regels}));
+        Ok(self.end(run, &format!("factuur/{}", args.id), result))
+    }
+
+    #[tool(
+        description = "Een verkoopfactuur maken. Prijzen per stuk, incl of excl btw; btw op code (HOOG_VERK_21, LAAG_VERK_9, GEEN, ...), de omzetrekening op code. Zonder nummer krijgt de factuur het volgende nummer van e-Boekhouden. De factuur wordt niet verstuurd. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de factuur eerst goed in EB MCP.",
+        annotations(
+            title = "Factuur toevoegen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn factuur_toevoegen(
+        &self,
+        Parameters(args): Parameters<write::FactuurToevoegenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "factuur_toevoegen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let books = self.books(&run).await?;
+            let factuur_context = self.factuur_context(&run).await?;
+            let built = write::factuur_nieuw(&args, &factuur_context, &books)?;
+            self.approve(&run, TOOL, &built, false).await?;
+            self.change(&run, "POST", "factuur/model", Some(&built.body))
+                .await
+        }
+        .await;
+        Ok(self.end_write(
+            run,
+            "Factuur toegevoegd; data.id is het id en data.nummer het factuurnummer",
+            result,
+        ))
+    }
+
+    #[tool(
+        description = "Een verkoopfactuur wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. De mutatie van een verwerkte factuur volgt vanzelf. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP.",
+        annotations(
+            title = "Factuur wijzigen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn factuur_wijzigen(
+        &self,
+        Parameters(args): Parameters<write::FactuurWijzigenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "factuur_wijzigen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let (now, items) = self.with_items(&run, "factuur", args.id).await?;
+            let books = self.books(&run).await?;
+            let built = write::factuur_gewijzigd(&args, &now, &items, &books)?;
+            self.approve(&run, TOOL, &built, false).await?;
+            self.change_done(&run, "PUT", "factuur/model", Some(&built.body))
+                .await
+        }
+        .await;
+        Ok(self.end_write(run, "Factuur gewijzigd", result))
+    }
+
+    #[tool(
+        description = "Een verkoopfactuur verwijderen, op id. De mutatie van een verwerkte factuur verdwijnt mee. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        annotations(
+            title = "Factuur verwijderen",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn factuur_verwijderen(
+        &self,
+        Parameters(args): Parameters<IdArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "factuur_verwijderen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let now = self
+                .fetch(&run, &format!("factuur/{}", args.id), Vec::new())
+                .await?;
+            let nummer = now
+                .get("nummer")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let built = Built {
+                body: Value::Null,
+                title: format!("Factuur {nummer} verwijderen"),
+                lines: vec![
+                    line("Factuur", &nummer),
+                    line(
+                        "Relatie",
+                        format!(
+                            "id {}",
+                            now.get("relatieId").and_then(Value::as_u64).unwrap_or(0)
+                        ),
+                    ),
+                    line(
+                        "Totaal incl. btw",
+                        write::euro(now.get("totaal").and_then(Value::as_f64).unwrap_or(0.0)),
+                    ),
+                    line(
+                        "Gevolg",
+                        "de factuur en zijn mutatie verdwijnen; dit is niet terug te draaien",
+                    ),
+                ],
+            };
+            self.approve(&run, TOOL, &built, true).await?;
+            self.change_done(
+                &run,
+                "DELETE",
+                &format!("factuur/normaal/{}", args.id),
+                None,
+            )
+            .await
+        }
+        .await;
+        Ok(self.end_write(run, "Factuur verwijderd", result))
+    }
+
+    #[tool(
+        description = "Een verkoopfactuur crediteren, op id: er komt een nieuwe factuur met dezelfde regels in negatieve aantallen, zoals Factuur crediteren in e-Boekhouden doet. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        annotations(
+            title = "Factuur crediteren",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn factuur_crediteren(
+        &self,
+        Parameters(args): Parameters<write::FactuurCreditArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "factuur_crediteren";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let (now, items) = self.with_items(&run, "factuur", args.id).await?;
+            let books = self.books(&run).await?;
+            let factuur_context = self.factuur_context(&run).await?;
+            let built = write::factuur_credit(&args, &now, &items, &factuur_context, &books)?;
+            self.approve(&run, TOOL, &built, true).await?;
+            self.change(&run, "POST", "factuur/model", Some(&built.body))
+                .await
+        }
+        .await;
+        Ok(self.end_write(
+            run,
+            "Creditfactuur gemaakt; data.id is het id en data.nummer het factuurnummer",
+            result,
+        ))
+    }
+
+    #[tool(
+        description = "De abonnementen: id, naam, relatie, frequentie, startdatum, prolongatiedatum en bedrag.",
+        annotations(title = "Abonnementen", read_only_hint = true)
+    )]
+    async fn abonnementen(
+        &self,
+        Parameters(args): Parameters<ListArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const PATH: &str = "abonnement/gridtable";
+        let run = match self.begin(&context, "abonnementen", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let query = match grid(args.limit, args.offset) {
+            Ok(query) => query,
+            Err(message) => return Ok(self.refuse(run, message)),
+        };
+        let result = self.fetch(&run, PATH, query).await.map(named_rows);
+        Ok(self.end(run, PATH, result))
+    }
+
+    #[tool(
+        description = "Eén abonnement met zijn data en regels, op id (uit abonnementen).",
+        annotations(title = "Abonnement", read_only_hint = true)
+    )]
+    async fn abonnement(
+        &self,
+        Parameters(args): Parameters<IdArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let run = match self.begin(&context, "abonnement", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let (abonnement, regels) = self.with_items(&run, "abonnement", args.id).await?;
+            let data = self
+                .fetch(&run, &format!("factuurextra/{}", args.id), Vec::new())
+                .await?;
+            Ok(json!({"abonnement": abonnement, "data": data, "regels": regels}))
+        }
+        .await;
+        Ok(self.end(run, &format!("abonnement/{}", args.id), result))
+    }
+
+    #[tool(
+        description = "Een abonnement maken: een terugkerende factuur voor een relatie. Prijzen per stuk, incl of excl btw; btw en omzetrekening op code. Er wordt nog geen factuur gemaakt; dat doet abonnementen_factureren. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP.",
+        annotations(
+            title = "Abonnement toevoegen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn abonnement_toevoegen(
+        &self,
+        Parameters(args): Parameters<write::AbonnementToevoegenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "abonnement_toevoegen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let books = self.books(&run).await?;
+            let factuur_context = self.factuur_context(&run).await?;
+            let built =
+                write::abonnement_nieuw(&args, factuur_context.sjabloon_id, today(), &books)?;
+            self.approve(&run, TOOL, &built, false).await?;
+            self.change(&run, "POST", "abonnement/model", Some(&built.body))
+                .await
+        }
+        .await;
+        Ok(self.end_write(run, "Abonnement toegevoegd; data.id is het id", result))
+    }
+
+    #[tool(
+        description = "Een abonnement wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP.",
+        annotations(
+            title = "Abonnement wijzigen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn abonnement_wijzigen(
+        &self,
+        Parameters(args): Parameters<write::AbonnementWijzigenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "abonnement_wijzigen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let (now, items) = self.with_items(&run, "abonnement", args.id).await?;
+            let extra = self
+                .fetch(&run, &format!("factuurextra/{}", args.id), Vec::new())
+                .await?;
+            let books = self.books(&run).await?;
+            let built = write::abonnement_gewijzigd(&args, &now, &extra, &items, &books)?;
+            self.approve(&run, TOOL, &built, false).await?;
+            self.change_done(&run, "PUT", "abonnement/model", Some(&built.body))
+                .await
+        }
+        .await;
+        Ok(self.end_write(run, "Abonnement gewijzigd", result))
+    }
+
+    #[tool(
+        description = "Een abonnement verwijderen, op id. Facturen die er al van gemaakt zijn blijven staan. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        annotations(
+            title = "Abonnement verwijderen",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn abonnement_verwijderen(
+        &self,
+        Parameters(args): Parameters<IdArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "abonnement_verwijderen";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let now = self
+                .fetch(&run, &format!("abonnement/{}", args.id), Vec::new())
+                .await?;
+            let naam = now
+                .get("nummer")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let built = Built {
+                body: Value::Null,
+                title: format!("Abonnement {naam} verwijderen"),
+                lines: vec![
+                    line("Abonnement", &naam),
+                    line(
+                        "Relatie",
+                        format!(
+                            "id {}",
+                            now.get("relatieId").and_then(Value::as_u64).unwrap_or(0)
+                        ),
+                    ),
+                    line(
+                        "Bedrag incl. btw",
+                        write::euro(now.get("totaal").and_then(Value::as_f64).unwrap_or(0.0)),
+                    ),
+                    line(
+                        "Gevolg",
+                        "het abonnement verdwijnt; dit is niet terug te draaien",
+                    ),
+                ],
+            };
+            self.approve(&run, TOOL, &built, true).await?;
+            self.change_done(&run, "DELETE", &format!("abonnement/{}", args.id), None)
+                .await
+        }
+        .await;
+        Ok(self.end_write(run, "Abonnement verwijderd", result))
+    }
+
+    #[tool(
+        description = "Facturen maken voor abonnementen, zoals Facturen maken in e-Boekhouden: voor ALLE abonnementen waarvan de prolongatiedatum in het gekozen venster valt (standaard: al verlopen) komt er een factuur, en hun prolongatiedatum schuift een periode op. Eén abonnement kiezen kan niet. De gebruiker moet dit altijd goedkeuren in EB MCP.",
+        annotations(
+            title = "Abonnementen factureren",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn abonnementen_factureren(
+        &self,
+        Parameters(args): Parameters<write::AbonnementenFacturerenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "abonnementen_factureren";
+        let run = match self.begin_write(&context, TOOL, &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let result = async {
+            let counts = self
+                .fetch(&run, "factuur/expiredabonnementencount", Vec::new())
+                .await?;
+            let venster = args.venster.unwrap_or(write::Venster::Verlopen);
+            let aantal = counts
+                .get(venster.count_key())
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let books = self.books(&run).await?;
+            let built = write::abonnementen_factureren(&args, aantal, today(), &books)?;
+            self.approve(&run, TOOL, &built, true).await?;
+            let call = self
+                .state
+                .api_hub(
+                    run.account.id,
+                    "factuur/abonnementenfactureren",
+                    "create",
+                    &built.body,
+                    Some(run.id),
+                    &run.client,
+                )
+                .await;
+            if !call.ok() {
+                return Err(Halt::Error(
+                    call.error
+                        .unwrap_or_else(|| "e-Boekhouden gaf een fout".into()),
+                ));
+            }
+            Ok(call.json.unwrap_or(Value::Null))
+        }
+        .await;
+        Ok(self.end_write(run, "Facturen gemaakt; data.createdIds zijn de ids van de nieuwe facturen en data.errorMessages wat niet lukte", result))
+    }
 }
 
 /// How clients name and picture the server: "e-Boekhouden MCP" with the app icon, sent inline so it
@@ -1027,7 +1954,9 @@ fn server_info() -> Implementation {
     .expect("a valid MCP icon");
     Implementation::new("e-boekhouden", env!("CARGO_PKG_VERSION"))
         .with_title("e-Boekhouden MCP")
-        .with_description("Leest je boekhouding in e-Boekhouden, alleen lezen.")
+        .with_description(
+            "Leest je boekhouding in e-Boekhouden, en boekt alleen waar jij dat aanzet.",
+        )
         .with_website_url("https://sherin.dev/eb-mcp/")
         .with_icons(vec![icon])
 }
@@ -1038,7 +1967,10 @@ impl ServerHandler for EbMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(server_info())
             .with_instructions(
-                "Leest de boekhouding in e-Boekhouden van de accounts die in EB MCP zijn ingelogd. Alleen lezen: niets boeken, opslaan of verwijderen. \
+                "Leest de boekhouding in e-Boekhouden van de accounts die in EB MCP zijn ingelogd. \
+                 Wijzigen (mutaties, bestanden, facturen, abonnementen) kan alleen voor accounts waar de gebruiker schrijven heeft aangezet; \
+                 status zegt per account of dat uit staat, met akkoord of zonder akkoord. Met akkoord toont EB MCP elke wijziging eerst aan de gebruiker, \
+                 en de tool wacht tot die is goedgekeurd of geweigerd: vertel de gebruiker dat er in EB MCP iets klaarstaat. \
                  Staat er meer dan één account in EB MCP, dan moet elke tool de account-parameter meekrijgen; status zegt welke accounts er zijn.",
             )
     }
@@ -1071,6 +2003,7 @@ mod tests {
             op_title: None,
             op_vault: None,
             administration: None,
+            write: crate::accounts::WriteMode::Off,
         }
     }
 
@@ -1171,7 +2104,7 @@ mod tests {
 
     #[test]
     fn counts_its_tools_on_the_router() {
-        assert_eq!(tool_count(), 13);
+        assert_eq!(tool_count(), 30);
     }
 
     #[test]
@@ -1254,6 +2187,47 @@ mod tests {
         let other = json!({"data": [{"id": 1}], "colMetadata": [{"name": "id", "readerIndex": 0}]});
         assert_eq!(named_rows(other.clone()), other);
         assert_eq!(named_rows(json!({"valid": true})), json!({"valid": true}));
+    }
+
+    #[test]
+    fn takes_an_upload_only_from_a_real_file_with_a_full_path() {
+        let dir = std::env::temp_dir().join(format!("ebmcp-upload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("bon.pdf");
+        std::fs::write(&file, b"%PDF-1.4 proef").unwrap();
+        let path = file.to_str().unwrap();
+        let (name, data, size) = read_upload(path, None).unwrap();
+        assert_eq!((name.as_str(), size), ("bon.pdf", 14));
+        // base64 of the bytes, without a data: prefix: what folder/upload takes.
+        assert_eq!(data, "JVBERi0xLjQgcHJvZWY=");
+        assert_eq!(
+            read_upload(path, Some(" Bon november.pdf ")).unwrap().0,
+            "Bon november.pdf"
+        );
+        assert!(
+            read_upload("bon.pdf", None)
+                .unwrap_err()
+                .contains("volledige pad")
+        );
+        assert!(
+            read_upload(dir.to_str().unwrap(), None)
+                .unwrap_err()
+                .contains("geen bestand")
+        );
+        assert!(
+            read_upload(dir.join("weg.pdf").to_str().unwrap(), None)
+                .unwrap_err()
+                .contains("Geen bestand")
+        );
+        assert!(read_upload(path, Some("map/bon.pdf")).is_err());
+        let empty = dir.join("leeg.pdf");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(
+            read_upload(empty.to_str().unwrap(), None)
+                .unwrap_err()
+                .contains("leeg")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

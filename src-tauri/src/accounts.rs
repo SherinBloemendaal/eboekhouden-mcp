@@ -36,6 +36,22 @@ pub struct Account {
     pub op_vault: Option<String>,
     /// Filled in from e-Boekhouden after a sign-in.
     pub administration: Option<String>,
+    /// Whether AI clients may change this account's books. Off unless the user turns it on.
+    #[serde(default)]
+    pub write: WriteMode,
+}
+
+/// What AI clients may do in an account's books besides reading.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WriteMode {
+    /// Read only: every tool that changes something is refused.
+    #[default]
+    Off,
+    /// Each change waits for the user's approval in EB MCP.
+    Ask,
+    /// Changes go through at once. Deleting and crediting still ask.
+    Auto,
 }
 
 /// What the UI sends to add or change an account.
@@ -50,6 +66,8 @@ pub struct AccountInput {
     pub op_title: Option<String>,
     #[serde(default)]
     pub op_vault: Option<String>,
+    #[serde(default)]
+    pub write: WriteMode,
 }
 
 pub struct AccountStore {
@@ -150,6 +168,7 @@ impl AccountStore {
             op_title: input.op_title,
             op_vault: input.op_vault,
             administration: None,
+            write: input.write,
         };
         accounts.push(account.clone());
         self.save(&accounts)?;
@@ -169,6 +188,7 @@ impl AccountStore {
         account.op_ref = input.op_ref;
         account.op_title = input.op_title;
         account.op_vault = input.op_vault;
+        account.write = input.write;
         let updated = account.clone();
         self.save(&accounts)?;
         Ok(updated)
@@ -267,6 +287,7 @@ mod tests {
             op_ref: None,
             op_title: None,
             op_vault: None,
+            write: WriteMode::Off,
         }
     }
 
@@ -295,6 +316,7 @@ mod tests {
             op_ref: Some("op://Werk".into()),
             op_title: None,
             op_vault: None,
+            write: WriteMode::Off,
         };
         assert!(store.add(bad_ref).is_err());
         let good_ref = AccountInput {
@@ -304,6 +326,7 @@ mod tests {
             op_ref: Some(" op://Werk/e-Boekhouden Studio Noord ".into()),
             op_title: Some(" e-Boekhouden Studio Noord ".into()),
             op_vault: Some("  ".into()),
+            write: WriteMode::Off,
         };
         let added = store.add(good_ref).unwrap();
         assert_eq!(
@@ -320,6 +343,7 @@ mod tests {
             op_ref: Some("op://abcvault123/xyzitem456".into()),
             op_title: Some("e-Boekhouden".into()),
             op_vault: Some("Werk".into()),
+            write: WriteMode::Off,
         };
         assert!(store.add(by_id).is_ok());
         // Accounts written before these fields existed, and with the default mark of 0.1.12 and older, still load.

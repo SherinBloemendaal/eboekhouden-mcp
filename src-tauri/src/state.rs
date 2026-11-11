@@ -52,13 +52,20 @@ pub struct SessionView {
 pub enum AppEvent {
     SessionsChanged,
     LogChanged,
-    SessionExpired { account_id: Uuid, label: String },
+    SessionExpired {
+        account_id: Uuid,
+        label: String,
+    },
+    /// A change waits for the user's approval, or one was answered or withdrawn.
+    ApprovalsChanged,
 }
 
 pub struct AppState {
     pub accounts: AccountStore,
     pub client: EbClient,
     pub log: RequestLog,
+    /// Changes AI clients asked for that wait for the user's word (approvals.rs).
+    pub approvals: crate::approvals::Approvals,
     jar: Arc<dyn CookieJar>,
     sessions: RwLock<HashMap<Uuid, Session>>,
     pub events: broadcast::Sender<AppEvent>,
@@ -80,6 +87,7 @@ impl AppState {
             accounts,
             client,
             log: RequestLog::default(),
+            approvals: crate::approvals::Approvals::default(),
             jar,
             sessions: RwLock::new(HashMap::new()),
             events,
@@ -202,6 +210,64 @@ impl AppState {
         parent: Option<u64>,
         client: &str,
     ) -> ApiCall {
+        self.api_send(account_id, "GET", path, query, None, parent, client)
+            .await
+    }
+
+    /// A job on e-Boekhouden's hub in the session of `account_id`, logged like any other call.
+    pub async fn api_hub(
+        &self,
+        account_id: Uuid,
+        hub: &str,
+        target: &str,
+        argument: &serde_json::Value,
+        parent: Option<u64>,
+        client: &str,
+    ) -> ApiCall {
+        let session = self.sessions.read().unwrap().get(&account_id).cloned();
+        let label = session
+            .as_ref()
+            .map(|s| s.label.clone())
+            .unwrap_or_else(|| self.label_of(account_id));
+        let path = format!("hub/{hub}");
+        let cookies = session
+            .filter(|s| !s.expired)
+            .and_then(|s| self.jar.cookies(&s.key).ok());
+        let (call, had_session) = match cookies {
+            None => (not_signed_in(&path, &[], &label), false),
+            Some(cookies) => {
+                self.note_use(account_id);
+                let call = self.client.hub(&cookies, hub, target, argument).await;
+                if call.status == 401 {
+                    self.mark_expired(account_id);
+                }
+                (call, true)
+            }
+        };
+        self.log.add_eb(
+            &call,
+            parent,
+            client,
+            Some((account_id, label)),
+            had_session,
+        );
+        let _ = self.events.send(AppEvent::LogChanged);
+        call
+    }
+
+    /// One call on e-Boekhouden's API in the session of `account_id`, logged: a GET, or a change (POST, PUT,
+    /// DELETE). The caller has already decided that this account may make the change.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn api_send(
+        &self,
+        account_id: Uuid,
+        method: &'static str,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<&serde_json::Value>,
+        parent: Option<u64>,
+        client: &str,
+    ) -> ApiCall {
         let session = self.sessions.read().unwrap().get(&account_id).cloned();
         let label = session
             .as_ref()
@@ -220,7 +286,7 @@ impl AppState {
                 }
                 Ok(cookies) => {
                     self.note_use(account_id);
-                    let call = self.client.get(&cookies, path, query).await;
+                    let call = self.client.send(&cookies, method, path, query, body).await;
                     // Only these mean "not signed in". A 403 is a part this account may not see.
                     if matches!(call.status, 300..=399 | 401) {
                         self.mark_expired(account_id);
