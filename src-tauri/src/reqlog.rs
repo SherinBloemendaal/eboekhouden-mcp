@@ -20,6 +20,16 @@
 //! e-Boekhouden calls it makes are linked to it like any other; it ends `Ok` or `Error` when the
 //! change ran, or `Refused` when the user refused it or the proposal lapsed. An entry still
 //! waiting when EB MCP stopped comes back `Refused` with `LAPSED`.
+//!
+//! The times of an MCP entry: `duration_ms` is the whole span from the call coming in to its end,
+//! the wait for the user's answer included. It meant that before the wait was recorded too, so older
+//! entries and exports read the same. `wait_started_at` and `wait_ended_at` say when the proposal went
+//! up and when the wait ended (approved, refused or lapsed), and `waited_ms` is that wait: 0 for a call
+//! that never waited. What EB MCP itself worked on the call is `duration_ms - waited_ms`, the work
+//! time Verzoeken shows (`workMs` in src/lib/log.ts).
+//! The e-Boekhouden calls of a waiting call fall before `wait_started_at` (preparing) or after
+//! `wait_ended_at` (making the change). The statistics never count the wait: they hold the times of
+//! e-Boekhouden calls only.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -74,6 +84,7 @@ pub struct McpEntry {
     pub args: Value,
     pub account: Option<String>,
     pub outcome: Outcome,
+    /// From the call coming in to its end, the wait for approval included; 0 until it ends.
     pub duration_ms: u64,
     pub bytes: usize,
     pub error: Option<String>,
@@ -83,6 +94,26 @@ pub struct McpEntry {
     /// The proposal (approvals.rs) of a change this call asked for, once it went up for approval or ran without.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal: Option<u64>,
+    /// When the change went up for the user's approval; `None` when it never waited.
+    #[serde(default)]
+    pub wait_started_at: Option<u64>,
+    /// When the wait ended: approved, refused or lapsed. `None` when it never waited or still waits.
+    #[serde(default)]
+    pub wait_ended_at: Option<u64>,
+    /// The part of `duration_ms` spent waiting for the user; 0 when it never waited or still waits.
+    #[serde(default)]
+    pub waited_ms: u64,
+}
+
+impl McpEntry {
+    /// Ends the wait at `end`, once; a call that never waited is left alone.
+    fn end_wait(&mut self, end: u64) {
+        if let (Some(start), None) = (self.wait_started_at, self.wait_ended_at) {
+            let end = end.max(start);
+            self.wait_ended_at = Some(end);
+            self.waited_ms = end - start;
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -324,10 +355,13 @@ impl RequestLog {
 
     /// Takes over a saved log. An MCP call that still ran when the app stopped becomes an error, one
     /// whose change still waited for approval is refused; both are counted in the statistics as
-    /// `finish_mcp` would have. Returns how many entries were loaded.
+    /// `finish_mcp` would have. A wait still open ends at the file's last save, the nearest known
+    /// moment to the stop, so the wait never takes the time EB MCP was not running for work. Returns
+    /// how many entries were loaded.
     fn restore(&self, snapshot: Snapshot) -> usize {
         let Snapshot {
             next,
+            saved_at,
             entries: saved,
             stats: mut saved_stats,
             ..
@@ -341,11 +375,19 @@ impl RequestLog {
                         Outcome::Running => {
                             e.outcome = Outcome::Error;
                             e.error = Some(RESTARTED.to_owned());
+                            // Approved, then cut off while the change ran: the span reaches at least
+                            // the end of the wait, so the work time never comes out negative.
+                            if let Some(ended) = e.wait_ended_at {
+                                e.duration_ms = saved_at.max(ended).saturating_sub(e.at);
+                            }
                             interrupted.push(e.clone());
                         }
                         Outcome::Waiting => {
                             e.outcome = Outcome::Refused;
                             e.error = Some(LAPSED.to_owned());
+                            let end = saved_at.max(e.wait_started_at.unwrap_or(e.at)).max(e.at);
+                            e.end_wait(end);
+                            e.duration_ms = end - e.at;
                             interrupted.push(e.clone());
                         }
                         Outcome::Ok | Outcome::Error | Outcome::Refused => {}
@@ -436,8 +478,52 @@ impl RequestLog {
             calls: Vec::new(),
             result: None,
             proposal: None,
+            wait_started_at: None,
+            wait_ended_at: None,
+            waited_ms: 0,
         }));
         id
+    }
+
+    /// Gives an entry from before waits were recorded (0.4.0) the wait its proposal's record knows:
+    /// asked at `asked`, answered at `decided`. Only an ended call of the same tool that carries that
+    /// proposal and has no wait yet takes it, and the wait stays inside the call's own span. A call on
+    /// an account that needs no approval never waited: the caller leaves those out. `true` when set.
+    pub fn backfill_wait(
+        &self,
+        proposal: u64,
+        tool: &str,
+        asked: u64,
+        decided: Option<u64>,
+    ) -> bool {
+        let found = {
+            let mut entries = self.entries.lock().unwrap();
+            let entry = entries.iter_mut().find_map(|e| match e {
+                Entry::Mcp(m)
+                    if m.proposal == Some(proposal)
+                        && m.tool == tool
+                        && m.wait_started_at.is_none()
+                        && !matches!(m.outcome, Outcome::Running | Outcome::Waiting) =>
+                {
+                    Some(m)
+                }
+                _ => None,
+            });
+            match entry {
+                Some(m) => {
+                    let end_of_call = m.at + m.duration_ms;
+                    let start = asked.clamp(m.at, end_of_call);
+                    m.wait_started_at = Some(start);
+                    m.end_wait(decided.unwrap_or(end_of_call).clamp(start, end_of_call));
+                    true
+                }
+                None => false,
+            }
+        };
+        if found {
+            self.changed();
+        }
+        found
     }
 
     /// Links an MCP call to the proposal of the change it asked for (approvals.rs).
@@ -445,20 +531,25 @@ impl RequestLog {
         self.set_mcp(id, |e| e.proposal = Some(proposal));
     }
 
-    /// The call's change waits for the user's approval: the call no longer counts as running.
+    /// The call's change waits for the user's approval: the call no longer counts as running, and
+    /// the wait starts now.
     pub fn wait_mcp(&self, id: u64) {
+        let now = now_ms();
         self.set_mcp(id, |e| {
-            if e.outcome == Outcome::Running {
+            if e.outcome == Outcome::Running && e.wait_started_at.is_none() {
                 e.outcome = Outcome::Waiting;
+                e.wait_started_at = Some(now.max(e.at));
             }
         });
     }
 
-    /// The user approved: the call runs again until its change is done.
+    /// The user approved: the wait ends now, and the call runs again until its change is done.
     pub fn resume_mcp(&self, id: u64) {
+        let now = now_ms();
         self.set_mcp(id, |e| {
             if e.outcome == Outcome::Waiting {
                 e.outcome = Outcome::Running;
+                e.end_wait(now);
             }
         });
     }
@@ -493,8 +584,13 @@ impl RequestLog {
             if let Some(Entry::Mcp(e)) = entries.iter_mut().find(|e| e.id() == id)
                 && matches!(e.outcome, Outcome::Running | Outcome::Waiting)
             {
+                let now = now_ms();
+                // Refused or lapsed while it waited: the wait ends with the call.
+                if e.outcome == Outcome::Waiting {
+                    e.end_wait(now);
+                }
                 e.outcome = outcome;
-                e.duration_ms = now_ms().saturating_sub(e.at);
+                e.duration_ms = now.saturating_sub(e.at);
                 e.bytes = result.map(|r| r.to_string().len()).unwrap_or(0);
                 e.result = result.map(|r| shorten(r).0);
                 e.error = error;
@@ -998,6 +1094,239 @@ mod tests {
         assert_eq!(log.stats().mcp, 1);
         let listed = serde_json::to_value(log.list()).unwrap();
         assert_eq!(listed[0]["proposal"], 7);
+    }
+
+    fn mcp(log: &RequestLog, id: u64) -> McpEntry {
+        match log.get(id) {
+            Some(Entry::Mcp(m)) => m,
+            other => panic!("no MCP entry {id}: {other:?}"),
+        }
+    }
+
+    /// What EB MCP itself worked on a call, as Verzoeken shows it.
+    fn work(m: &McpEntry) -> u64 {
+        m.duration_ms - m.waited_ms
+    }
+
+    fn eb_at(log: &RequestLog, id: u64) -> u64 {
+        match log.get(id) {
+            Some(Entry::Eb(e)) => e.at,
+            other => panic!("no e-Boekhouden entry {id}: {other:?}"),
+        }
+    }
+
+    fn pause(ms: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+
+    #[test]
+    fn an_approved_change_records_its_wait_apart_from_the_work() {
+        let log = RequestLog::default();
+        let id = log.start_mcp("Claude", "mutatie_toevoegen", json!({}), Some("SN".into()));
+        let read = log.add_eb(
+            &call("grootboekrekening/gridtable", 200, 0),
+            Some(id),
+            "Claude",
+            None,
+            true,
+        );
+        pause(5);
+        log.link_proposal(id, 7);
+        log.wait_mcp(id);
+        let waiting = mcp(&log, id);
+        let started = waiting.wait_started_at.expect("the wait started");
+        assert!(started >= waiting.at);
+        assert_eq!(
+            (waiting.wait_ended_at, waiting.waited_ms),
+            (None, 0),
+            "still waiting"
+        );
+        let listed = serde_json::to_value(log.list()).unwrap();
+        assert_eq!(listed[1]["waitStartedAt"], started);
+        assert!(listed[1]["waitEndedAt"].is_null());
+        assert_eq!(listed[1]["waitedMs"], 0);
+
+        pause(40);
+        log.resume_mcp(id);
+        let resumed = mcp(&log, id);
+        let ended = resumed
+            .wait_ended_at
+            .expect("the wait ended at the approval");
+        assert_eq!(resumed.waited_ms, ended - started);
+        assert!(resumed.waited_ms >= 40, "{}", resumed.waited_ms);
+        let sent = log.add_eb(&call("mutatie", 200, 0), Some(id), "Claude", None, true);
+        log.finish_mcp(id, Outcome::Ok, Some(&json!({"mutNr": 1})), None);
+
+        let done = mcp(&log, id);
+        assert_eq!(
+            done.wait_ended_at,
+            Some(ended),
+            "the end of the wait stays the approval"
+        );
+        assert_eq!(done.waited_ms, ended - started);
+        assert!(done.duration_ms >= done.waited_ms);
+        assert!(work(&done) < done.duration_ms);
+        // The e-Boekhouden calls fall on either side of the wait.
+        assert!(eb_at(&log, read) <= started);
+        assert!(eb_at(&log, sent) >= ended);
+    }
+
+    #[test]
+    fn a_refused_change_waited_until_its_end() {
+        let log = RequestLog::default();
+        let id = log.start_mcp(
+            "Claude",
+            "factuur_verwijderen",
+            json!({}),
+            Some("SN".into()),
+        );
+        log.wait_mcp(id);
+        pause(30);
+        log.finish_mcp(id, Outcome::Refused, None, Some("geweigerd".into()));
+        let m = mcp(&log, id);
+        assert_eq!(m.outcome, Outcome::Refused);
+        let (started, ended) = (m.wait_started_at.unwrap(), m.wait_ended_at.unwrap());
+        assert_eq!(m.waited_ms, ended - started);
+        assert!(m.waited_ms >= 30);
+        assert_eq!(m.duration_ms, ended - m.at, "nothing ran after the wait");
+        assert_eq!(work(&m), started - m.at);
+    }
+
+    #[test]
+    fn an_entry_from_before_waits_were_recorded_takes_the_wait_of_its_proposal() {
+        let log = RequestLog::default();
+        let id = log.start_mcp("Claude", "mutatie_toevoegen", json!({}), Some("SN".into()));
+        log.link_proposal(id, 7);
+        pause(30);
+        log.finish_mcp(id, Outcome::Ok, None, None);
+        let before = mcp(&log, id);
+        assert_eq!((before.wait_started_at, before.waited_ms), (None, 0));
+
+        // Another tool, another proposal or a call that still runs is left alone.
+        assert!(!log.backfill_wait(7, "relatie_toevoegen", before.at + 5, Some(before.at + 20)));
+        assert!(!log.backfill_wait(8, "mutatie_toevoegen", before.at + 5, Some(before.at + 20)));
+
+        assert!(log.backfill_wait(7, "mutatie_toevoegen", before.at + 5, Some(before.at + 20)));
+        let after = mcp(&log, id);
+        assert_eq!(after.wait_started_at, Some(before.at + 5));
+        assert_eq!(after.wait_ended_at, Some(before.at + 20));
+        assert_eq!(after.waited_ms, 15);
+        assert_eq!(
+            after.duration_ms, before.duration_ms,
+            "the whole span stays"
+        );
+        // Once only, and a wait never reaches outside the call.
+        assert!(!log.backfill_wait(7, "mutatie_toevoegen", 0, None));
+
+        let refused = log.start_mcp(
+            "Claude",
+            "factuur_verwijderen",
+            json!({}),
+            Some("SN".into()),
+        );
+        log.link_proposal(refused, 9);
+        pause(10);
+        log.finish_mcp(refused, Outcome::Refused, None, Some("geweigerd".into()));
+        let r = mcp(&log, refused);
+        assert!(log.backfill_wait(9, "factuur_verwijderen", 0, Some(u64::MAX)));
+        let r2 = mcp(&log, refused);
+        assert_eq!(r2.wait_started_at, Some(r.at));
+        assert_eq!(r2.wait_ended_at, Some(r.at + r.duration_ms));
+        assert_eq!(r2.waited_ms, r.duration_ms);
+    }
+
+    #[test]
+    fn a_call_that_never_waited_has_no_wait() {
+        let log = RequestLog::default();
+        let id = log.start_mcp("Claude", "relaties", json!({}), Some("SN".into()));
+        pause(5);
+        // Resuming what never waited changes nothing.
+        log.resume_mcp(id);
+        log.finish_mcp(id, Outcome::Ok, None, None);
+        let m = mcp(&log, id);
+        assert_eq!(
+            (m.wait_started_at, m.wait_ended_at, m.waited_ms),
+            (None, None, 0)
+        );
+        assert_eq!(work(&m), m.duration_ms);
+        let listed = serde_json::to_value(log.list()).unwrap();
+        assert!(listed[0]["waitStartedAt"].is_null());
+        assert!(listed[0]["waitEndedAt"].is_null());
+        assert_eq!(listed[0]["waitedMs"], 0);
+    }
+
+    #[test]
+    fn a_wait_open_at_the_stop_ends_at_the_last_save() {
+        let log = RequestLog::default();
+        let waiting = log.start_mcp("Claude", "mutatie_toevoegen", json!({}), None);
+        log.wait_mcp(waiting);
+        let approved = log.start_mcp("Claude", "relatie_wijzigen", json!({}), None);
+        log.wait_mcp(approved);
+        log.resume_mcp(approved);
+        let started = mcp(&log, waiting).wait_started_at.unwrap();
+        let approved_end = mcp(&log, approved).wait_ended_at.unwrap();
+        let mut snapshot = log.snapshot();
+        snapshot.saved_at = started + 5_000;
+
+        let again = RequestLog::default();
+        again.restore(snapshot);
+        let lapsed = mcp(&again, waiting);
+        assert_eq!(lapsed.outcome, Outcome::Refused);
+        assert_eq!(lapsed.error.as_deref(), Some(LAPSED));
+        assert_eq!(lapsed.wait_ended_at, Some(started + 5_000));
+        assert_eq!(lapsed.waited_ms, 5_000);
+        assert_eq!(lapsed.duration_ms, started + 5_000 - lapsed.at);
+        assert_eq!(work(&lapsed), started - lapsed.at);
+        // Cut off while the approved change ran: the wait stays as it was, the span covers it.
+        let cut = mcp(&again, approved);
+        assert_eq!(cut.outcome, Outcome::Error);
+        assert_eq!(cut.wait_ended_at, Some(approved_end));
+        assert!(cut.duration_ms >= cut.waited_ms);
+        assert_eq!(cut.duration_ms, started + 5_000 - cut.at);
+    }
+
+    #[test]
+    fn the_statistics_leave_the_wait_out() {
+        let log = RequestLog::default();
+        let id = log.start_mcp("Claude", "mutatie_toevoegen", json!({}), Some("SN".into()));
+        log.add_eb(
+            &call("grootboekrekening/gridtable", 200, 100),
+            Some(id),
+            "Claude",
+            None,
+            true,
+        );
+        log.wait_mcp(id);
+        pause(60);
+        log.resume_mcp(id);
+        log.add_eb(&call("mutatie", 200, 300), Some(id), "Claude", None, true);
+        log.finish_mcp(id, Outcome::Ok, None, None);
+        assert!(mcp(&log, id).waited_ms >= 60);
+        let stats = log.stats();
+        assert_eq!((stats.mcp, stats.eb), (1, 2));
+        assert_eq!(stats.avg_ms, 200, "the e-Boekhouden calls only");
+        assert_eq!(stats.p95_ms, 300);
+    }
+
+    #[test]
+    fn an_entry_saved_before_waits_were_kept_loads_without_one() {
+        let old = json!({
+            "kind": "mcp", "id": 4, "at": 1000, "version": "0.3.2", "client": "Claude", "tool": "mutatie_toevoegen",
+            "args": {}, "account": "SN", "outcome": "ok", "durationMs": 47_600, "bytes": 2,
+            "error": null, "calls": [], "proposal": 2
+        });
+        let Entry::Mcp(m) = serde_json::from_value::<Entry>(old).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            (m.wait_started_at, m.wait_ended_at, m.waited_ms),
+            (None, None, 0)
+        );
+        assert_eq!(
+            work(&m),
+            47_600,
+            "without a recorded wait the whole span counts"
+        );
     }
 
     #[test]

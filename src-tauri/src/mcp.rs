@@ -559,9 +559,17 @@ mod tests {
         let record = settled(&state, id).await;
         assert_eq!(record.status, crate::approvals::Status::Refused);
         assert!(seen.lock().unwrap().is_empty());
+        let refused = mcp_entry(&state, id);
+        assert_eq!(refused.outcome, crate::reqlog::Outcome::Refused);
+        // The wait ran until the refusal; nothing ran after it.
+        let (started, ended) = (
+            refused.wait_started_at.unwrap(),
+            refused.wait_ended_at.unwrap(),
+        );
+        assert_eq!(refused.waited_ms, ended - started);
         assert_eq!(
-            mcp_entry(&state, id).outcome,
-            crate::reqlog::Outcome::Refused
+            refused.duration_ms - refused.waited_ms,
+            started - refused.at
         );
         let (_, status) = ask_status(id).await;
         assert!(status.contains("\"status\":\"geweigerd\""), "{status}");
@@ -596,6 +604,29 @@ mod tests {
             matches!(state.log.get(*call), Some(crate::reqlog::Entry::Eb(e)) if e.method == "POST" && e.path == "mutatie")
         });
         assert!(posted, "the POST is linked to the MCP call");
+        // The reads came before the wait, the POST after the approval.
+        let (started, ended) = (entry.wait_started_at.unwrap(), entry.wait_ended_at.unwrap());
+        assert_eq!(entry.waited_ms, ended - started);
+        for call in &entry.calls {
+            let Some(crate::reqlog::Entry::Eb(e)) = state.log.get(*call) else {
+                panic!("call {call} is not in the log")
+            };
+            if e.method == "POST" {
+                assert!(
+                    e.at >= ended,
+                    "{} at {} before the approval {ended}",
+                    e.path,
+                    e.at
+                );
+            } else {
+                assert!(
+                    e.at <= started,
+                    "{} at {} after the wait began {started}",
+                    e.path,
+                    e.at
+                );
+            }
+        }
         let detail = state.approvals.get(id).unwrap();
         assert_eq!(detail.body, request);
         assert_eq!(detail.args["omschrijving"], "Parkeergarage");
@@ -610,6 +641,12 @@ mod tests {
         let auto = &state.approvals.history(Some(1))[0];
         assert_eq!(auto.decision, Some(crate::approvals::Decision::Auto));
         assert_eq!(auto.status, crate::approvals::Status::Done);
+        let ran = mcp_entry(&state, auto.proposal.id);
+        assert_eq!(
+            (ran.wait_started_at, ran.waited_ms),
+            (None, 0),
+            "it never waited"
+        );
 
         // Approved after the account signed out: it fails as "Niet ingelogd", and nothing went out.
         set_write(WriteMode::Ask);

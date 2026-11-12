@@ -7,7 +7,8 @@
 //! change or EB MCP stops (lapsed). There is no time limit.
 //!
 //! Every proposal stays in the history once it is answered, with what was asked, the request body, the tool
-//! and its arguments, the client, the account, the times, the decision, the app version and the outcome. A
+//! and its arguments, the client, the account, the times, the decision (and whether the user gave it to all
+//! waiting proposals at once), the app version and the outcome. A
 //! change an "auto" account made without asking is recorded too (decision `auto`), so the history is the
 //! full record of what AI clients changed. The history is kept in a gzip file in the app's config folder
 //! (`history_file`, written through logstore.rs as the request log is), at most `CAPACITY` records. Values
@@ -167,6 +168,9 @@ pub struct Record {
     pub error: Option<String>,
     /// The app version that asked.
     pub version: String,
+    /// The user answered it with Alles goedkeuren or Alles weigeren (`decide_all`), not on its own.
+    #[serde(default)]
+    pub bulk: bool,
 }
 
 /// A proposal with its technical data, as the history keeps it and `approval_get` shows it.
@@ -356,6 +360,7 @@ impl Approvals {
                 },
                 error: None,
                 version: APP_VERSION.to_owned(),
+                bulk: false,
             },
             args: kept(&technical.args),
             body: kept(&technical.body),
@@ -399,8 +404,9 @@ impl Approvals {
     }
 
     /// Ends the wait of one proposal with `answer`. `false` when it was not waiting (any more), or when the
-    /// change that waited on it is gone; the record then says the proposal lapsed.
-    fn close(&self, inner: &mut Inner, id: u64, answer: Answer, now: u64) -> bool {
+    /// change that waited on it is gone; the record then says the proposal lapsed. `bulk`: the user gave the
+    /// answer to all waiting proposals at once; the record keeps that when the answer arrived.
+    fn close(&self, inner: &mut Inner, id: u64, answer: Answer, now: u64, bulk: bool) -> bool {
         let Some(sender) = inner.pending.remove(&id) else {
             return false;
         };
@@ -408,6 +414,7 @@ impl Approvals {
         if let Some(detail) = inner.record_mut(id) {
             let record = &mut detail.record;
             record.decided_at = Some(now);
+            record.bulk = bulk && delivered;
             match (&answer, delivered) {
                 (Answer::Approved, true) => {
                     record.decision = Some(Decision::Approved);
@@ -442,7 +449,7 @@ impl Approvals {
             Answer::Refused(REFUSED_BY_USER.to_owned())
         };
         let mut inner = self.lock();
-        self.close(&mut inner, id, answer, now)
+        self.close(&mut inner, id, answer, now, false)
     }
 
     /// The same answer for exactly the proposals in `ids`, the ones the user saw. A proposal that came up
@@ -459,7 +466,7 @@ impl Approvals {
             } else {
                 Answer::Refused(REFUSED_BY_USER.to_owned())
             };
-            if self.close(&mut inner, id, answer, now) {
+            if self.close(&mut inner, id, answer, now, true) {
                 done.decided.push(id);
             } else {
                 done.gone.push(id);
@@ -471,7 +478,7 @@ impl Approvals {
     /// Ends one waiting proposal without the user's answer: refused (`Answer::Refused`) or lapsed.
     pub fn end(&self, id: u64, answer: Answer, now: u64) -> bool {
         let mut inner = self.lock();
-        self.close(&mut inner, id, answer, now)
+        self.close(&mut inner, id, answer, now, false)
     }
 
     /// Ends every waiting proposal of an account with `answer`: refused when the account is removed or set to
@@ -488,7 +495,7 @@ impl Approvals {
             .map(|d| d.record.proposal.id)
             .collect();
         for &id in &ids {
-            self.close(&mut inner, id, answer.clone(), now);
+            self.close(&mut inner, id, answer.clone(), now, false);
         }
         ids.len()
     }
@@ -823,6 +830,65 @@ mod tests {
             serde_json::to_value(&done).unwrap(),
             json!({"decided": [a.id], "gone": [b.id, 999]})
         );
+        // Each record says how it was answered: A and C with the bulk action, B on its own.
+        assert!(approvals.get(a.id).unwrap().record.bulk);
+        assert!(!approvals.get(b.id).unwrap().record.bulk);
+        let c_record = approvals.get(c.id).unwrap().record;
+        assert!(c_record.bulk);
+        assert_eq!(c_record.decision, Some(Decision::Refused));
+        assert_eq!(
+            serde_json::to_value(&approvals.history(None)[0]).unwrap()["bulk"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bulk_answer_nobody_waits_for_lapses_without_the_bulk_mark() {
+        let approvals = Approvals::default();
+        let (proposal, receiver) = approvals.ask(ask(Uuid::new_v4(), "Weg"), technical(), 1);
+        drop(receiver);
+        assert_eq!(
+            approvals.decide_all(&[proposal.id], true, 2).gone,
+            vec![proposal.id]
+        );
+        let record = approvals.get(proposal.id).unwrap().record;
+        assert_eq!(record.decision, Some(Decision::Lapsed));
+        assert!(!record.bulk);
+    }
+
+    #[test]
+    fn a_record_saved_before_bulk_was_kept_loads_as_answered_on_its_own() {
+        let mut saved = serde_json::to_value(Detail {
+            record: Record {
+                proposal: Proposal {
+                    id: 1,
+                    account_id: Uuid::nil(),
+                    account: "Studio Noord".into(),
+                    client: "Claude".into(),
+                    tool: "mutatie_toevoegen".into(),
+                    title: "Oud".into(),
+                    lines: vec![],
+                    danger: false,
+                    asked_at: 1,
+                },
+                decided_at: Some(2),
+                decision: Some(Decision::Approved),
+                status: Status::Done,
+                error: None,
+                version: "0.4.0".into(),
+                bulk: true,
+            },
+            args: Value::Null,
+            body: Value::Null,
+            result: None,
+            log_id: Some(4),
+            finished_at: Some(3),
+        })
+        .unwrap();
+        saved.as_object_mut().unwrap().remove("bulk");
+        let detail: Detail = serde_json::from_value(saved).unwrap();
+        assert!(!detail.record.bulk);
+        assert_eq!(detail.record.proposal.title, "Oud");
     }
 
     #[tokio::test]
@@ -918,6 +984,7 @@ mod tests {
         assert_eq!(shown["status"], "done");
         assert_eq!(shown["version"], APP_VERSION);
         assert_eq!(shown["decidedAt"], 1);
+        assert_eq!(shown["bulk"], false);
         for technical in ["args", "body", "result", "logId"] {
             assert!(shown.get(technical).is_none(), "{technical} is not listed");
         }

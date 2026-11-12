@@ -1,14 +1,17 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import Alert from '../components/Alert.vue'
 import EmptyState from '../components/EmptyState.vue'
 import ExportNotice from '../components/ExportNotice.vue'
 import Icon from '../components/Icon.vue'
 import JsonView from '../components/JsonView.vue'
 import {
-  clearLog, connectLog, duration, entryDetail, exportLog, isError, log, setPaused, size, statusLabel, time, timeline,
-  type EbEntry, type Entry,
+  clearLog, connectLog, duration, entryDetail, exportLog, isError, log, PHASE_LABELS, phases, proportions, segments, setPaused, size,
+  statusLabel, time, timeline, waited, waitingFor, waitNote, waitSteps, workMs, workOffset,
+  type EbEntry, type Entry, type Phase, type Segment, type WaitAnswer,
 } from '../lib/log'
+import { approvalDetail } from '../lib/approvals'
 import { useExport } from '../lib/exporting'
 
 type Tab = 'all' | 'mcp' | 'eb'
@@ -27,7 +30,20 @@ const clearing = ref(false)
 // Exporteer: the file it wrote or why it could not, shown by ExportNotice (shared with Akkoord).
 const exported = useExport(exportLog)
 
-onMounted(() => connectLog())
+const router = useRouter()
+// The clock of the waits that still count: "wacht al 4 min" in the list and the detail's figures. It only moves the page
+// while a listed call waits for approval or runs after one.
+const now = ref(Date.now())
+const live = computed(() => log.entries.some((e) => e.kind === 'mcp' && e.waitStartedAt !== null && (e.outcome === 'waiting' || e.outcome === 'running')))
+let clock: ReturnType<typeof setInterval> | undefined
+
+onMounted(() => {
+  void connectLog()
+  clock = setInterval(() => {
+    if (live.value) now.value = Date.now()
+  }, 1000)
+})
+onBeforeUnmount(() => clearInterval(clock))
 
 const counts = computed(() => ({
   all: log.entries.length,
@@ -56,7 +72,27 @@ const rows = computed(() => {
   return timeline(log.entries).filter((r) => matches(r.entry) || r.children.some(matches))
 })
 
-const maxMs = computed(() => Math.max(1000, ...log.entries.map((e) => e.durationMs)))
+// The bars share one scale: the longest work time listed, so a long wait for approval does not shrink every other row.
+const maxMs = computed(() => Math.max(1000, ...log.entries.map((e) => workMs(e, now.value))))
+/** Some listed call waited for approval: the legend of the bar's colours shows, and Duur takes room for its wait. */
+const hasWait = computed(() => rows.value.some(({ entry }) => entry.kind === 'mcp' && entry.waitStartedAt !== null))
+
+interface Dur { work: number; note: string; parts: Segment[]; title: string }
+/** The Duur cell of a row: the work time, the wait beside it, and the bar's parts. */
+function dur(entry: Entry): Dur {
+  const work = workMs(entry, now.value)
+  const p = entry.kind === 'mcp' ? phases(entry, now.value) : null
+  const title = p
+    ? `${duration(work)} aan het werk, ${p.waiting ? `wacht al ${waitingFor(p.waitMs)}` : `${waited(p.waitMs)} gewacht`} op akkoord`
+    : duration(work)
+  return { work, note: waitNote(entry, now.value), parts: segments(entry, maxMs.value, now.value), title }
+}
+const durs = computed(() => {
+  const map = new Map<number, Dur>()
+  for (const { entry } of rows.value) map.set(entry.id, dur(entry))
+  return map
+})
+const PHASES: Phase[] = ['prep', 'wait', 'exec']
 
 function toggle(id: number) {
   toggled.value = id
@@ -74,22 +110,63 @@ async function select(entry: Entry) {
 watch(
   () => log.entries,
   async () => {
+    now.value = Date.now()
     if (selectedId.value !== null) detail.value = await entryDetail(selectedId.value)
   },
 )
+
+// ---- The wait of the opened call ----
+
+const detailPhases = computed(() => (detail.value?.kind === 'mcp' ? phases(detail.value, now.value) : null))
+/** How the proposal of the opened call was answered, from its record on Akkoord (approval_get), once it was answered. */
+const answer = ref<WaitAnswer | null>(null)
+let answerFor: number | null = null
+let answerSeq = 0
+watch(
+  () => {
+    const d = detail.value
+    return d?.kind === 'mcp' && d.waitStartedAt !== null && d.proposal !== undefined ? { id: d.id, proposal: d.proposal, ended: d.waitEndedAt } : null
+  },
+  async (key, before) => {
+    if (key?.id !== answerFor) answer.value = null
+    answerFor = key?.id ?? null
+    // Read once per opened call when its wait has ended, and again only when that end changes.
+    if (!key || key.ended === null || (before && before.id === key.id && before.ended === key.ended)) return
+    const seq = ++answerSeq
+    try {
+      const record = await approvalDetail(key.proposal)
+      if (seq !== answerSeq || answerFor !== key.id) return
+      const decision = record.decision === 'approved' || record.decision === 'refused' || record.decision === 'lapsed' ? record.decision : null
+      answer.value = decision ? { decision, bulk: !!record.bulk } : null
+    } catch {
+      // The record left the history (it keeps the last 2000): the log's own outcome names the answer.
+      if (seq === answerSeq) answer.value = null
+    }
+  },
+  { immediate: true },
+)
+const steps = computed(() => (detail.value?.kind === 'mcp' ? waitSteps(detail.value, detailCalls.value, answer.value, now.value) : []))
+/** A length that can run to minutes: "640 ms", "4,20 s", "4 min 12 s". */
+function long(ms: number): string {
+  return ms < 60_000 ? duration(ms) : waited(ms)
+}
+
+function openProposal(id: number) {
+  void router.push({ path: '/akkoord', query: { open: String(id) } })
+}
 
 const detailCalls = computed<EbEntry[]>(() => {
   const d = detail.value
   if (!d || d.kind !== 'mcp') return []
   return log.entries.filter((e): e is EbEntry => e.kind === 'eb' && e.parent === d.id).sort((a, b) => a.at - b.at)
 })
+// The waterfall of the opened call on its work time: a wait for approval is taken out, so the calls keep their size.
 const span = computed(() => {
   const calls = detailCalls.value
   const d = detail.value
-  if (!d || !calls.length) return { start: 0, total: 1 }
-  const start = d.at
-  const end = Math.max(d.at + d.durationMs, ...calls.map((c) => c.at + c.durationMs))
-  return { start, total: Math.max(1, end - start) }
+  if (!d || d.kind !== 'mcp' || !calls.length) return { total: 1 }
+  const end = Math.max(workMs(d, now.value), ...calls.map((c) => workOffset(d, c.at) + c.durationMs))
+  return { total: Math.max(1, end) }
 })
 const parentOf = computed(() => {
   const d = detail.value
@@ -159,6 +236,16 @@ function initials(text: string | null): string {
       </button>
     </div>
 
+    <Transition name="accordion">
+      <div v-if="hasWait" class="accordion">
+        <div>
+          <ul class="legend" aria-label="Kleuren van de duur">
+            <li v-for="phase in PHASES" :key="phase"><span class="swatch seg" :class="phase" />{{ PHASE_LABELS[phase] }}</li>
+          </ul>
+        </div>
+      </div>
+    </Transition>
+
     <EmptyState v-if="log.loaded && !log.entries.length" icon="inbox" title="Nog geen verzoeken">
       Elke MCP-aanroep en de aanroepen naar e-Boekhouden die hij veroorzaakt, verschijnen hier. EB MCP bewaart de laatste 1000, ook na een herstart of update, tot je ze leegmaakt.
     </EmptyState>
@@ -168,7 +255,7 @@ function initials(text: string | null): string {
     </EmptyState>
 
     <div v-else class="split">
-      <div class="list" role="table" aria-label="Verzoeken">
+      <div class="list" :class="{ waits: hasWait }" role="table" aria-label="Verzoeken">
         <div class="row head" role="row">
           <span class="c-time" role="columnheader">Tijd</span><span class="c-src" role="columnheader">Bron</span><span class="main" role="columnheader">Tool of pad</span><span class="c-status" role="columnheader">Status</span>
           <span class="c-dur right" role="columnheader">Duur</span><span class="c-size right" role="columnheader">Grootte</span><span class="c-who" role="columnheader">Wie</span>
@@ -191,7 +278,11 @@ function initials(text: string | null): string {
                 <span v-else class="mono path" :title="entry.path">{{ entry.path }}</span>
               </span>
               <span class="c-status status" role="cell" :class="{ bad: isError(entry), warn: entry.kind === 'mcp' && entry.outcome === 'refused' }" :title="statusLabel(entry)"><span class="dot" :class="isError(entry) ? 'bad' : 'on-static'" /><span class="clip">{{ statusLabel(entry) }}</span></span>
-              <span class="c-dur right dur" role="cell"><span class="clip">{{ duration(entry.durationMs) }}</span><span class="bar"><span :style="{ width: `${Math.max(4, (entry.durationMs / maxMs) * 100)}%` }" :class="{ slow: entry.durationMs >= 1000 }" /></span></span>
+              <span class="c-dur right dur" role="cell" :title="durs.get(entry.id)!.title">
+                <span class="clip">{{ duration(durs.get(entry.id)!.work) }}</span><span v-if="durs.get(entry.id)!.note" class="waited">{{ durs.get(entry.id)!.note }}</span>
+                <span v-if="durs.get(entry.id)!.parts.length" class="bar phased"><span v-for="part in durs.get(entry.id)!.parts" :key="part.phase" class="seg" :class="part.phase" :style="{ width: `${part.width}%` }" /></span>
+                <span v-else class="bar"><span :style="{ width: `${Math.max(4, (durs.get(entry.id)!.work / maxMs) * 100)}%` }" :class="{ slow: durs.get(entry.id)!.work >= 1000 }" /></span>
+              </span>
               <span class="c-size right muted clip" role="cell">{{ size(entry.bytes) }}</span>
               <span class="c-who who" role="cell" :title="`${entry.client}${entry.account ? ` · ${entry.account}` : ''}`"><span class="tag">{{ initials(entry.client) }}</span><span v-if="entry.account" class="tag acc">{{ initials(entry.account) }}</span></span>
             </div>
@@ -222,7 +313,7 @@ function initials(text: string | null): string {
             </div>
             <div class="facts">
               <span class="chip" :class="isError(detail) ? 'bad' : 'ok'">{{ statusLabel(detail) }}</span>
-              <span class="chip">{{ duration(detail.durationMs) }}</span>
+              <span class="chip" :title="detail.kind === 'mcp' && detailPhases ? 'Aan het werk, zonder het wachten op akkoord' : undefined">{{ duration(workMs(detail, now)) }}</span>
               <span class="chip">{{ size(detail.bytes) }}</span>
               <span class="chip">{{ detail.client }}</span>
               <span v-if="detail.account" class="chip info">{{ detail.account }}</span>
@@ -236,12 +327,46 @@ function initials(text: string | null): string {
           <div class="detail-body">
             <p v-if="detail.error" class="note bad" role="alert">{{ detail.error }}</p>
             <template v-if="detail.kind === 'mcp'">
+              <section v-if="detailPhases" class="wait-view" aria-label="Verloop">
+                <dl class="figures">
+                  <div class="figure"><dt>Aan het werk</dt><dd>{{ duration(detailPhases.workMs) }}</dd></div>
+                  <div class="figure"><dt>Gewacht</dt><dd>{{ detailPhases.waiting ? waitingFor(detailPhases.waitMs) : waited(detailPhases.waitMs) }}</dd></div>
+                  <div class="figure"><dt>Totaal</dt><dd>{{ long(detailPhases.totalMs) }}</dd></div>
+                </dl>
+                <div class="phase-bar" role="img" :aria-label="`Voorbereiden ${duration(detailPhases.prepMs)}, wachten ${waited(detailPhases.waitMs)}, uitvoeren ${duration(detailPhases.execMs)}`">
+                  <span v-for="part in proportions(detailPhases)" :key="part.phase" class="seg" :class="part.phase" :style="{ width: `${part.width}%` }" />
+                </div>
+                <TransitionGroup name="accordion" tag="ol" class="steps">
+                  <li v-for="step in steps" :key="step.key" class="accordion" :data-step="step.key">
+                    <div>
+                      <div class="step">
+                        <span class="step-dot" :class="step.tone" aria-hidden="true" />
+                        <div class="step-body">
+                          <div class="step-head">
+                            <span class="step-title">{{ step.title }}</span>
+                            <span v-if="step.chip" class="chip step-chip">{{ step.chip }}</span>
+                            <span class="step-value">{{ step.value }}</span>
+                          </div>
+                          <p v-if="step.note" class="step-note selectable">{{ step.note }}</p>
+                          <div v-if="step.calls?.length" class="step-calls">
+                            <button v-for="call in step.calls" :key="call.id" type="button" class="step-call" :title="call.path" @click="select(call)">
+                              <span class="mono method">{{ call.method }}</span><span class="mono path">{{ call.path }}</span>
+                              <span class="call-status" :class="{ bad: isError(call) }">{{ statusLabel(call) }}</span><span class="right">{{ duration(call.durationMs) }}</span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </li>
+                </TransitionGroup>
+                <button v-if="detail.proposal !== undefined" type="button" class="btn small open-proposal" @click="openProposal(detail.proposal)">Bekijk voorstel op Akkoord</button>
+              </section>
               <section><h3 class="section-label">Argumenten</h3><JsonView :value="detail.args" /></section>
               <section v-if="detailCalls.length">
-                <h3 class="section-label">Naar e-Boekhouden · {{ calls(detailCalls.length) }}, {{ duration(detail.durationMs) }}</h3>
+                <h3 class="section-label">Naar e-Boekhouden · {{ calls(detailCalls.length) }}, {{ duration(workMs(detail, now)) }}</h3>
                 <button v-for="call in detailCalls" :key="call.id" type="button" class="wf" @click="select(call)">
                   <span class="mono path">{{ call.path }}</span>
-                  <span class="wf-track"><span class="wf-bar" :class="{ bad: isError(call) }" :style="{ left: `${((call.at - span.start) / span.total) * 100}%`, width: `${Math.max(2, (call.durationMs / span.total) * 100)}%` }" /></span>
+                  <span class="wf-track"><span class="wf-bar" :class="{ bad: isError(call) }" :style="{ left: `${(workOffset(detail, call.at) / span.total) * 100}%`, width: `${Math.max(2, (call.durationMs / span.total) * 100)}%` }" /></span>
                   <span class="right small">{{ duration(call.durationMs) }}</span>
                 </button>
               </section>
@@ -356,6 +481,19 @@ function initials(text: string | null): string {
 .bar { width: 32px; height: 4px; border-radius: 2px; background: var(--line-soft); overflow: hidden; flex: none; }
 .bar span { display: block; height: 4px; background: #0a84ff; }
 .bar span.slow { background: #ff9f0a; }
+/*
+ * A call that waited for approval: its bar in the phases' colours, the wait striped. Beside the work time a muted
+ * "+ 47,3 s gewacht" that gives way first: it shrinks to an ellipsis before the number does, and only a wide list shows it.
+ */
+.bar.phased { display: flex; }
+.bar .seg { flex: none; height: 4px; transition: width 300ms var(--ease); }
+.seg.prep { background: var(--phase-prep); }
+.seg.wait { background: repeating-linear-gradient(135deg, var(--phase-wait) 0 3px, var(--phase-wait-stripe) 3px 5px); }
+.seg.exec { background: var(--phase-exec); }
+.waited { display: none; flex: 0 1000 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 11px; color: var(--muted); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 0; padding: 0 16px 8px; list-style: none; font-size: 11px; color: var(--muted); }
+.legend li { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.swatch { display: inline-block; width: 14px; height: 6px; border-radius: 2px; }
 .who { display: flex; gap: 3px; overflow: hidden; }
 .tag { flex: none; height: 18px; min-width: 20px; padding: 0 3px; box-sizing: border-box; border-radius: 5px; background: var(--subtle); color: var(--label); font-size: 9px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
 .tag.acc { border-radius: 50%; background: var(--info-soft); color: var(--info); }
@@ -387,6 +525,41 @@ h3 { display: flex; align-items: center; margin: 0; }
 .wf-track { position: relative; height: 8px; border-radius: 3px; background: var(--sunken); }
 .wf-bar { position: absolute; top: 0; bottom: 0; border-radius: 3px; background: #0a84ff; }
 .wf-bar.bad { background: #d93025; }
+.wait-view { gap: 10px; }
+.figures { margin: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.figure { min-width: 0; padding: 7px 9px; border-radius: 10px; background: var(--sunken); }
+.figure dt { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.figure dd { margin: 2px 0 0; font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.phase-bar { display: flex; gap: 1px; height: 10px; border-radius: 5px; overflow: hidden; background: var(--sunken); }
+.phase-bar .seg { flex: none; height: 100%; transition: width 300ms var(--ease); }
+.phase-bar .seg.wait { background: repeating-linear-gradient(135deg, var(--phase-wait) 0 4px, var(--phase-wait-stripe) 4px 7px); }
+.steps { margin: 0; padding: 0; list-style: none; }
+.step { position: relative; display: grid; grid-template-columns: 14px minmax(0, 1fr); column-gap: 8px; padding-bottom: 10px; }
+.step::before { content: ''; position: absolute; left: 6px; top: 14px; bottom: 0; width: 1px; background: var(--line); }
+.steps li:last-child .step { padding-bottom: 0; }
+.steps li:last-child .step::before { display: none; }
+.step-dot { width: 9px; height: 9px; margin: 4px 0 0 2px; border-radius: 50%; background: var(--off); }
+.step-dot.prep { background: var(--phase-prep); }
+.step-dot.wait { background: var(--phase-wait); }
+.step-dot.exec { background: var(--phase-exec); }
+.step-dot.ok { background: var(--success-solid); }
+.step-dot.bad { background: var(--danger); }
+.step-body { min-width: 0; }
+.step-head { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 12px; line-height: 17px; }
+.step-title { min-width: 0; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.step-head .step-chip { margin-left: 0; flex: none; }
+.step-value { flex: none; margin-left: auto; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.step-note { margin: 2px 0 0; font-size: 11px; line-height: 15px; color: var(--muted); overflow-wrap: anywhere; }
+.step-calls { margin-top: 4px; display: flex; flex-direction: column; }
+.step-call {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto 52px; column-gap: 6px; align-items: center; height: 22px; padding: 0 6px;
+  border: 0; border-radius: 6px; background: transparent; text-align: left; font-size: 11px; transition: background-color 150ms ease;
+}
+.step-call:hover { background: var(--hover); }
+.step-call .method { color: var(--info); }
+.call-status { color: var(--success); white-space: nowrap; }
+.call-status.bad { color: var(--danger); }
+.open-proposal { align-self: flex-start; }
 .note { padding: 9px 11px; border-radius: 10px; font-size: 12px; line-height: 16px; }
 .note.bad { background: var(--danger-soft); color: var(--danger); }
 .icon-btn { width: 24px; height: 24px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); transition: background-color 150ms ease, color 150ms ease, transform 120ms var(--ease); }
@@ -394,6 +567,11 @@ h3 { display: flex; align-items: center; margin: 0; }
 .icon-btn:active { transform: scale(0.92); }
 @media (max-width: 1240px) { .detail { width: 340px; } }
 @media (max-width: 1080px) { .detail { width: 300px; } }
+/* A wide list with a wait listed gives Duur room for the wait beside the work time; narrower, Duur is as it always was. */
+@container requests (min-width: 900px) {
+  .list.waits .row { grid-template-columns: minmax(0, 92px) minmax(0, 56px) minmax(0, 1fr) minmax(0, 84px) minmax(0, 176px) minmax(0, 62px) minmax(0, 52px); }
+  .waited { display: block; }
+}
 /* The list gives up columns from least to most needed: Grootte, then Wie and the duration bar, then Tijd. */
 @container requests (max-width: 759px) {
   .row { grid-template-columns: minmax(0, 84px) minmax(0, 56px) minmax(0, 1fr) minmax(0, 80px) minmax(0, 92px) minmax(0, 52px); }
@@ -401,7 +579,7 @@ h3 { display: flex; align-items: center; margin: 0; }
 }
 @container requests (max-width: 559px) {
   .row { grid-template-columns: minmax(0, 84px) minmax(0, 56px) minmax(0, 1fr) minmax(0, 80px) minmax(0, 60px); }
-  .c-who, .bar { display: none; }
+  .c-who, .bar, .bar.phased { display: none; }
 }
 @container requests (max-width: 459px) {
   .row { grid-template-columns: minmax(0, 56px) minmax(0, 1fr) minmax(0, 80px) minmax(0, 60px); }
@@ -410,7 +588,7 @@ h3 { display: flex; align-items: center; margin: 0; }
 @media (prefers-reduced-motion: reduce) {
   .detail { animation: fade-in 150ms ease both; }
   .detail.detail-leave-active { animation: fade-out 140ms cubic-bezier(0.4, 0, 1, 1) both; }
-  .chev span { transition: none; }
+  .chev span, .bar .seg, .phase-bar .seg { transition: none; }
   .chev:active, .icon-btn:active, .kids-enter-from { transform: none; }
 }
 </style>

@@ -33,6 +33,8 @@ export interface ApprovalRecord extends Proposal {
   error: string | null
   /** The EB MCP version that took the proposal in. */
   version: string
+  /** Answered with Alles goedkeuren or Alles weigeren rather than on its own. */
+  bulk: boolean
 }
 
 /** A record with what EB MCP got from the client, sent to e-Boekhouden and got back. */
@@ -154,11 +156,11 @@ export function statusOf(status: ApprovalStatus): { label: string; tone: StatusT
   return STATUSES.find((s) => s.value === status) ?? { label: status, tone: 'off' }
 }
 
-/** How the detail names the answer. */
-export function decisionLabel(decision: ApprovalDecision | null): string {
+/** How the detail names the answer, and whether it was given to all waiting changes at once. */
+export function decisionLabel(decision: ApprovalDecision | null, bulk = false): string {
   switch (decision) {
-    case 'approved': return 'Goedgekeurd'
-    case 'refused': return 'Geweigerd'
+    case 'approved': return bulk ? 'Goedgekeurd · Alles goedkeuren' : 'Goedgekeurd'
+    case 'refused': return bulk ? 'Geweigerd · Alles weigeren' : 'Geweigerd'
     case 'auto': return 'Zonder akkoord: dit account boekt direct'
     case 'lapsed': return 'Niet beantwoord'
     default: return 'Nog niet beantwoord'
