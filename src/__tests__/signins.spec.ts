@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  addAccount, askedCode, dismissSignin, markStarted, receiveSignin, refresh, signIn, signingIn, startedHere, store,
+  addAccount, askedCode, dismissSignin, markStarted, receiveSignin, refresh, signIn, signInAll, signingIn, startedHere, store,
   type AccountView, type SigninEvent,
 } from '../lib/accounts'
 
@@ -42,6 +42,22 @@ describe('sign-ins started in this window', () => {
     expect(startedHere('a')).toBe(true)
     // Not the end of the sign-in before it.
     expect(store.signins.a).toEqual(event('a', 'credentials'))
+  })
+
+  it('starts every signed-out account at once and shows them as waiting until the app says more', async () => {
+    // One of them was signing in already, one ended an earlier sign-in, one was never tried.
+    receiveSignin(event('busy', 'submit'))
+    receiveSignin(event('ended', 'failed', 'Onjuist wachtwoord'))
+    invoke.mockResolvedValueOnce(['busy', 'ended', 'new'])
+    expect(await signInAll()).toEqual(['busy', 'ended', 'new'])
+    expect(invoke).toHaveBeenCalledWith('signin_all')
+    // A running sign-in keeps its step; the others no longer show an earlier end.
+    expect(store.signins.busy).toEqual(event('busy', 'submit'))
+    expect(store.signins.ended).toEqual(event('ended', 'queued'))
+    expect(store.signins.new).toEqual(event('new', 'queued'))
+    expect(['busy', 'ended', 'new'].every(startedHere)).toBe(true)
+    // Waiting for its turn counts as signing in.
+    expect(signingIn(account('new', false))).toBe(true)
   })
 
   it('shows its own sign-in until it is closed, and keeps the end state known after that', () => {

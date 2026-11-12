@@ -108,15 +108,19 @@ const appearances: { value: Appearance; label: string }[] = [
         </div>
       </div>
       <div class="row">
-        <span class="text"><strong>Uitloggen na stilte</strong><small>Stilte: geen aanroep van een AI-client voor dat account.</small></span>
-        <select class="select" :value="settings.idleMinutes" aria-label="Uitloggen na stilte" @change="save({ idleMinutes: Number(($event.target as HTMLSelectElement).value) }, 'view')">
+        <span class="text"><strong>Blijf ingelogd</strong><small>EB MCP houdt elke sessie op de achtergrond actief bij e-Boekhouden, ook als je lang niets doet. Uit: uitloggen na stilte.</small></span>
+        <button type="button" role="switch" class="switch" :aria-checked="settings.keepSignedIn" aria-label="Blijf ingelogd" @click="save({ keepSignedIn: !settings.keepSignedIn }, 'view')"><span /></button>
+      </div>
+      <div class="row" :class="{ muted: settings.keepSignedIn }">
+        <span class="text"><strong>Uitloggen na stilte</strong><small>{{ settings.keepSignedIn ? 'Staat uit zolang Blijf ingelogd aan staat.' : 'Stilte: geen aanroep van een AI-client voor dat account.' }}</small></span>
+        <select class="select" :value="settings.idleMinutes" :disabled="settings.keepSignedIn" aria-label="Uitloggen na stilte" @change="save({ idleMinutes: Number(($event.target as HTMLSelectElement).value) }, 'view')">
           <option :value="15">15 minuten</option>
           <option :value="30">30 minuten</option>
           <option :value="60">1 uur</option>
           <option :value="240">4 uur</option>
         </select>
       </div>
-      <p class="hint">Afsluiten vergeet altijd alle sessies; EB MCP bewaart ze nergens. Na een update log je zelf opnieuw in.</p>
+      <p class="hint">Afsluiten vergeet altijd alle sessies; EB MCP bewaart ze nergens. Na een update log je zelf opnieuw in{{ settings.keepSignedIn ? ', en ook als e-Boekhouden een sessie toch beëindigt' : '' }}.</p>
       <Transition name="accordion">
         <div v-if="errors.view" class="accordion"><div><p class="error" role="alert">{{ errors.view }}</p></div></div>
       </Transition>
@@ -160,6 +164,8 @@ const appearances: { value: Appearance; label: string }[] = [
 .section { margin: 18px 4px 8px; font-size: 12px; font-weight: 600; color: var(--muted); }
 .section:first-child { margin-top: 0; }
 .group + .section { margin-top: 22px; }
+.row.muted .text strong, .row.muted .select { opacity: 0.5; }
+.row .text strong, .row .select { transition: opacity 200ms var(--ease); }
 .switch { position: relative; width: 38px; height: 22px; flex: none; padding: 0; border: 0; border-radius: 999px; background: var(--subtle); box-shadow: inset 0 0 0 0.5px var(--line); transition: background-color 200ms var(--ease), filter 150ms ease; }
 .switch span { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25); transition: transform 200ms var(--ease); }
 .switch[aria-checked='true'] { background: var(--accent); }

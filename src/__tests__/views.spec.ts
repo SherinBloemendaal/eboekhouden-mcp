@@ -91,6 +91,42 @@ describe('accounts page', () => {
     wrapper.unmount()
   })
 
+  it('offers Alles inloggen for several accounts, and only while one of them is signed out', async () => {
+    const wrapper = await mountAt('/accounts')
+    const all = () => wrapper.findAll('#toolbar-actions .btn').find((b) => b.text() === 'Alles inloggen')
+    const session = (id: string) => ({ accountId: id, label: id, administration: null, startedAt: Date.now(), expired: false })
+    // One account has its own Inloggen: no button for all.
+    store.accounts = [account({})]
+    await flushPromises()
+    expect(all()).toBeUndefined()
+    // Two, one of them signed out.
+    store.accounts = [account({ session: session('a1') }), account({ id: 'a2', label: 'Tweede' })]
+    await flushPromises()
+    expect(all()!.attributes('disabled')).toBeUndefined()
+    // An expired session counts as signed out.
+    store.accounts = [account({ session: session('a1') }), account({ id: 'a2', label: 'Tweede', session: { ...session('a2'), expired: true } })]
+    await flushPromises()
+    expect(all()!.attributes('disabled')).toBeUndefined()
+    // Everybody signed in: nothing to do, and the button says why.
+    store.accounts = [account({ session: session('a1') }), account({ id: 'a2', label: 'Tweede', session: session('a2') })]
+    await flushPromises()
+    expect(all()!.attributes('disabled')).toBeDefined()
+    expect(all()!.attributes('title')).toBe('Alle accounts zijn ingelogd')
+    // Every signed-out account is signing in already: busy, not startable again.
+    store.accounts = [account({ signingIn: true }), account({ id: 'a2', label: 'Tweede', signingIn: true })]
+    store.signins = { a1: { accountId: 'a1', step: 'submit', message: null }, a2: { accountId: 'a2', step: 'queued', message: null } }
+    await flushPromises()
+    expect(all()!.attributes('aria-busy')).toBe('true')
+    expect(all()!.attributes('disabled')).toBeDefined()
+    // The one that waits for its turn says so, in its row and in its steps.
+    const rows = wrapper.findAll('.session-text').map((r) => r.text())
+    expect(rows).toEqual(['Bezig met inloggen…', 'Wacht op zijn beurt…'])
+    await wrapper.findAll('.actions .btn').find((b) => b.attributes('aria-label') === 'Inloggen van Tweede volgen')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').text()).toContain('Wachten tot een andere aanmelding klaar is')
+    wrapper.unmount()
+  })
+
   it('offers to follow a sign-in started elsewhere and shows its steps', async () => {
     const wrapper = await mountAt('/accounts')
     store.accounts = [account({ signingIn: true })]
@@ -162,9 +198,17 @@ describe('instellingen', () => {
   it('offers Openen bij inloggen and Toon in Dock as switches', async () => {
     const wrapper = await mountAt('/instellingen')
     const switches = wrapper.findAll('[role="switch"]').map((s) => s.attributes('aria-label'))
-    expect(switches).toEqual(['Openen bij inloggen', 'Toon in Dock'])
+    expect(switches).toEqual(['Openen bij inloggen', 'Toon in Dock', 'Blijf ingelogd'])
     // On by default (Sherin, 2026-11-10).
     expect(wrapper.find('[aria-label="Toon in Dock"]').attributes('aria-checked')).toBe('true')
+    wrapper.unmount()
+  })
+
+  it('has Blijf ingelogd off until the user turns it on, with the idle time then in use', async () => {
+    const wrapper = await mountAt('/instellingen')
+    expect(wrapper.find('[aria-label="Blijf ingelogd"]').attributes('aria-checked')).toBe('false')
+    expect(wrapper.find('select[aria-label="Uitloggen na stilte"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.text()).toContain('houdt elke sessie op de achtergrond actief')
     wrapper.unmount()
   })
 

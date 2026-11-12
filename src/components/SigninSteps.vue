@@ -27,7 +27,9 @@ watch(
   () => props.event?.step,
   (step) => {
     // A sign-in starts by reading the credentials: whatever an earlier one asked no longer counts.
-    if (step === 'credentials') codeSeen.value = false
+    if (step === 'credentials' || step === 'queued') codeSeen.value = false
+    // Waiting for its turn comes before the first step.
+    if (step === 'queued') lastIndex.value = 0
     if (step === 'code') codeSeen.value = true
     if (step && !['done', 'failed', 'unknown', 'cancelled'].includes(step)) lastIndex.value = indexOf(step)
     if (step === 'code') {
@@ -42,7 +44,10 @@ const asked = computed(() => codeSeen.value)
 const rows = computed(() => {
   const step = props.event?.step
   const labels = [
-    props.account.store === 'onePassword' ? 'Gegevens uit 1Password lezen' : `${unlockName} voor het wachtwoord`,
+    // A few sign-ins run at once; one that waits for its turn says so in place of its first step.
+    step === 'queued'
+      ? 'Wachten tot een andere aanmelding klaar is'
+      : props.account.store === 'onePassword' ? 'Gegevens uit 1Password lezen' : `${unlockName} voor het wachtwoord`,
     'Inloggen bij e-Boekhouden',
     ...(asked.value ? ['Tweestapsverificatie'] : []),
     'Administratie ophalen',

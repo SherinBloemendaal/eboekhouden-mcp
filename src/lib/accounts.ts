@@ -74,7 +74,7 @@ export function opLabel(account: Pick<AccountView, 'opRef' | 'opTitle' | 'opVaul
 }
 
 export type Step =
-  | 'credentials' | 'submit' | 'code' | 'administration' | 'done' | 'failed' | 'unknown' | 'cancelled'
+  | 'queued' | 'credentials' | 'submit' | 'code' | 'administration' | 'done' | 'failed' | 'unknown' | 'cancelled'
 
 export interface SigninEvent {
   accountId: string
@@ -95,6 +95,8 @@ export const WRITE_MODES: { value: WriteMode; label: string; hint: string }[] = 
 
 export interface Settings {
   idleMinutes: number
+  /** Blijf ingelogd: no idle sign-out, and EB MCP keeps each session alive at e-Boekhouden. */
+  keepSignedIn: boolean
   appearance: Appearance
   /** macOS: an icon in the Dock as well as in the menu bar. */
   showInDock: boolean
@@ -207,6 +209,20 @@ export const signIn = (id: string) => {
 }
 export const cancelSignIn = (id: string) => invoke('signin_cancel', { id })
 
+/**
+ * Alles inloggen: starts a sign-in for every account without a session that stands. The app runs a few at a
+ * time; the others wait for their turn. Gives the accounts it started.
+ */
+export async function signInAll(): Promise<string[]> {
+  const ids = await invoke<string[]>('signin_all')
+  for (const id of ids) {
+    // Shown at once; the app's own steps follow. An account whose sign-in already ran keeps its newest step.
+    if (!isRunning(store.signins[id]?.step)) store.signins[id] = { accountId: id, step: 'queued', message: null }
+    markStarted(id)
+  }
+  return ids
+}
+
 /** One sign-in as Instellingen › Diagnose shows it: what EB MCP saw and did. No password, code or cookie. */
 export interface Trace {
   accountId: string
@@ -225,7 +241,7 @@ export function traceText(trace: Trace): string {
 export const sendCode = (id: string, code: string) => invoke('signin_code', { id, code })
 export const signOut = (id: string) => invoke('sign_out', { id }).finally(refresh)
 export const signOutAll = () => invoke('sign_out_all').finally(refresh)
-export const getSettings = () => (inApp() ? invoke<Settings>('settings_get') : Promise.resolve<Settings>({ idleMinutes: 30, appearance: 'system', showInDock: true }))
+export const getSettings = () => (inApp() ? invoke<Settings>('settings_get') : Promise.resolve<Settings>({ idleMinutes: 30, keepSignedIn: false, appearance: 'system', showInDock: true }))
 export const saveSettings = (value: Settings) => invoke('settings_set', { value })
 
 /** Closes this window's view of a sign-in. Its newest step stays known, here and in other windows. */

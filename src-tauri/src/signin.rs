@@ -12,7 +12,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -32,6 +32,8 @@ const TRACES_KEPT: usize = 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Step {
+    /// Waiting for its turn: only a few sign-ins run at once (`MAX_AT_ONCE`).
+    Queued,
     Credentials,
     Submit,
     /// Waiting for a two-step code (the UI's code field and `give_code`). Not sent while the classic form's
@@ -90,15 +92,49 @@ struct Pending {
     code: Option<oneshot::Sender<String>>,
 }
 
+/// How many sign-ins talk to e-Boekhouden at the same time. Alles inloggen starts one per account; more than
+/// a handful at once looks like an attack on a login form, and gains little.
+pub const MAX_AT_ONCE: usize = 4;
+
 /// Sign-ins that are running, by account, and the diagnosis of the last few.
-#[derive(Default)]
 pub struct Signins {
+    /// One permit per sign-in that is past the queue.
+    slots: tokio::sync::Semaphore,
+    /// Held while one sign-in reads its username and password. 1Password and the system store ask the user
+    /// (Touch ID, a consent prompt): one question at a time, and an answer that unlocks the store serves the
+    /// reads that follow, where several at once would each put up their own prompt.
+    reading: tokio::sync::Mutex<()>,
     pending: Mutex<HashMap<Uuid, Pending>>,
     /// The newest step of each account's latest sign-in, its end state included, until the next sign-in or
     /// the end of the app. Every window reads it with the accounts, so none depends on having heard each event.
     /// Locked only while `pending` is held or on its own, never the other way round.
     last: Mutex<HashMap<Uuid, SigninEvent>>,
     traces: Mutex<VecDeque<(Instant, Trace)>>,
+}
+
+impl Default for Signins {
+    fn default() -> Self {
+        Self {
+            slots: tokio::sync::Semaphore::new(MAX_AT_ONCE),
+            reading: tokio::sync::Mutex::new(()),
+            pending: Mutex::default(),
+            last: Mutex::default(),
+            traces: Mutex::default(),
+        }
+    }
+}
+
+/// Waits for `wait`, looking every moment whether the user stopped the sign-in; `None` when they did.
+async fn unless_cancelled<T>(cancel: &AtomicBool, wait: impl Future<Output = T>) -> Option<T> {
+    tokio::pin!(wait);
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        if let Ok(done) = tokio::time::timeout(Duration::from_millis(150), &mut wait).await {
+            return Some(done);
+        }
+    }
 }
 
 impl Signins {
@@ -265,7 +301,21 @@ pub async fn sign_in(
     signins.trace_start(account_id, &label);
     let started = Instant::now();
     let mut called = false;
-    let (step, message) = run(&app, &state, &signins, account_id, &cancel, &mut called).await;
+    // Its turn first: at most MAX_AT_ONCE sign-ins run side by side. One that has to wait says so and can be
+    // stopped while it waits; one that can start at once never shows as waiting.
+    let slot = match signins.slots.try_acquire() {
+        Ok(slot) => Some(Ok(slot)),
+        Err(_) => {
+            emit(&app, &signins, account_id, Step::Queued, None);
+            signins.trace(account_id, "Wacht op zijn beurt: er lopen al aanmeldingen");
+            unless_cancelled(&cancel, signins.slots.acquire()).await
+        }
+    };
+    let (step, message) = match slot {
+        Some(Ok(_slot)) => run(&app, &state, &signins, account_id, &cancel, &mut called).await,
+        Some(Err(_)) => (Step::Failed, Some("Het inloggen is afgebroken".into())),
+        None => (Step::Cancelled, None),
+    };
     // Every HTTP call of the sign-in is in Verzoeken already. A sign-in that ended before the first one
     // (credentials not read, or cancelled) gets a line of its own, so each sign-in shows there.
     if !called {
@@ -317,7 +367,12 @@ async fn run(
         account_id,
         format!("Gegevens lezen uit {:?}", account.store),
     );
-    let credentials = creds::read(&account, cancel).await;
+    let credentials = {
+        let Some(_one_at_a_time) = unless_cancelled(cancel, signins.reading.lock()).await else {
+            return (Step::Cancelled, None);
+        };
+        creds::read(&account, cancel).await
+    };
     crate::refocus_main(app);
     let credentials = match credentials {
         Ok(c) => {
@@ -525,6 +580,66 @@ mod tests {
             signins.give_code(id, typed.into()).unwrap();
             assert_eq!(rx.blocking_recv().unwrap(), sent, "{typed:?}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_few_sign_ins_run_at_once_and_a_waiting_one_can_be_stopped() {
+        let signins = Signins::default();
+        let go = AtomicBool::new(false);
+        let mut running = Vec::new();
+        for _ in 0..MAX_AT_ONCE {
+            running.push(
+                unless_cancelled(&go, signins.slots.acquire())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        // The next one waits for its turn. Stopping it ends the wait without taking a turn.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            stopping.store(true, Ordering::SeqCst);
+        });
+        assert!(
+            unless_cancelled(&stop, signins.slots.acquire())
+                .await
+                .is_none()
+        );
+        assert_eq!(signins.slots.available_permits(), 0);
+        // When one ends, the next gets its turn.
+        running.pop();
+        assert!(
+            unless_cancelled(&go, signins.slots.acquire())
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn credentials_are_read_by_one_sign_in_at_a_time() {
+        let signins = Signins::default();
+        let go = AtomicBool::new(false);
+        let reading = unless_cancelled(&go, signins.reading.lock()).await.unwrap();
+        let stop = AtomicBool::new(false);
+        let second = unless_cancelled(&stop, signins.reading.lock());
+        tokio::pin!(second);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), &mut second)
+                .await
+                .is_err(),
+            "it waits"
+        );
+        drop(reading);
+        assert!(second.await.is_some());
+        // A sign-in that was stopped before it could read never asks 1Password or the system store.
+        let stopped = AtomicBool::new(true);
+        assert!(
+            unless_cancelled(&stopped, signins.reading.lock())
+                .await
+                .is_none()
+        );
     }
 
     #[test]

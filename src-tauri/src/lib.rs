@@ -392,6 +392,17 @@ fn signin_start(app: AppHandle, id: Uuid) {
     start_sign_in(&app, id);
 }
 
+/// Alles inloggen: starts a sign-in for every account without a session that stands. They run side by side,
+/// a few at a time (signin.rs, `Signins`); the ids come back so the window can show each one as started.
+#[tauri::command]
+fn signin_all(app: AppHandle, app_state: Shared<'_, AppState>) -> Vec<Uuid> {
+    let ids = app_state.signed_out_accounts();
+    for id in &ids {
+        start_sign_in(&app, *id);
+    }
+    ids
+}
+
 /// Instellingen › Diagnose: the last sign-ins, step by step, without passwords, codes or cookies.
 #[tauri::command]
 fn signin_traces(signins: Shared<'_, Signins>) -> Vec<signin::Trace> {
@@ -453,6 +464,11 @@ async fn log_clear(app_state: Shared<'_, AppState>) -> Result<(), String> {
 
 /// How often the request log is saved at most, when it changed.
 const LOG_SAVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often Blijf ingelogd asks e-Boekhouden whether each session still stands. How long e-Boekhouden keeps
+/// an unused session is not published; five minutes is well inside the half hour its sessions were seen to
+/// last, and costs one small request per account.
+const KEEP_ALIVE_EVERY: Duration = Duration::from_secs(5 * 60);
 
 /// Saves the request log and the approval history when they changed, compressing them off the async
 /// runtime's threads.
@@ -1219,6 +1235,7 @@ pub fn run() {
             open_eboekhouden,
             op_items,
             signin_traces,
+            signin_all,
             approvals_list,
             approval_decide,
             approvals_decide_all,
@@ -1370,13 +1387,24 @@ pub fn run() {
                 }
             });
 
-            // Idle sign-out, checked every minute.
+            // Every minute: idle sign-out, or with Blijf ingelogd the check that keeps the sessions alive.
             let idle_state = app_state.clone();
             tauri::async_runtime::spawn(async move {
+                let mut kept_alive: Option<std::time::Instant> = None;
                 loop {
                     tokio::time::sleep(Duration::from_secs(60)).await;
-                    let minutes = settings.get().idle_minutes;
-                    idle_state.sign_out_idle(Duration::from_secs(u64::from(minutes) * 60));
+                    let now = settings.get();
+                    if now.keep_signed_in {
+                        // Right after it is turned on, then every KEEP_ALIVE_EVERY.
+                        if kept_alive.is_none_or(|at| at.elapsed() >= KEEP_ALIVE_EVERY) {
+                            kept_alive = Some(std::time::Instant::now());
+                            idle_state.keep_alive_all().await;
+                        }
+                    } else {
+                        kept_alive = None;
+                        idle_state
+                            .sign_out_idle(Duration::from_secs(u64::from(now.idle_minutes) * 60));
+                    }
                 }
             });
 

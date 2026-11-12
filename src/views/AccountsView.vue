@@ -8,7 +8,7 @@ import Icon from '../components/Icon.vue'
 import Sheet from '../components/Sheet.vue'
 import SigninSteps from '../components/SigninSteps.vue'
 import {
-  cancelSignIn, connect, dismissSignin, getSettings, isRunning, opLabel, removeAccount, sessionAge, signIn, signingIn, signOut, store, WRITE_MODES,
+  cancelSignIn, connect, dismissSignin, getSettings, isRunning, opLabel, removeAccount, sessionAge, signIn, signInAll, signingIn, signOut, store, WRITE_MODES,
   type AccountView,
 } from '../lib/accounts'
 import { unlockName } from '../lib/server'
@@ -19,6 +19,7 @@ const removing = ref<AccountView | null>(null)
 const removeError = ref<string | null>(null)
 const watching = ref<string | null>(null)
 const idleMinutes = ref(30)
+const keepSignedIn = ref(false)
 const now = ref(Date.now())
 let tick: ReturnType<typeof setInterval> | undefined
 
@@ -26,7 +27,9 @@ onMounted(async () => {
   // Started before the awaits, so leaving the page early still finds it to clear.
   tick = setInterval(() => (now.value = Date.now()), 30_000)
   await connect()
-  idleMinutes.value = (await getSettings()).idleMinutes
+  const settings = await getSettings()
+  idleMinutes.value = settings.idleMinutes
+  keepSignedIn.value = settings.keepSignedIn
 })
 onBeforeUnmount(() => clearInterval(tick))
 
@@ -49,6 +52,27 @@ function followable(account: AccountView): boolean {
 /** Shows the steps and the code field of a running sign-in, without starting a new one. */
 function follow(account: AccountView) {
   watching.value = account.id
+}
+
+/** The accounts Alles inloggen would sign in: without a session that stands. */
+const signedOut = computed(() => store.accounts.filter((a) => !a.session || a.session.expired))
+/** Every one of them is signing in already: nothing left to start. */
+const allSigningIn = computed(() => signedOut.value.length > 0 && signedOut.value.every(signingIn))
+const allError = ref<string | null>(null)
+const startingAll = ref(false)
+
+/** Starts every sign-in at once; the app runs a few side by side. The rows show how each one goes. */
+async function startAll() {
+  if (startingAll.value) return
+  startingAll.value = true
+  allError.value = null
+  try {
+    await signInAll()
+  } catch (e) {
+    allError.value = String(e)
+  } finally {
+    startingAll.value = false
+  }
 }
 
 function startSignIn(account: AccountView) {
@@ -82,7 +106,7 @@ async function confirmRemove() {
 }
 
 function sessionText(account: AccountView): { tone: string; text: string } {
-  if (signingIn(account)) return { tone: 'run', text: 'Bezig met inloggen…' }
+  if (signingIn(account)) return { tone: 'run', text: store.signins[account.id]?.step === 'queued' ? 'Wacht op zijn beurt…' : 'Bezig met inloggen…' }
   if (account.session?.expired) return { tone: 'bad', text: 'Sessie verlopen' }
   if (account.session) return { tone: 'on', text: sessionAge(account.session.startedAt, now.value) }
   return { tone: 'off', text: account.administration ? 'Niet ingelogd' : 'Nog nooit ingelogd' }
@@ -92,6 +116,10 @@ function sessionText(account: AccountView): { tone: string; text: string } {
 
 <template>
   <Teleport to="#toolbar-actions" defer>
+    <button
+      v-if="store.accounts.length > 1" type="button" class="btn" :disabled="!signedOut.length || allSigningIn || startingAll" :aria-busy="allSigningIn || startingAll"
+      :title="signedOut.length ? 'Logt alle accounts in die niet ingelogd zijn, een paar tegelijk' : 'Alle accounts zijn ingelogd'" @click="startAll"
+    ><span class="btn-label">Alles inloggen</span></button>
     <button v-if="store.accounts.length" type="button" class="btn primary" @click="adding = true"><Icon name="plus" :size="15" />Account toevoegen</button>
   </Teleport>
 
@@ -103,6 +131,9 @@ function sessionText(account: AccountView): { tone: string; text: string } {
   </EmptyState>
 
   <div v-else class="page">
+    <Transition name="accordion">
+      <div v-if="allError" class="accordion"><div><p class="error" role="alert">Alles inloggen is niet gestart: {{ allError }}</p></div></div>
+    </Transition>
     <div class="group table" role="table" aria-label="Accounts">
       <div class="row head" role="row">
         <span>Account</span><span>Administratie</span><span>Wachtwoord</span><span>Sessie</span><span />
@@ -145,7 +176,8 @@ function sessionText(account: AccountView): { tone: string; text: string } {
       </section>
       <section class="group card">
         <h2>Sessies</h2>
-        <p>EB MCP vergeet de sessie van een account na {{ idleText }} zonder aanroep van een AI-client; bij e-Boekhouden verloopt die daarna vanzelf. Afsluiten vergeet altijd alle sessies; EB MCP bewaart ze nergens.</p>
+        <p v-if="keepSignedIn">Blijf ingelogd staat aan: EB MCP houdt elke sessie op de achtergrond actief bij e-Boekhouden en logt niet uit na stilte. Afsluiten vergeet altijd alle sessies; EB MCP bewaart ze nergens.</p>
+        <p v-else>EB MCP vergeet de sessie van een account na {{ idleText }} zonder aanroep van een AI-client; bij e-Boekhouden verloopt die daarna vanzelf. Afsluiten vergeet altijd alle sessies; EB MCP bewaart ze nergens.</p>
         <RouterLink class="btn small" to="/instellingen">Wijzigen in Instellingen</RouterLink>
       </section>
     </div>

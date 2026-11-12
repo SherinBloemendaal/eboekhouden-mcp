@@ -729,6 +729,17 @@ impl EbClient {
     /// `POST /v1/api/auth`, the check e-Boekhouden's own app makes at startup: whether these cookies make a
     /// signed-in session. The answer's `valid` says so; `valid_session` reads it.
     pub async fn auth(&self, cookies: &[(String, String)]) -> ApiCall {
+        self.auth_keeping(cookies).await.0
+    }
+
+    /// `auth`, with the session's cookies as they are after the answer: what it set (`Set-Cookie`) on top of
+    /// what was sent. A browser keeps those by itself; a session that is kept alive has to do the same, or a
+    /// token e-Boekhouden renews would be dropped here. Without a usable answer the cookies come back as sent.
+    pub async fn auth_keeping(
+        &self,
+        cookies: &[(String, String)],
+    ) -> (ApiCall, Vec<(String, String)>) {
+        let mut kept = cookies.to_vec();
         let mut call = ApiCall {
             method: "POST",
             path: "auth".into(),
@@ -759,16 +770,19 @@ impl EbClient {
             Err(_) => call.error = Some("Geen verbinding met e-Boekhouden".into()),
             Ok(response) => {
                 call.status = response.status().as_u16();
+                let renewed = with_set_cookies(cookies, response.headers());
                 let body = response.bytes().await.unwrap_or_default();
                 call.bytes = body.len();
                 call.json = serde_json::from_slice::<Value>(&body).ok();
-                if !valid_session(&call) {
+                if valid_session(&call) {
+                    kept = renewed;
+                } else {
                     call.error = Some("Nog geen geldige sessie bij e-Boekhouden".into());
                 }
             }
         }
         call.duration_ms = started.elapsed().as_millis() as u64;
-        call
+        (call, kept)
     }
 
     fn url(&self, path: &str, query: &[(String, String)]) -> Result<Url, String> {

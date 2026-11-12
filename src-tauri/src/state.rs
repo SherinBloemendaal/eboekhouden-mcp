@@ -17,6 +17,19 @@ use crate::reqlog::RequestLog;
 
 /// Holds the cookies of each session, by key, and forgets them at sign-out. The app keeps them in memory
 /// (signin.rs, SessionJar); tests use a fake. Signing out only forgets: e-Boekhouden's API has no sign-out.
+/// What a keep-alive check found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeepAlive {
+    /// e-Boekhouden still knows the session.
+    Alive,
+    /// e-Boekhouden no longer knows it: the session is marked expired.
+    Expired,
+    /// No answer or a server error: nothing learned, nothing changed.
+    Unknown,
+    /// There was no session to check.
+    NoSession,
+}
+
 pub trait CookieJar: Send + Sync {
     fn cookies(&self, key: &str) -> Result<Vec<(String, String)>, String>;
     fn put(&self, key: &str, cookies: Vec<(String, String)>);
@@ -483,6 +496,83 @@ impl AppState {
         }
     }
 
+    /// Asks e-Boekhouden whether the session of `account_id` still stands (`POST auth`, the check its own app
+    /// makes), for Blijf ingelogd: a session that is asked after does not lapse there for lack of use, and
+    /// cookies the answer renews are kept. It does not count as use by an AI client. A session e-Boekhouden
+    /// no longer knows is marked expired, and only that shows in Verzoeken: a line for every quiet check
+    /// would push the AI calls out of the log.
+    pub async fn keep_alive(&self, account_id: Uuid) -> KeepAlive {
+        let session = self.sessions.read().unwrap().get(&account_id).cloned();
+        let Some(session) = session.filter(|s| !s.expired) else {
+            return KeepAlive::NoSession;
+        };
+        let Ok(cookies) = self.jar.cookies(&session.key) else {
+            return KeepAlive::NoSession;
+        };
+        let (call, renewed) = self.client.auth_keeping(&cookies).await;
+        if crate::ebapi::valid_session(&call) {
+            // Signed out or signed in again while the check was under way: those cookies are not this
+            // session's any more.
+            let same = self
+                .sessions
+                .read()
+                .unwrap()
+                .get(&account_id)
+                .is_some_and(|s| s.key == session.key && !s.expired);
+            if same && renewed != cookies {
+                self.jar.put(&session.key, renewed);
+            }
+            return KeepAlive::Alive;
+        }
+        // No answer, or a server error: nothing is known about the session, so it stays as it is.
+        if call.status == 0 || call.status >= 500 {
+            log::warn!(
+                "ingelogd blijven {}: e-Boekhouden gaf geen bruikbaar antwoord (status {})",
+                session.label,
+                call.status
+            );
+            return KeepAlive::Unknown;
+        }
+        self.log.add_signin(
+            &call,
+            "EB MCP (ingelogd blijven)",
+            (account_id, session.label.clone()),
+        );
+        let _ = self.events.send(AppEvent::LogChanged);
+        self.mark_expired(account_id);
+        KeepAlive::Expired
+    }
+
+    /// `keep_alive` for every session that stands, one after the other; how many are still alive.
+    pub async fn keep_alive_all(&self) -> usize {
+        let ids: Vec<Uuid> = self
+            .sessions
+            .read()
+            .unwrap()
+            .values()
+            .filter(|s| !s.expired)
+            .map(|s| s.account_id)
+            .collect();
+        let mut alive = 0;
+        for id in ids {
+            if self.keep_alive(id).await == KeepAlive::Alive {
+                alive += 1;
+            }
+        }
+        alive
+    }
+
+    /// The accounts without a session that stands: never signed in, signed out, or expired.
+    pub fn signed_out_accounts(&self) -> Vec<Uuid> {
+        let sessions = self.sessions.read().unwrap();
+        self.accounts
+            .list()
+            .into_iter()
+            .map(|a| a.id)
+            .filter(|id| sessions.get(id).is_none_or(|s| s.expired))
+            .collect()
+    }
+
     /// A sign-in attempt or one of its checks in Verzoeken, so they show next to the AI calls. They stay out
     /// of the Dashboard's statistics (reqlog.rs, `add_signin`).
     pub fn log_signin_call(&self, call: &ApiCall, account_id: Uuid, label: &str) {
@@ -670,6 +760,157 @@ mod tests {
         assert_eq!(call.status, 401);
         assert!(state.sessions()[0].expired);
         assert_eq!(state.session_count(), 0);
+    }
+
+    /// e-Boekhouden's `POST auth` for three sessions, told apart by their token: one that stands and gets a
+    /// renewed token, one it no longer knows, and one it answers with a server error.
+    async fn auth_server() -> String {
+        use axum::http::{HeaderMap, StatusCode, header};
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().route(
+            "/v1/api/auth",
+            axum::routing::post(|headers: HeaderMap| async move {
+                let cookie = headers
+                    .get(header::COOKIE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                if cookie.contains("auth-token=goed") || cookie.contains("auth-token=vernieuwd") {
+                    (
+                        [(header::SET_COOKIE, "auth-token=vernieuwd; path=/")],
+                        axum::Json(serde_json::json!({"valid": true})),
+                    )
+                        .into_response()
+                } else if cookie.contains("auth-token=kapot") {
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                } else {
+                    axum::Json(serde_json::json!({"valid": false})).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/v1/api/")
+    }
+
+    #[tokio::test]
+    async fn keeping_alive_renews_what_stands_and_expires_only_what_e_boekhouden_dropped() {
+        let jar = Arc::new(FakeJar::default());
+        jar.put(
+            "eb-goed",
+            vec![
+                ("auth-token".into(), "goed".into()),
+                ("server".into(), "a".into()),
+            ],
+        );
+        jar.put("eb-oud", vec![("auth-token".into(), "oud".into())]);
+        jar.put("eb-kapot", vec![("auth-token".into(), "kapot".into())]);
+        let state = state_with(jar.clone(), &auth_server().await);
+        let (goed, oud, kapot) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        state.add_session(goed, "Goed", "eb-goed");
+        state.add_session(oud, "Oud", "eb-oud");
+        state.add_session(kapot, "Kapot", "eb-kapot");
+        // Not used for longer than the idle time: the check must not count as use.
+        let long_ago = Instant::now() - Duration::from_secs(31 * 60);
+        state
+            .sessions
+            .write()
+            .unwrap()
+            .get_mut(&goed)
+            .unwrap()
+            .last_used = long_ago;
+        let logged = state.log.len();
+
+        // The session that stands: alive, and the token the answer set replaces the old one, the rest stays.
+        assert_eq!(state.keep_alive(goed).await, KeepAlive::Alive);
+        assert_eq!(
+            jar.cookies("eb-goed").unwrap(),
+            vec![
+                ("server".to_owned(), "a".to_owned()),
+                ("auth-token".to_owned(), "vernieuwd".to_owned())
+            ]
+        );
+        assert_eq!(state.sessions.read().unwrap()[&goed].last_used, long_ago);
+        assert_eq!(
+            state.log.len(),
+            logged,
+            "a quiet check leaves no line in Verzoeken"
+        );
+
+        // A server error says nothing about the session: it stays, and nothing is logged in Verzoeken.
+        assert_eq!(state.keep_alive(kapot).await, KeepAlive::Unknown);
+        assert!(!state.sessions.read().unwrap()[&kapot].expired);
+        assert_eq!(state.log.len(), logged);
+
+        // The session e-Boekhouden dropped: expired, told to the windows, and shown in Verzoeken once.
+        let mut events = state.events.subscribe();
+        assert_eq!(state.keep_alive(oud).await, KeepAlive::Expired);
+        assert!(state.sessions.read().unwrap()[&oud].expired);
+        assert_eq!(
+            jar.cookies("eb-oud").unwrap(),
+            vec![("auth-token".to_owned(), "oud".to_owned())]
+        );
+        assert_eq!(state.log.len(), logged + 1);
+        let mut told = false;
+        while let Ok(event) = events.try_recv() {
+            told |=
+                matches!(event, AppEvent::SessionExpired { account_id, .. } if account_id == oud);
+        }
+        assert!(told);
+        // An expired session, or an account without one, is not asked after again.
+        assert_eq!(state.keep_alive(oud).await, KeepAlive::NoSession);
+        assert_eq!(state.keep_alive(Uuid::new_v4()).await, KeepAlive::NoSession);
+        assert_eq!(state.log.len(), logged + 1);
+
+        // All at once: only the one that stands counts, and it is asked after with its renewed token.
+        assert_eq!(state.keep_alive_all().await, 1);
+    }
+
+    #[test]
+    fn alles_inloggen_takes_the_accounts_without_a_session_that_stands() {
+        use crate::accounts::{AccountInput, Store, WriteMode};
+        let state = state_with(Arc::new(FakeJar::default()), "http://127.0.0.1:9/v1/api/");
+        let add = |label: &str| {
+            state
+                .accounts
+                .add(AccountInput {
+                    label: label.into(),
+                    username: format!("{label}@example.test"),
+                    store: Store::System,
+                    op_ref: None,
+                    op_title: None,
+                    op_vault: None,
+                    write: WriteMode::Off,
+                })
+                .unwrap()
+                .id
+        };
+        let (signed_in, expired, never) = (add("In"), add("Verlopen"), add("Nooit"));
+        state.add_session(signed_in, "In", "eb-1");
+        state.add_session(expired, "Verlopen", "eb-2");
+        state.mark_expired(expired);
+        let mut todo = state.signed_out_accounts();
+        todo.sort();
+        let mut expected = vec![expired, never];
+        expected.sort();
+        assert_eq!(todo, expected);
+    }
+
+    #[tokio::test]
+    async fn no_connection_leaves_a_session_as_it_is() {
+        let jar = Arc::new(FakeJar::default());
+        jar.put("eb-1", vec![("auth-token".into(), "goed".into())]);
+        // Nothing listens there.
+        let state = state_with(jar.clone(), "http://127.0.0.1:9/v1/api/");
+        let id = Uuid::new_v4();
+        state.add_session(id, "A", "eb-1");
+        assert_eq!(state.keep_alive(id).await, KeepAlive::Unknown);
+        assert!(!state.sessions()[0].expired);
+        assert_eq!(
+            jar.cookies("eb-1").unwrap(),
+            vec![("auth-token".to_owned(), "goed".to_owned())]
+        );
     }
 
     #[test]

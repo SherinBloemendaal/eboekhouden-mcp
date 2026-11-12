@@ -1,4 +1,5 @@
-//! Small app settings on disk (no secrets): the idle sign-out time, the appearance and the Dock icon.
+//! Small app settings on disk (no secrets): the idle sign-out time, staying signed in, the appearance and the
+//! Dock icon.
 //! Opening at login is not kept here: the system's own login item is the truth (lib.rs, autostart).
 
 use std::fs;
@@ -22,8 +23,12 @@ pub enum Appearance {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    /// Minutes without an AI call before an account is signed out.
+    /// Minutes without an AI call before an account is signed out. Not used while `keep_signed_in` is on.
     pub idle_minutes: u32,
+    /// Blijf ingelogd: no idle sign-out, and EB MCP asks e-Boekhouden every few minutes whether each session
+    /// still stands, so it does not lapse there for lack of use. Off unless the user turns it on: a session
+    /// that stays open is a session an AI client can use at any time.
+    pub keep_signed_in: bool,
     pub appearance: Appearance,
     /// macOS: an icon in the Dock as well as in the menu bar. On by default (Sherin, 2026-11-10).
     pub show_in_dock: bool,
@@ -33,6 +38,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             idle_minutes: 30,
+            keep_signed_in: false,
             appearance: Appearance::System,
             show_in_dock: true,
         }
@@ -95,10 +101,12 @@ mod tests {
         store
             .set(Settings {
                 idle_minutes: 60,
+                keep_signed_in: true,
                 appearance: Appearance::Dark,
                 show_in_dock: true,
             })
             .unwrap();
+        assert!(SettingsStore::open(&dir).get().keep_signed_in);
         assert_eq!(SettingsStore::open(&dir).get().idle_minutes, 60);
         assert_eq!(SettingsStore::open(&dir).get().appearance, Appearance::Dark);
         assert!(SettingsStore::open(&dir).get().show_in_dock);
@@ -116,10 +124,14 @@ mod older_files {
             settings,
             Settings {
                 idle_minutes: 15,
+                // Staying signed in is a choice: a file from before it has it off.
+                keep_signed_in: false,
                 appearance: Appearance::System,
                 show_in_dock: true,
             }
         );
+        let kept: Settings = serde_json::from_str(r#"{"keepSignedIn": true}"#).unwrap();
+        assert!(kept.keep_signed_in);
     }
 
     #[test]
