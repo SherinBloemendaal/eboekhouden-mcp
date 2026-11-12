@@ -156,7 +156,6 @@ icpopgave/regels/id/{}/{}/gridtable
 icpopgave/regels/{}
 icpopgave/regels/{}/{}/gridtable
 icpopgave/{}
-icpopgave/{}/{}/{}
 incassobeheerdossier/get
 incassobestand/oud/{}
 instelling

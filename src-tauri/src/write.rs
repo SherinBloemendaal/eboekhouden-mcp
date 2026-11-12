@@ -275,7 +275,28 @@ impl Books {
 // ---------------------------------------------------------------- small helpers
 
 fn round2(amount: f64) -> f64 {
-    (amount * 100.0).round() / 100.0
+    round_cents(amount)
+}
+
+/// An amount in whole cents, rounded the way e-Boekhouden's own forms do it (`round(n, 2)` in the web app):
+/// the amount in cents is first written with three decimals, which takes the float error out, and then
+/// goes up from a first decimal of 5, away from zero. So 3,50 plus 21% (4,235, held as 423.49999999999994
+/// cents) becomes 4,24 as on their screen, where plain rounding gives 4,23.
+pub(crate) fn round_cents(amount: f64) -> f64 {
+    let text = format!("{:.3}", amount * 100.0);
+    let Some((whole, decimals)) = text.split_once('.') else {
+        return amount;
+    };
+    let negative = whole.starts_with('-');
+    let cents: f64 = whole.parse().unwrap_or(0.0);
+    let up = decimals.as_bytes().first().is_some_and(|d| *d >= b'5');
+    let cents = match (up, negative) {
+        (true, true) => cents - 1.0,
+        (true, false) => cents + 1.0,
+        (false, _) => cents,
+    };
+    let rounded = cents / 100.0;
+    if rounded == 0.0 { 0.0 } else { rounded }
 }
 
 fn round4(amount: f64) -> f64 {
@@ -2408,6 +2429,22 @@ pub fn abonnementen_factureren(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rounds_cents_as_e_boekhoudens_forms_do() {
+        // 3,50 excl. 21% btw: 4,235 is held just under it, and their form still shows 4,24.
+        assert_eq!(round_cents(3.50 * 1.21), 4.24);
+        assert_eq!(round_cents(4.235), 4.24);
+        assert_eq!(round_cents(4.234), 4.23);
+        assert_eq!(round_cents(1.005), 1.01);
+        assert_eq!(round_cents(2.0), 2.0);
+        assert_eq!(round_cents(0.004), 0.0);
+        // Away from zero for a negative amount, and never a negative zero.
+        assert_eq!(round_cents(-4.235), -4.24);
+        assert_eq!(round_cents(-0.005), -0.01);
+        assert!(round_cents(-0.001).is_sign_positive());
+        assert_eq!(round2(3.50 * 1.21), 4.24);
+    }
 
     /// The rekeningschema and btw codes of the test administration, in the API's own shapes.
     fn books() -> Books {

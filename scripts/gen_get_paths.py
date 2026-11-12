@@ -39,6 +39,9 @@ def main(src: str) -> None:
                 continue
             if not path or path.startswith("{") or DENY.search(path):
                 continue
+            # Opening an ICP period (icpopgave/{jaar}/{type}/{id}) may create the opgave.
+            if re.fullmatch(r"icpopgave(/\{[^}]*\}){3}", path, re.I):
+                continue
             path = re.sub(r"\{[^}]*\}", "{}", path)
             if re.fullmatch(r"[A-Za-z0-9_\-]+(/([A-Za-z0-9_\-.]+|\{\}))*", path):
                 out.add(path)

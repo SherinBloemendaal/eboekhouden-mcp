@@ -2272,7 +2272,7 @@ impl EbMcp {
     // The list behind Boekhouden > Importeren in e-Boekhouden's own app (`import/gridtable`). Only the read: the
     // paths that process, book or delete these lines (`import/verwerk`, `import/bulk/wegboeken`) are never called.
     #[tool(
-        description = "Geïmporteerde bankregels (afschriftregels) die nog niet verwerkt zijn tot een mutatie. Per regel: id, datum (van de import), rekening (IBAN van de eigen bankrekening), mutDatum (boekdatum), mutBedrag (negatief is af), mutOmschrijving (met naam en IBAN van de tegenpartij), mutFactuur, grootboekId, opmerking, hasFiles en verwerkFailureReason. Te filteren op boekdatum en omschrijving. Alleen lezen: verwerken of wegboeken kan EB MCP niet.",
+        description = "Geïmporteerde bankregels (afschriftregels) die nog niet verwerkt zijn tot een mutatie. Per regel: id, datum (van de import), rekening (IBAN van de eigen bankrekening), mutDatum (boekdatum), mutBedrag (negatief is af), mutOmschrijving (met naam en IBAN van de tegenpartij), mutFactuur, grootboekId, opmerking, hasFiles en verwerkFailureReason. Te filteren op boekdatum en omschrijving. Alleen lezen. Eén regel verwerken kan met mutatie_toevoegen (bankregel_id); alle regels opnieuw door de automatische importregels halen kan met importregels_verwerken.",
         annotations(title = "Bankregels", read_only_hint = true)
     )]
     async fn bankregels(
@@ -4618,6 +4618,8 @@ mod tests {
             "voorraad/actualiseer",
             "apiinfo/getByKey/abc",
             "ibanxs/newConsent",
+            // Opening an ICP period may make the opgave: only the ICP tools read it, and say so.
+            "icpopgave/2026/K/1",
             // An action word where the map has an id.
             "aangifte/pay",
             "factuur/verwijder",
