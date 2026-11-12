@@ -213,10 +213,9 @@ fn checks_new_values_as_the_form_does() {
     assert_eq!(check("iban", "").unwrap(), "");
     assert_eq!(check("bic", "rabonl2u").unwrap(), "RABONL2U");
     assert!(check("bic", "RABO").is_err());
-    assert!(
-        check("email", "geen adres")
-            .unwrap_err()
-            .contains("geen geldig e-mailadres")
+    assert_eq!(
+        check("email", "lisa@").unwrap_err(),
+        "lisa@ is geen geldig e-mailadres"
     );
     assert!(
         check("email", "")
@@ -334,7 +333,13 @@ fn only_a_real_answer_counts_as_saved() {
     assert!(saved(json!(true)).is_ok());
     assert!(saved(json!({"id": 1})).is_ok());
     for bad in [Value::Null, json!(false), json!("")] {
-        assert!(matches!(saved(bad), Err(Halt::Error(_))));
+        let Err(Halt::Error(message)) = saved(bad) else {
+            panic!("an empty answer counted as saved");
+        };
+        assert!(
+            message.contains("niet bekend") && !message.contains("niets gewijzigd"),
+            "{message}"
+        );
     }
 }
 
@@ -358,88 +363,100 @@ fn checks_numbers_like_the_web_app() {
 
 // ------------------------------------------------------------ end to end, with a stand-in for e-Boekhouden
 
-/// What the stand-in was asked to change, in order: "PUT path?query body".
+/// What the stand-in was asked to change, in order: every request that is not a GET, as "METHOD path?query body".
 type Seen = Arc<Mutex<Vec<String>>>;
 
-async fn mock(seen: Seen) -> String {
-    use axum::extract::{Path, Query, RawQuery};
-    use axum::routing::get;
-    use std::collections::HashMap;
-    let (put1, put2) = (seen.clone(), seen.clone());
-    let app = axum::Router::new()
-        .route(
-            "/v1/api/administratie/mijngegevens",
-            get(|Query(query): Query<HashMap<String, String>>| async move {
-                // The administration's own details only with adm=true.
-                if query.get("adm").map(String::as_str) != Some("true") {
-                    return axum::Json(json!({"bedrijf": "Accountantskantoor"}));
+/// How the stand-in answers `GET bic`.
+#[derive(Clone, Copy)]
+enum BicAnswer {
+    /// The BIC of the bank, for the one IBAN it knows; an empty answer for any other.
+    Known,
+    /// A BIC that is not one.
+    Invalid,
+    /// A server error.
+    Fails,
+}
+
+/// What the stand-in serves; a test changes it between the proposal and the approval.
+struct Stub {
+    administratie: Mutex<Value>,
+    factuuradres: Mutex<Value>,
+    bic: Mutex<BicAnswer>,
+}
+
+fn factuuradres_model() -> Value {
+    json!({"bedrijf": "Studio Noord", "contactpersoon": "Lisa", "geslacht": "v", "adres": "Oude Gracht 1", "postcode": "3511 AA", "plaats": "Utrecht", "land": "Nederland", "telefoon": "030", "mobiel": "", "emailFactuur": "factuur@studionoord.example", "fax": ""})
+}
+
+/// A stand-in for e-Boekhouden's API: it answers the reads of this part, and keeps every change it gets, on any
+/// path and with any method, so a stray write cannot go unnoticed.
+async fn mock(seen: Seen, stub: Arc<Stub>) -> String {
+    use axum::http::{Method, StatusCode, Uri, header};
+    use axum::response::IntoResponse;
+    let app = axum::Router::new().fallback(
+        move |method: Method, uri: Uri, body: axum::body::Bytes| {
+            let (seen, stub) = (seen.clone(), stub.clone());
+            async move {
+                let path = uri.path().trim_start_matches("/v1/api/").to_owned();
+                let query = uri.query().unwrap_or_default().to_owned();
+                if method != Method::GET {
+                    let body = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+                    let shown = if query.is_empty() {
+                        format!("{method} {path} {body}")
+                    } else {
+                        format!("{method} {path}?{query} {body}")
+                    };
+                    seen.lock().unwrap().push(shown);
+                    return axum::Json(json!(true)).into_response();
                 }
-                axum::Json(administratie())
-            })
-            .put(move |RawQuery(query): RawQuery, axum::Json(body): axum::Json<Value>| {
-                let seen = put1.clone();
-                async move {
-                    seen.lock().unwrap().push(format!(
-                        "PUT administratie/mijngegevens?{} {body}",
-                        query.unwrap_or_default()
-                    ));
-                    axum::Json(json!(true))
-                }
-            }),
-        )
-        .route(
-            "/v1/api/bic",
-            get(|Query(query): Query<HashMap<String, String>>| async move {
-                axum::Json(json!(match query.get("iban").map(String::as_str) {
-                    Some("NL18RABO0123459876") => "RABONL2U",
-                    _ => "",
-                }))
-            }),
-        )
-        .route(
-            "/v1/api/skillsource/relatie/mijngegevens/factuuradres",
-            get(|| async {
-                axum::Json(json!({"bedrijf": "Studio Noord", "contactpersoon": "Lisa", "geslacht": "v", "adres": "Oude Gracht 1", "postcode": "3511 AA", "plaats": "Utrecht", "land": "Nederland", "telefoon": "030", "mobiel": "", "emailFactuur": "factuur@studionoord.example", "fax": ""}))
-            })
-            .put(move |axum::Json(body): axum::Json<Value>| {
-                let seen = put2.clone();
-                async move {
-                    seen.lock().unwrap().push(format!(
-                        "PUT skillsource/relatie/mijngegevens/factuuradres {body}"
-                    ));
-                    axum::Json(json!(true))
-                }
-            }),
-        )
-        .route(
-            "/v1/api/skillsource/factuur/recent/gridtable",
-            get(|| async {
-                axum::Json(json!({"colMetadata": [{"name": "id"}, {"name": "datum"}, {"name": "nummer"}, {"name": "periode"}, {"name": "totaal"}, {"name": "voldaan"}],
-                                  "data": [[8812, "2026-10-01T00:00:00", "SK-104", "okt 2026", 15.73, 15.73]], "rowCount": 1}))
-            }),
-        )
-        .route(
-            "/v1/api/skillsource/openstaandeposten/gridtable",
-            get(|| async {
-                axum::Json(json!({"colMetadata": [{"name": "id"}, {"name": "nummer"}, {"name": "totaal"}],
-                                  "data": [[8813, "SK-105", 15.73]], "rowCount": 1}))
-            }),
-        )
-        .route(
-            "/v1/api/SkillSource/factuur/recent/pdf/{id}",
-            get(|Path(id): Path<u64>| async move {
-                (
-                    [
-                        (axum::http::header::CONTENT_TYPE, "application/pdf".to_owned()),
+                match path.as_str() {
+                    // The administration's own details only with adm=true.
+                    "administratie/mijngegevens" if query == "adm=true" => {
+                        axum::Json(stub.administratie.lock().unwrap().clone()).into_response()
+                    }
+                    "administratie/mijngegevens" => {
+                        axum::Json(json!({"bedrijf": "Accountantskantoor"})).into_response()
+                    }
+                    "bic" => match *stub.bic.lock().unwrap() {
+                        BicAnswer::Known if query == "iban=NL18RABO0123459876" => {
+                            axum::Json(json!("RABONL2U")).into_response()
+                        }
+                        BicAnswer::Known => axum::Json(json!("")).into_response(),
+                        BicAnswer::Invalid => axum::Json(json!("RABO-NL")).into_response(),
+                        BicAnswer::Fails => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    },
+                    "skillsource/relatie/mijngegevens/factuuradres" => {
+                        axum::Json(stub.factuuradres.lock().unwrap().clone()).into_response()
+                    }
+                    "skillsource/factuur/recent/gridtable" => axum::Json(json!({
+                        "colMetadata": [{"name": "id"}, {"name": "datum"}, {"name": "nummer"}, {"name": "periode"}, {"name": "totaal"}, {"name": "voldaan"}],
+                        "data": [[8812, "2026-10-01T00:00:00", "SK-104", "okt 2026", 15.73, 15.73]], "rowCount": 1
+                    }))
+                    .into_response(),
+                    "skillsource/openstaandeposten/gridtable" => axum::Json(json!({
+                        "colMetadata": [{"name": "id"}, {"name": "nummer"}, {"name": "totaal"}],
+                        "data": [[8813, "SK-105", 15.73]], "rowCount": 1
+                    }))
+                    .into_response(),
+                    pdf if pdf.starts_with("SkillSource/factuur/recent/pdf/") => {
+                        let id = pdf.rsplit('/').next().unwrap_or_default().to_owned();
                         (
-                            axum::http::header::CONTENT_DISPOSITION,
-                            format!("attachment; filename=SK-{id}.pdf"),
-                        ),
-                    ],
-                    b"%PDF-1.4 e-Boekhouden".to_vec(),
-                )
-            }),
-        );
+                            [
+                                (header::CONTENT_TYPE, "application/pdf".to_owned()),
+                                (
+                                    header::CONTENT_DISPOSITION,
+                                    format!("attachment; filename=SK-{id}.pdf"),
+                                ),
+                            ],
+                            b"%PDF-1.4 e-Boekhouden".to_vec(),
+                        )
+                            .into_response()
+                    }
+                    _ => StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        },
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -480,10 +497,15 @@ async fn changing_the_own_details_always_asks_and_sends_only_after_approval() {
     use std::sync::RwLock;
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let seen: Seen = Arc::default();
+    let stub = Arc::new(Stub {
+        administratie: Mutex::new(administratie()),
+        factuuradres: Mutex::new(factuuradres_model()),
+        bic: Mutex::new(BicAnswer::Known),
+    });
     let jar = Arc::new(crate::state::testing::FakeJar::default());
     let state = Arc::new(crate::state::testing::state_with(
         jar,
-        &mock(seen.clone()).await,
+        &mock(seen.clone(), stub.clone()).await,
     ));
     let input = |mode: WriteMode| AccountInput {
         label: "Studio Noord".into(),
@@ -731,6 +753,232 @@ async fn changing_the_own_details_always_asks_and_sends_only_after_approval() {
     assert!(result["content"][1]["resource"]["blob"].as_str().is_some());
     std::fs::remove_dir_all(&dir).unwrap();
 
-    // Nothing else was changed along the way.
+    // Refusing the invoice address sends nothing.
+    let (_, text, _) = call("factuuradres_wijzigen", json!({"telefoon": "030 999 0000"})).await;
+    assert!(text.contains("\"status\":\"wacht\""), "{text}");
+    let proposal = proposal_up("Factuuradres wijzigen");
+    assert!(state.approvals.decide(proposal.id, false, 4));
+    assert_eq!(
+        settled(&state, proposal.id).await.status,
+        approvals::Status::Refused
+    );
     assert_eq!(made().len(), 2);
+
+    // A BIC that is not found, not valid, or not to be looked up: the BIC stays, and the approval says so.
+    for (answer, iban, want) in [
+        (
+            BicAnswer::Known,
+            "NL20INGB0001234567",
+            "e-Boekhouden vond geen BIC bij het nieuwe IBAN; de BIC blijft ABNANL2A",
+        ),
+        (
+            BicAnswer::Invalid,
+            "NL18RABO0123459876",
+            "e-Boekhouden gaf bij het nieuwe IBAN geen geldige BIC (RABO-NL); de BIC blijft ABNANL2A",
+        ),
+        (
+            BicAnswer::Fails,
+            "NL18RABO0123459876",
+            "EB MCP kon de BIC bij het nieuwe IBAN niet opzoeken; de BIC blijft ABNANL2A",
+        ),
+    ] {
+        *stub.bic.lock().unwrap() = answer;
+        let (_, text, _) = call("bedrijfsgegevens_wijzigen", json!({"iban": iban})).await;
+        assert!(text.contains("\"status\":\"wacht\""), "{text}");
+        let proposal = proposal_up("Bedrijfsgegevens wijzigen: Studio Noord B.V.");
+        let shown = lines(&proposal);
+        assert!(
+            shown
+                .iter()
+                .any(|(label, value)| label == "BIC" && value.starts_with(want)),
+            "{want} not in {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|(label, _)| label == "BIC wordt"),
+            "{shown:?}"
+        );
+        assert_eq!(
+            state.approvals.get(proposal.id).unwrap().body["bic"],
+            "ABNANL2A"
+        );
+        assert!(state.approvals.decide(proposal.id, false, 5));
+        settled(&state, proposal.id).await;
+    }
+    *stub.bic.lock().unwrap() = BicAnswer::Known;
+    assert_eq!(made().len(), 2);
+
+    // Approved after another field changed in e-Boekhouden: refused after the approval, nothing goes out.
+    let (_, text, _) = call(
+        "bedrijfsgegevens_wijzigen",
+        json!({"website": "noord.example"}),
+    )
+    .await;
+    assert!(text.contains("\"status\":\"wacht\""), "{text}");
+    let proposal = proposal_up("Bedrijfsgegevens wijzigen: Studio Noord B.V.");
+    stub.administratie.lock().unwrap()["telefoon"] = json!("030 765 4321");
+    assert!(state.approvals.decide(proposal.id, true, 6));
+    let record = settled(&state, proposal.id).await;
+    assert_eq!(record.status, approvals::Status::Failed, "{record:?}");
+    let error = record.error.unwrap_or_default();
+    assert!(
+        error.contains("intussen gewijzigd in e-Boekhouden")
+            && error.contains("vraag de wijziging opnieuw aan"),
+        "{error}"
+    );
+    assert_eq!(made().len(), 2);
+
+    // Only the requested field changed meanwhile: the approved change still goes out, built on the fresh read.
+    *stub.administratie.lock().unwrap() = administratie();
+    let (_, text, _) = call(
+        "bedrijfsgegevens_wijzigen",
+        json!({"website": "noord.example"}),
+    )
+    .await;
+    assert!(text.contains("\"status\":\"wacht\""), "{text}");
+    let proposal = proposal_up("Bedrijfsgegevens wijzigen: Studio Noord B.V.");
+    stub.administratie.lock().unwrap()["website"] = json!("iets-anders.example");
+    assert!(state.approvals.decide(proposal.id, true, 7));
+    assert_eq!(
+        settled(&state, proposal.id).await.status,
+        approvals::Status::Done
+    );
+    let mut body = form_of(&administratie(), BEDRIJF, BEDRIJF_KEEP).unwrap();
+    body.insert("website".into(), json!("noord.example"));
+    assert_eq!(
+        made()[2],
+        format!(
+            "PUT administratie/mijngegevens?adm=true {}",
+            Value::Object(body)
+        )
+    );
+
+    // No invoice address yet (e-Boekhouden answers null): the required fields must be given, then it is made.
+    *stub.factuuradres.lock().unwrap() = Value::Null;
+    let (is_error, text, _) = call(
+        "factuuradres_wijzigen",
+        json!({"email": "f@studionoord.example"}),
+    )
+    .await;
+    assert!(
+        is_error && text.contains("Bedrijfsnaam is verplicht"),
+        "{text}"
+    );
+    assert_eq!(state.approvals.count(), 0);
+    let (_, text, _) = call(
+        "factuuradres_wijzigen",
+        json!({"bedrijf": "Studio Noord", "adres": "Oude Gracht 1", "postcode": "3511aa", "plaats": "Utrecht", "email": "f@studionoord.example"}),
+    )
+    .await;
+    assert!(text.contains("\"status\":\"wacht\""), "{text}");
+    let proposal = proposal_up("Factuuradres wijzigen");
+    assert!(lines(&proposal).contains(&("Adres was".to_owned(), "onbekend".to_owned())));
+    assert!(state.approvals.decide(proposal.id, true, 8));
+    assert_eq!(
+        settled(&state, proposal.id).await.status,
+        approvals::Status::Done
+    );
+    let body = json!({"bedrijf": "Studio Noord", "geslacht": "m", "adres": "Oude Gracht 1", "postcode": "3511 AA", "plaats": "Utrecht", "emailFactuur": "f@studionoord.example"});
+    assert_eq!(
+        made()[3],
+        format!("PUT skillsource/relatie/mijngegevens/factuuradres {body}")
+    );
+
+    // Nothing else was changed along the way, on any path or with any method.
+    assert_eq!(made().len(), 4);
+}
+
+#[test]
+fn a_null_under_one_name_does_not_hide_a_value_under_the_other() {
+    let read = json!({"bedrijf": "A", "telefoon": null, "telefoonnummer": "030", "mobiel": null, "fax": "", "faxnummer": "071"});
+    let form = form_of(&read, FACTUUR, &[]).unwrap();
+    assert_eq!(form.get("telefoonnummer"), Some(&json!("030")));
+    // Null under every name stays null; an empty text is a value and wins.
+    assert_eq!(form.get("mobielnummer"), Some(&Value::Null));
+    assert_eq!(form.get("faxnummer"), Some(&json!("")));
+}
+
+#[test]
+fn sends_after_the_approval_only_what_still_matches_the_fresh_read() {
+    let approved = merge(
+        &administratie(),
+        BEDRIJF,
+        BEDRIJF_KEEP,
+        vec![("adres", "Nieuwe Gracht 12".into())],
+    )
+    .unwrap();
+    let approved_body = Value::Object(approved.body);
+    // Unchanged: the same body goes out.
+    let body = rebuild(
+        &administratie(),
+        BEDRIJF,
+        BEDRIJF_KEEP,
+        &approved_body,
+        &approved.changed,
+        "bedrijfsgegevens",
+    );
+    assert_eq!(body.ok(), Some(approved_body.clone()));
+    // Fields outside the form (incasso, id) may change; they never go back anyway.
+    let mut fresh = administratie();
+    fresh["incassoRekening"] = json!("NL20INGB0001234567");
+    assert!(
+        rebuild(
+            &fresh,
+            BEDRIJF,
+            BEDRIJF_KEEP,
+            &approved_body,
+            &approved.changed,
+            "bedrijfsgegevens"
+        )
+        .is_ok()
+    );
+    // A form field, a kept field, or a field that appeared: refused.
+    for (key, value) in [
+        ("plaats", json!("Zeist")),
+        ("klantcode", json!("K9")),
+        ("bic", Value::Null),
+    ] {
+        let mut fresh = administratie();
+        fresh[key] = value;
+        let Err(Halt::Error(message)) = rebuild(
+            &fresh,
+            BEDRIJF,
+            BEDRIJF_KEEP,
+            &approved_body,
+            &approved.changed,
+            "bedrijfsgegevens",
+        ) else {
+            panic!("{key} changed but the change went through");
+        };
+        assert!(
+            message.starts_with("De bedrijfsgegevens zijn intussen gewijzigd in e-Boekhouden"),
+            "{message}"
+        );
+    }
+    let mut fresh = administratie();
+    fresh.as_object_mut().unwrap().remove("telefoon");
+    assert!(
+        rebuild(
+            &fresh,
+            BEDRIJF,
+            BEDRIJF_KEEP,
+            &approved_body,
+            &approved.changed,
+            "bedrijfsgegevens"
+        )
+        .is_err()
+    );
+    // The requested field itself may differ now: the approved value goes out.
+    let mut fresh = administratie();
+    fresh["adres"] = json!("Elders 3");
+    let Ok(body) = rebuild(
+        &fresh,
+        BEDRIJF,
+        BEDRIJF_KEEP,
+        &approved_body,
+        &approved.changed,
+        "bedrijfsgegevens",
+    ) else {
+        panic!("refused a change of the requested field only");
+    };
+    assert_eq!(body["adres"], "Nieuwe Gracht 12");
 }
