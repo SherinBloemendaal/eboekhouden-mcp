@@ -80,7 +80,7 @@ const seen = new Set<number>()
 let primed = false
 
 function toast(proposal: Proposal): Toast {
-  return { id: proposal.id, title: proposal.title, text: `${proposal.account} · ${proposal.client}`, action: 'Bekijken', icon: 'clipboard-check' }
+  return { id: proposal.id, title: proposal.title, text: `Voorstel ${proposal.id} · ${proposal.account} · ${proposal.client}`, action: 'Bekijken', icon: 'clipboard-check' }
 }
 
 // Each read of the queue (connectApprovals above starts one) counts; a list read before this shell mounted does not.
