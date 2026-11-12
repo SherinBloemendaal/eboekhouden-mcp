@@ -17,7 +17,8 @@ mod tests;
 use built::{
     Aanmaansjabloon, BerichtActie, Kant, Ontvanger, Post, Tegenrekening, aanmaning, accountant,
     afboeken, afgeboekt, antwoord_onderwerp, berichten_actie, check_wanted, controle_aanvraag,
-    controle_beoordeling, field, find_posten, moment, pick_tegenrekening, relatie_ids, rows, text,
+    controle_beoordeling, field, find_posten, is_accountant, moment, pick_tegenrekening,
+    relatie_ids, rows, text, verzonden,
 };
 
 /// The tools of this part that only read.
@@ -210,6 +211,11 @@ pub struct ControleopdrachtBeoordelenArgs {
     pub account: Option<String>,
 }
 
+/// The refusals for an accountant's login: e-Boekhouden's own pages work differently for an accountant.
+const ACCOUNTANT_BERICHT: &str = "Dit account is van een accountant. Een accountant kiest in e-Boekhouden bij elk bericht de administratie waar het heen gaat, en dat kan EB MCP niet; verstuur het bericht in e-Boekhouden zelf.";
+const ACCOUNTANT_CONTROLE: &str = "Dit account is van een accountant. Een controle-opdracht vraagt een administratie aan haar accountant; e-Boekhouden biedt dat een accountant niet aan. Beoordeel opdrachten van klanten met controleopdracht_beoordelen.";
+const GEEN_ACCOUNTANT: &str = "Dit account is niet van een accountant. Alleen een accountant beoordeelt controle-opdrachten; e-Boekhouden toont dat scherm alleen aan accountants.";
+
 /// A grid query with room for every row e-Boekhouden gives in one page.
 fn page(offset: u32) -> Vec<(String, String)> {
     vec![
@@ -279,6 +285,29 @@ impl EbMcp {
         find_posten(&wanted, &open)
     }
 
+    /// Whether the signed-in user is an accountant, from `POST auth`: the check e-Boekhouden's own app makes at
+    /// startup (`isAccountant`). It changes nothing.
+    async fn opa_is_accountant(&self, run: &Run) -> Result<bool, String> {
+        let call = self
+            .state
+            .api_send(
+                run.account.id,
+                "POST",
+                "auth",
+                &[],
+                None,
+                Some(run.id),
+                &run.client,
+            )
+            .await;
+        match (call.ok(), call.json) {
+            (true, Some(auth)) => Ok(is_accountant(&auth)),
+            _ => Err(call
+                .error
+                .unwrap_or_else(|| format!("e-Boekhouden gaf {} op auth", call.status))),
+        }
+    }
+
     /// The accountant a message or a check request goes to, or a refusal when the administration has none.
     async fn opa_accountant(&self, run: &Run) -> Result<String, String> {
         let info = self
@@ -324,7 +353,7 @@ impl EbMcp {
 #[tool_router(router = open_posten_acties_router, vis = "pub(super)")]
 impl EbMcp {
     #[tool(
-        description = "Een herinnering of aanmaning per e-mail versturen vanuit e-Boekhouden, voor één of meer open posten van debiteuren (uit open_posten), zoals Aanmanen per e-mail op de open posten in e-Boekhouden. De tekst komt uit een aanmaansjabloon per e-mail (sjablonen met soort aanmaan; maak er een met sjabloon_toevoegen); e-Boekhouden vult de codes per relatie in en stuurt per relatie één e-mail naar het e-mailadres van de relatie. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de ontvangers, het sjabloon met onderwerp en tekst, en de facturen met hun openstaande bedragen. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een herinnering of aanmaning per e-mail versturen vanuit e-Boekhouden, voor één of meer open posten van debiteuren (uit open_posten), zoals Aanmanen per e-mail op de open posten in e-Boekhouden. De tekst komt uit een aanmaansjabloon per e-mail (sjablonen met soort aanmaan; maak er een met sjabloon_toevoegen); e-Boekhouden vult de codes per relatie en factuur in en kiest zelf naar welk e-mailadres van de relatie de mail gaat. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de relaties met de e-mailadressen die EB MCP van ze kent, het sjabloon met onderwerp en tekst, en de facturen met hun openstaande bedragen. Is de uitkomst onbekend, kijk dan eerst met aanmaning_historie of de herinnering al is verstuurd voordat je het opnieuw probeert. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Herinnering versturen",
             read_only_hint = false,
@@ -340,7 +369,7 @@ impl EbMcp {
     ) -> Result<CallToolResult, McpError> {
         const TOOL: &str = "aanmaning_versturen";
         let account = args.account.clone();
-        self.write_tool(&context, TOOL, account.as_deref(), args, "Herinneringen verstuurd per e-mail", move |this, run, args| async move {
+        self.write_tool(&context, TOOL, account.as_deref(), args, "Herinneringen aangeboden aan e-Boekhouden; data.uitkomst zegt wat er is verstuurd", move |this, run, args| async move {
             let posten = this.opa_open_posten(&run, Kant::Debiteuren, &args.posten).await?;
             // The templates the aanmaning form offers for e-mail; the first is its default.
             let choices = rows(&this.fetch(&run, "aanmaansjabloon/soort/E", Vec::new()).await?);
@@ -384,16 +413,9 @@ impl EbMcp {
             )?;
             this.approve(&run, TOOL, &built, true).await?;
             let sent = this.change(&run, "POST", "OpenPost/aanmaning", Some(&built.body)).await?;
-            let verstuurd = sent.get("sendEmails").and_then(Value::as_u64).unwrap_or(0);
-            let zonder = sent.get("noEmail").and_then(Value::as_u64).unwrap_or(0);
-            if verstuurd == 0 {
-                return Err(Halt::Error(if zonder > 0 {
-                    format!("e-Boekhouden heeft geen herinnering verstuurd: {zonder} relatie(s) zonder e-mailadres")
-                } else {
-                    "e-Boekhouden heeft geen herinnering verstuurd en gaf geen uitleg".to_owned()
-                }));
-            }
-            Ok(json!({"verstuurd": verstuurd, "niet_verstuurd_zonder_emailadres": zonder}))
+            // Only an answer that says so means nothing went out; anything else may have sent mail, and is
+            // reported as unknown so nobody sends the same reminder twice.
+            verzonden(&sent).map_err(Halt::Error)
         })
         .await
     }
@@ -503,9 +525,12 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Eén bericht lezen, op id (uit berichten): van, aan, datum, onderwerp en de tekst (body, en als platte tekst in tekst).",
+        description = "Eén bericht lezen, op id (uit berichten): van, aan, datum, onderwerp en de tekst (body, platte tekst). Dit is dezelfde vraag die e-Boekhouden stelt als de gebruiker het bericht opent; of e-Boekhouden het bericht daarbij als gelezen markeert, is niet bekend. Verder verandert er niets.",
         annotations(title = "Bericht", read_only_hint = true)
     )]
+    // Kept read-only: it asks exactly what e-Boekhouden's own page asks when the user opens a message, and it
+    // changes nothing in the books. The most it can change is the message's read mark, which the description
+    // says; treating every look at a message as a change to approve would cost more than it protects.
     async fn bericht(
         &self,
         Parameters(args): Parameters<IdArgs>,
@@ -516,18 +541,8 @@ impl EbMcp {
             Err(answer) => return Ok(answer),
         };
         let path = format!("bericht/{}", args.id);
-        let result = self
-            .fetch(&run, &path, Vec::new())
-            .await
-            .map(|mut bericht| {
-                let tekst = field(&bericht, "body")
-                    .and_then(Value::as_str)
-                    .map(plain_text);
-                if let (Some(tekst), Some(object)) = (tekst, bericht.as_object_mut()) {
-                    object.insert("tekst".into(), json!(tekst));
-                }
-                bericht
-            });
+        // The page shows `body` as it is (plain text, line breaks kept), so it is passed on untouched.
+        let result = self.fetch(&run, &path, Vec::new()).await;
         Ok(self.end(run, &path, result))
     }
 
@@ -580,7 +595,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een bericht versturen aan de accountant van de administratie, via e-Boekhouden (Overig > Berichten), of een bericht beantwoorden (antwoord_op). Alleen voor een administratie die aan een accountant gekoppeld is; het bericht gaat altijd naar die accountant. Dit verstuurt een bericht en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de ontvanger, het onderwerp en de tekst. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een bericht versturen aan de accountant van de administratie, via e-Boekhouden (Overig > Berichten), of een bericht beantwoorden (antwoord_op). Alleen voor een administratie die aan een accountant gekoppeld is, niet voor de login van een accountant; het bericht gaat altijd naar die accountant. Bij antwoord_op leest EB MCP eerst het oorspronkelijke bericht, zoals e-Boekhouden doet als je het opent. Dit verstuurt een bericht en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de ontvanger, het onderwerp en de tekst. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Bericht versturen",
             read_only_hint = false,
@@ -603,12 +618,19 @@ impl EbMcp {
             args,
             "Bericht verstuurd; data.id is het id",
             move |this, run, args| async move {
+                if this.opa_is_accountant(&run).await? {
+                    return Err(Halt::Error(ACCOUNTANT_BERICHT.into()));
+                }
                 let given = args
                     .onderwerp
                     .as_deref()
                     .map(str::trim)
                     .filter(|o| !o.is_empty())
                     .map(str::to_owned);
+                if given.is_none() && args.antwoord_op.is_none() {
+                    return Err(Halt::Error("Geef een onderwerp".into()));
+                }
+                let aan = this.opa_accountant(&run).await?;
                 let (onderwerp, original) = match args.antwoord_op {
                     Some(id) => {
                         let original = this
@@ -636,12 +658,8 @@ impl EbMcp {
                             Some(about),
                         )
                     }
-                    None => (
-                        given.ok_or_else(|| Halt::Error("Geef een onderwerp".into()))?,
-                        None,
-                    ),
+                    None => (given.unwrap_or_default(), None),
                 };
-                let aan = this.opa_accountant(&run).await?;
                 let built = built::bericht(&aan, &onderwerp, &args.bericht, original.as_deref())?;
                 this.approve(&run, TOOL, &built, true).await?;
                 this.change(&run, "POST", "bericht", Some(&built.body))
@@ -704,7 +722,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "De accountant vragen een maand of kwartaal te controleren (een controle-opdracht), met een opmerking erbij. Alleen voor een administratie die aan een accountant gekoppeld is. Dit stuurt een verzoek naar de accountant en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de accountant, de periode en de opmerking. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "De accountant vragen een maand of kwartaal te controleren (een controle-opdracht), met een opmerking erbij. Alleen voor een administratie die aan een accountant gekoppeld is, niet voor de login van een accountant. Dit stuurt een verzoek naar de accountant en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de accountant, de periode en de opmerking. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Controle-opdracht aanvragen",
             read_only_hint = false,
@@ -739,6 +757,9 @@ impl EbMcp {
                     &opmerking,
                     today(),
                 )?;
+                if this.opa_is_accountant(&run).await? {
+                    return Err(Halt::Error(ACCOUNTANT_CONTROLE.into()));
+                }
                 let aan = this.opa_accountant(&run).await?;
                 let built = controle_aanvraag(
                     &aan,
@@ -782,6 +803,9 @@ impl EbMcp {
             "Controle-opdracht beoordeeld",
             move |this, run, args| async move {
                 let opmerking = args.opmerking.clone().unwrap_or_default();
+                if !this.opa_is_accountant(&run).await? {
+                    return Err(Halt::Error(GEEN_ACCOUNTANT.into()));
+                }
                 let opdracht = this
                     .fetch(&run, &format!("controleopdracht/{}", args.id), Vec::new())
                     .await?;

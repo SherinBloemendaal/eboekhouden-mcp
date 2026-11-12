@@ -124,8 +124,20 @@ fn a_reminder_names_template_recipients_and_amounts() {
         Some("Beste [NAAM],\nFactuur [FACTNUMMER] staat nog open: [OPENSTAAND].")
     );
     assert_eq!(
-        label(&built, "Aan Bakkerij Jansen"),
-        Some("debiteuren@jansen.example (voor herinneringen), info@jansen.example (algemeen)")
+        label(&built, "Relatie Bakkerij Jansen"),
+        Some(
+            "bekende e-mailadressen: debiteuren@jansen.example (herinneringen), info@jansen.example (algemeen)"
+        )
+    );
+    assert!(
+        label(&built, "Ontvanger")
+            .unwrap()
+            .contains("e-Boekhouden kiest zelf")
+    );
+    assert!(
+        built.lines.iter().all(|l| !l.label.starts_with("Aan ")),
+        "no line claims who receives the mail: {:?}",
+        built.lines
     );
     assert_eq!(
         label(&built, "Factuur F001"),
@@ -194,9 +206,9 @@ fn a_reminder_without_address_or_debt_is_refused() {
     )
     .unwrap();
     assert!(
-        label(&built, "Aan Slagerij Pietersen")
+        label(&built, "Relatie Slagerij Pietersen")
             .unwrap()
-            .contains("verstuurt deze niet")
+            .contains("verstuurt dan niets")
     );
 }
 
@@ -312,6 +324,93 @@ fn writing_off_sends_one_item_per_post_and_shows_what_stays_open() {
     )
     .unwrap_err();
     assert!(nothing.contains("niets af te boeken"));
+}
+
+#[test]
+fn says_nothing_was_sent_only_when_e_boekhouden_says_so() {
+    assert_eq!(
+        verzonden(&json!({"sendEmails": 2, "noEmail": 1})).unwrap(),
+        json!({"uitkomst": "verstuurd", "verstuurd": 2, "niet_verstuurd_zonder_emailadres": 1})
+    );
+    assert_eq!(
+        verzonden(&json!({"SendEmails": 1})).unwrap()["uitkomst"],
+        "verstuurd"
+    );
+    let none = verzonden(&json!({"sendEmails": 0, "noEmail": 3})).unwrap_err();
+    assert!(
+        none.contains("geen herinnering verstuurd") && none.contains("3"),
+        "{none}"
+    );
+    assert!(verzonden(&json!({"sendEmails": 0})).is_err());
+    // An answer that does not say how many went out may have sent mail: unknown, with the advice to look first.
+    for odd in [
+        Value::Null,
+        json!(true),
+        json!({}),
+        json!({"sendEmails": "1"}),
+        json!({"sendEmails": null}),
+    ] {
+        let outcome = verzonden(&odd).unwrap();
+        assert_eq!(outcome["uitkomst"], "onbekend", "{odd}");
+        assert!(
+            outcome["let_op"]
+                .as_str()
+                .unwrap()
+                .contains("aanmaning_historie"),
+            "{outcome}"
+        );
+    }
+}
+
+#[test]
+fn knows_an_accountant_from_the_auth_answer() {
+    assert!(is_accountant(&json!({"valid": true, "isAccountant": true})));
+    assert!(is_accountant(&json!({"isAccountant": 1})));
+    assert!(!is_accountant(
+        &json!({"valid": true, "isAccountant": false})
+    ));
+    assert!(!is_accountant(&json!({"valid": true})));
+    assert!(!is_accountant(&json!({"isAccountant": 0})));
+}
+
+#[test]
+fn an_own_amount_stays_within_what_is_open_and_in_its_direction() {
+    let tegen = pick_tegenrekening(&rekeningen(), None).unwrap();
+    let afboek = |kant, open: f64, bedrag: f64| {
+        afboeken(
+            kant,
+            &[post("F1", 7, open)],
+            &tegen,
+            (2026, 1, 2),
+            "x",
+            Some(bedrag),
+        )
+    };
+    // Part of a debt, and all of it.
+    assert_eq!(
+        afboek(Kant::Debiteuren, 100.0, 40.0).unwrap().body[0]["bedrag"],
+        40.0
+    );
+    assert_eq!(
+        afboek(Kant::Debiteuren, 100.0, 100.0).unwrap().body[0]["bedrag"],
+        100.0
+    );
+    // A creditor post open at -500: written off with a negative amount, never with +500.
+    let crediteur = afboek(Kant::Crediteuren, -500.0, -120.0).unwrap();
+    assert_eq!(crediteur.body[0]["bedrag"], -120.0);
+    assert_eq!(crediteur.body[0]["crediteuren"], true);
+    for (kant, open, bedrag) in [
+        (Kant::Crediteuren, -500.0, 500.0),
+        (Kant::Debiteuren, 100.0, -10.0),
+        (Kant::Debiteuren, 100.0, 100.01),
+        (Kant::Crediteuren, -500.0, -500.5),
+    ] {
+        let refused = afboek(kant, open, bedrag).unwrap_err();
+        assert!(
+            refused.contains("past niet bij wat er open staat"),
+            "{refused}"
+        );
+    }
 }
 
 #[test]
@@ -446,15 +545,17 @@ mod end_to_end {
 
     /// What the stand-in for e-Boekhouden was sent: method and path, with the query for a read, and the body.
     type Seen = Arc<Mutex<Vec<(String, Value)>>>;
+    /// Answers that replace the stand-in's own, by "METHOD path".
+    type Answers = Arc<Mutex<std::collections::HashMap<String, Value>>>;
 
     /// A stand-in for e-Boekhouden with one open post (F001 of relatie 7), a reminder template, a ledger account
     /// for writing off, a message in the inbox and an accountant.
-    async fn eboekhouden(seen: Seen) -> String {
+    async fn eboekhouden(seen: Seen, answers: Answers) -> String {
         use axum::http::{Method, Uri};
         use axum::response::IntoResponse;
         let app = axum::Router::new().fallback(
             move |method: Method, uri: Uri, body: axum::body::Bytes| {
-                let seen = seen.clone();
+                let (seen, answers) = (seen.clone(), answers.clone());
                 async move {
                     let path = uri.path().trim_start_matches("/v1/api/").to_owned();
                     let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -463,6 +564,9 @@ mod end_to_end {
                         _ => format!("{method} {path}"),
                     };
                     seen.lock().unwrap().push((what, body));
+                    if let Some(answer) = answers.lock().unwrap().get(&format!("{method} {path}")) {
+                        return axum::Json(answer.clone()).into_response();
+                    }
                     let answer = match (method.as_str(), path.as_str()) {
                         ("GET", "openpost/gridtable/openpost") => json!({
                             "colMetadata": [{"name": "mutFactuur"}, {"name": "relatieId"}, {"name": "bedrijf"}, {"name": "sBedrag"}, {"name": "sBetaald"}, {"name": "teOntvangen"}, {"name": "vervaldatum"}],
@@ -482,10 +586,13 @@ mod end_to_end {
                             "colMetadata": [{"name": "id"}, {"name": "datum"}, {"name": "onderwerp"}],
                             "data": [[31, "2026-11-10T09:15:00", "Btw Q3"]]
                         }),
-                        ("GET", "bericht/31") => json!({"id": 31, "onderwerp": "Btw Q3", "van": "Cijfers & Co", "body": "<p>Klopt de btw?</p>"}),
+                        ("GET", "bericht/31") => json!({"id": 31, "onderwerp": "Btw Q3", "van": "Cijfers & Co", "body": "Klopt de btw?\nOmzet <5000 euro."}),
                         ("GET", "administratie/accountantinfo") => json!({"bedrijf": "Cijfers & Co", "plaats": "Utrecht"}),
                         ("POST", "bericht") => json!({"id": 99}),
                         ("POST", "controleopdracht") => json!({"id": 12}),
+                        ("POST", "auth") => json!({"valid": true, "isAccountant": false}),
+                        ("GET", "controleopdracht/12") => json!({"id": 12, "datum": "2026-11-01T10:00:00", "periode": "Oktober 2026", "opmerkingen": "Graag"}),
+                        ("PUT", _) => json!(true),
                         ("POST", _) => Value::Null,
                         _ => return axum::http::StatusCode::NOT_FOUND.into_response(),
                     };
@@ -611,10 +718,11 @@ mod end_to_end {
     async fn reminders_write_offs_and_messages_go_out_only_after_approval() {
         use crate::approvals::Status;
         let seen: Seen = Arc::default();
+        let answers: Answers = Arc::default();
         let jar = Arc::new(crate::state::testing::FakeJar::default());
         let state = Arc::new(crate::state::testing::state_with(
             jar,
-            &eboekhouden(seen.clone()).await,
+            &eboekhouden(seen.clone(), answers.clone()).await,
         ));
         let account = state.accounts.add(input(WriteMode::Off)).unwrap();
         state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
@@ -624,7 +732,8 @@ mod end_to_end {
             seen.lock()
                 .unwrap()
                 .iter()
-                .filter(|(what, _)| !what.starts_with("GET "))
+                // `POST auth` only asks who is signed in.
+                .filter(|(what, _)| !what.starts_with("GET ") && what != "POST auth")
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -663,7 +772,7 @@ mod end_to_end {
         );
         let (is_error, text) = client.call("bericht", json!({"id": 31})).await;
         assert!(
-            !is_error && text.contains("\"tekst\":\"Klopt de btw?\""),
+            !is_error && text.contains(r#""body":"Klopt de btw?\nOmzet <5000 euro.""#),
             "{text}"
         );
 
@@ -715,8 +824,8 @@ mod end_to_end {
                 .map(|l| l.value.clone())
         };
         assert_eq!(
-            line("Aan Bakkerij Jansen").as_deref(),
-            Some("info@jansen.example (algemeen)")
+            line("Relatie Bakkerij Jansen").as_deref(),
+            Some("bekende e-mailadressen: info@jansen.example (algemeen)")
         );
         assert_eq!(
             line("Factuur F001").as_deref(),
@@ -870,5 +979,118 @@ mod end_to_end {
         assert!(state.approvals.decide(id, false, 1));
         assert_eq!(settled(&state, id).await, Status::Refused);
         assert!(changes().is_empty());
+
+        // e-Boekhouden takes a reminder but does not say how many went out: the outcome is unknown, not an error.
+        let answer = |key: &str, value: Value| {
+            answers.lock().unwrap().insert(key.to_owned(), value);
+        };
+        let status_of = |id: u64| {
+            let client = &client;
+            async move {
+                let (_, text) = client
+                    .call("akkoord_status", json!({"voorstel_id": id}))
+                    .await;
+                serde_json::from_str::<Value>(&text).unwrap()
+            }
+        };
+        answer("POST OpenPost/aanmaning", json!(true));
+        let (_, text) = client.call("aanmaning_versturen", reminder.clone()).await;
+        let id = waiting_id(&text);
+        assert!(state.approvals.decide(id, true, 1));
+        assert_eq!(settled(&state, id).await, Status::Done);
+        let status = status_of(id).await;
+        assert_eq!(
+            status["resultaat"]["data"]["uitkomst"], "onbekend",
+            "{status}"
+        );
+        assert!(
+            status["resultaat"]["data"]["let_op"]
+                .as_str()
+                .unwrap()
+                .contains("aanmaning_historie"),
+            "{status}"
+        );
+        // It says that nothing went out: then it is an error.
+        answer(
+            "POST OpenPost/aanmaning",
+            json!({"sendEmails": 0, "noEmail": 1}),
+        );
+        let (_, text) = client.call("aanmaning_versturen", reminder.clone()).await;
+        let id = waiting_id(&text);
+        assert!(state.approvals.decide(id, true, 1));
+        assert_eq!(settled(&state, id).await, Status::Failed);
+        assert!(
+            status_of(id).await["fout"]
+                .as_str()
+                .unwrap()
+                .contains("geen herinnering verstuurd")
+        );
+        seen.lock().unwrap().clear();
+
+        // An administration without an accountant: no message can go, and nothing is asked or sent.
+        answer("GET administratie/accountantinfo", json!({}));
+        let (is_error, text) = client
+            .call(
+                "bericht_versturen",
+                json!({"onderwerp": "Vraag", "bericht": "Hallo"}),
+            )
+            .await;
+        assert!(
+            is_error && text.contains("niet aan een accountant gekoppeld"),
+            "{text}"
+        );
+        assert!(state.approvals.list().is_empty());
+        assert!(changes().is_empty());
+
+        // Only an accountant judges a check request; this account is none.
+        let (is_error, text) = client
+            .call(
+                "controleopdracht_beoordelen",
+                json!({"id": 12, "goedkeuren": true}),
+            )
+            .await;
+        assert!(
+            is_error && text.contains("niet van een accountant"),
+            "{text}"
+        );
+
+        // An accountant's login: sending a message or asking for a check is refused, judging one goes through approval.
+        answer("POST auth", json!({"valid": true, "isAccountant": true}));
+        let (is_error, text) = client
+            .call(
+                "bericht_versturen",
+                json!({"onderwerp": "Vraag", "bericht": "Hallo"}),
+            )
+            .await;
+        assert!(is_error && text.contains("van een accountant"), "{text}");
+        let (is_error, text) = client
+            .call(
+                "controleopdracht_aanvragen",
+                json!({"periode": "maand", "jaar": crate::tools::today().0, "maand": 1}),
+            )
+            .await;
+        assert!(is_error && text.contains("van een accountant"), "{text}");
+        assert!(state.approvals.list().is_empty());
+        assert!(changes().is_empty());
+        let (_, text) = client
+            .call(
+                "controleopdracht_beoordelen",
+                json!({"id": 12, "goedkeuren": false, "opmerking": "De bank sluit niet aan"}),
+            )
+            .await;
+        let id = waiting_id(&text);
+        let proposal = up();
+        assert!(proposal.danger);
+        assert_eq!(proposal.title, "Controle-opdracht afkeuren: Oktober 2026");
+        assert!(changes().is_empty(), "nothing is sent before the answer");
+        assert!(state.approvals.decide(id, true, 1));
+        assert_eq!(settled(&state, id).await, Status::Done);
+        assert_eq!(
+            changes(),
+            vec![(
+                "PUT controleopdracht/accountant/opmerking".to_owned(),
+                json!({"id": 12, "accept": false, "opmerking": "De bank sluit niet aan"})
+            )]
+        );
     }
 }
