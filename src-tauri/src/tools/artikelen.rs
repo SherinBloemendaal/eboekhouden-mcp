@@ -79,10 +79,15 @@ impl EbMcp {
     }
 
     /// A read that e-Boekhouden may answer without a body (or with null) when there is nothing: then `None`.
-    async fn artikelen_maybe(&self, run: &Run, path: &str) -> Result<Option<Value>, String> {
+    async fn artikelen_maybe(
+        &self,
+        run: &Run,
+        path: &str,
+        query: &[(String, String)],
+    ) -> Result<Option<Value>, String> {
         let call = self
             .state
-            .api_get(run.account.id, path, &[], Some(run.id), &run.client)
+            .api_get(run.account.id, path, query, Some(run.id), &run.client)
             .await;
         if call.ok() {
             return Ok(call.json.filter(|json| !json.is_null()));
@@ -107,16 +112,12 @@ fn required_text(value: &str, what: &str, max: usize) -> Result<String, String> 
     Ok(value.to_owned())
 }
 
-/// An amount in euros, rounded to cents; refused when it is no real number.
+/// An amount in euros, rounded to cents as e-Boekhouden's web app does; refused when it is no real number.
 fn euros(value: f64, what: &str) -> Result<f64, String> {
     if !value.is_finite() || value.abs() > 1e11 {
         return Err(format!("{what} is geen geldig bedrag"));
     }
-    Ok(round2(value))
-}
-
-fn round2(amount: f64) -> f64 {
-    (amount * 100.0).round() / 100.0
+    Ok(write::round_cents(value))
 }
 
 /// A long text for the approval window: whole unless it is very long.
@@ -225,6 +226,17 @@ mod tests {
                 }),
             )
             .route("/v1/api/btwinfo/btwplichtig", get(|| async { Json(json!(true)) }))
+            .route(
+                "/v1/api/grootboekrekening/selectlist/actief/VWBAL",
+                get(|| async { Json(json!([{"id": 80, "code": "8000", "omschrijving": "Omzet"}])) }),
+            )
+            .route(
+                "/v1/api/setting/administratie.use-voorraad",
+                get(|RawQuery(query): RawQuery| async move {
+                    assert_eq!(query.as_deref(), Some("acc=false"));
+                    Json(json!({"key": "administratie.use-voorraad", "value": "False"}))
+                }),
+            )
             .route(
                 "/v1/api/artikelgroep",
                 get(|| async { Json(json!([{"id": 4, "code": "DIENST", "omschrijving": "Diensten"}])) }).put(
@@ -509,6 +521,10 @@ mod tests {
             "{last}"
         );
         assert!(last.contains("\"id\":31"), "{last}");
+        assert!(
+            !last.contains("inVoorraad"),
+            "no stock flag where the administration keeps no stock: {last}"
+        );
 
         // A unit is added at once; deleting one always asks, even now.
         let (is_error, text) = call(

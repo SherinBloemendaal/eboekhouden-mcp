@@ -42,6 +42,8 @@ pub struct ArtikelToevoegenArgs {
     pub inkoopprijs: Option<f64>,
     /// Actief (standaard ja).
     pub actief: Option<bool>,
+    /// Opnemen in de automatische voorraadverwerking (standaard nee). Alleen als de administratie voorraad bijhoudt.
+    pub voorraad: Option<bool>,
     /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
@@ -82,6 +84,8 @@ pub struct ArtikelWijzigenArgs {
     pub inkoopprijs: Option<f64>,
     /// Actief aan of uit.
     pub actief: Option<bool>,
+    /// Opnemen in de automatische voorraadverwerking aan of uit. Alleen als de administratie voorraad bijhoudt.
+    pub voorraad: Option<bool>,
     /// De wijziging ook doorvoeren in bestaande abonnementen met dit product: nee (standaard), alles of alleen_prijs. Dit vraagt altijd het akkoord van de gebruiker.
     pub doorvoeren: Option<Doorvoeren>,
     /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
@@ -134,16 +138,39 @@ pub struct ArtikelgroepWijzigenArgs {
 
 // ---------------------------------------------------------------- what a product is checked against
 
-/// What the product form reads before it saves: the books (ledger accounts and btw codes), whether the
-/// administration charges btw, and its groups (`GET artikelgroep`) and units (`GET eenheid`).
+/// What the product form reads before it saves: the books (btw codes), whether the administration charges
+/// btw, the counter-accounts it offers (`grootboekrekening/selectlist/actief/VWBAL`: the active accounts of
+/// Winst en Verlies and Balans), its groups (`GET artikelgroep`) and units (`GET eenheid`), and whether it
+/// keeps stock (`setting/administratie.use-voorraad`, the form's `showVoorraadAdm`).
 pub(super) struct Keuzes {
     pub books: Books,
     pub btwplichtig: bool,
+    pub tegenrekeningen: Vec<Value>,
     pub groepen: Vec<Value>,
     pub eenheden: Vec<Value>,
+    pub voorraad: bool,
 }
 
 impl Keuzes {
+    /// A counter-account the product form offers, by its code: its id and its name.
+    fn tegenrekening(&self, code: &str) -> Result<(u64, String), String> {
+        let code = code.trim();
+        self.tegenrekeningen
+            .iter()
+            .find(|r| text_of(r, "code").trim() == code)
+            .and_then(|r| {
+                Some((
+                    r.get("id")?.as_u64()?,
+                    format!("{} {}", code, text_of(r, "omschrijving")),
+                ))
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Grootboekrekening {code:?} kan geen tegenrekening van een product zijn: e-Boekhouden biedt daar alleen actieve rekeningen van de balans en de winst-en-verliesrekening voor aan"
+                )
+            })
+    }
+
     fn groep(&self, id: u64) -> Result<String, String> {
         self.groepen
             .iter()
@@ -160,13 +187,35 @@ impl Keuzes {
             .ok_or_else(|| format!("Geen eenheid met id {id}; eenheden geeft de eenheden"))
     }
 
+    /// The counter-account a product has now, also when the form no longer offers it (inactive since).
     fn rekening_label(&self, id: u64) -> String {
-        self.books
-            .rekeningen
+        self.tegenrekeningen
             .iter()
-            .find(|r| r.id == id)
-            .map(|r| format!("{} {}", r.code, r.naam))
+            .find(|r| r.get("id").and_then(Value::as_u64) == Some(id))
+            .map(|r| format!("{} {}", text_of(r, "code"), text_of(r, "omschrijving")))
+            .or_else(|| {
+                self.books
+                    .rekeningen
+                    .iter()
+                    .find(|r| r.id == id)
+                    .map(|r| format!("{} {}", r.code, r.naam))
+            })
             .unwrap_or_else(|| format!("rekening {id}"))
+    }
+
+    /// The stock flag a product is saved with: only when the administration keeps stock, as the form does
+    /// (`inVoorraad = showVoorraadAdm ? ... : undefined`).
+    fn voorraad(&self, wanted: Option<bool>) -> Result<Option<bool>, String> {
+        if !self.voorraad {
+            if wanted == Some(true) {
+                return Err(
+                    "Deze administratie houdt geen voorraad bij; zet dat eerst aan in e-Boekhouden, of laat voorraad weg"
+                        .into(),
+                );
+            }
+            return Ok(None);
+        }
+        Ok(Some(wanted.unwrap_or(false)))
     }
 }
 
@@ -226,8 +275,8 @@ fn prijzen(prijs: f64, leading: InEx, percentage: f64) -> (f64, f64) {
     }
     let factor = 1.0 + percentage / 100.0;
     match leading {
-        InEx::Excl => (prijs, round2(prijs * factor)),
-        InEx::Incl => (round2(prijs / factor), prijs),
+        InEx::Excl => (prijs, write::round_cents(prijs * factor)),
+        InEx::Incl => (write::round_cents(prijs / factor), prijs),
     }
 }
 
@@ -241,6 +290,13 @@ fn flag_of(record: &Value, key: &str) -> Option<bool> {
     record
         .get(key)
         .and_then(|v| v.as_bool().or_else(|| v.as_u64().map(|n| n == 1)))
+}
+
+/// A setting as the product form tests it: `e && e.value.toLocaleLowerCase() === 'true'`.
+fn setting_on(setting: &Value) -> bool {
+    setting.get("value").is_some_and(|v| {
+        v.as_bool() == Some(true) || v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true"))
+    })
 }
 
 fn differs(a: f64, b: f64) -> bool {
@@ -265,7 +321,8 @@ pub(super) fn artikel_nieuw(args: &ArtikelToevoegenArgs, k: &Keuzes) -> Result<B
         InEx::Excl
     };
     let (excl, incl) = prijzen(euros(args.prijs, "De prijs")?, leading, tarief.percentage);
-    let rekening = k.books.rekening(&args.tegenrekening)?;
+    let (rekening, rekening_naam) = k.tegenrekening(&args.tegenrekening)?;
+    let voorraad = k.voorraad(args.voorraad)?;
     let inkoop = args
         .inkoopprijs
         .map(|p| euros(p, "De inkoopprijs"))
@@ -289,8 +346,11 @@ pub(super) fn artikel_nieuw(args: &ArtikelToevoegenArgs, k: &Keuzes) -> Result<B
     body.insert("prijsInclusief".into(), json!(incl));
     body.insert("prijsLeading".into(), json!(in_ex_code(leading)));
     body.insert("btw".into(), json!(tarief.code));
-    body.insert("grootboekrekeningId".into(), json!(rekening.id));
+    body.insert("grootboekrekeningId".into(), json!(rekening));
     body.insert("actief".into(), json!(u8::from(actief)));
+    if let Some(in_voorraad) = voorraad {
+        body.insert("inVoorraad".into(), json!(u8::from(in_voorraad)));
+    }
 
     let mut lines = vec![
         line("Code", &code),
@@ -303,10 +363,7 @@ pub(super) fn artikel_nieuw(args: &ArtikelToevoegenArgs, k: &Keuzes) -> Result<B
     } else {
         lines.push(line("Prijs", write::euro(excl)));
     }
-    lines.push(line(
-        "Tegenrekening",
-        format!("{} {}", rekening.code, rekening.naam),
-    ));
+    lines.push(line("Tegenrekening", rekening_naam));
     if let Some(groep) = groep {
         lines.push(line("Groep", groep));
     }
@@ -319,12 +376,20 @@ pub(super) fn artikel_nieuw(args: &ArtikelToevoegenArgs, k: &Keuzes) -> Result<B
     if !actief {
         lines.push(line("Actief", "nee"));
     }
+    if voorraad == Some(true) {
+        lines.push(line("Automatische voorraadverwerking", "ja"));
+    }
     Ok(Built {
         body: Value::Object(body),
         title: format!("Product {code} toevoegen"),
         lines,
     })
 }
+
+/// What the approval says about the subscriptions an edit is passed on to. e-Boekhouden's product form sends
+/// only the cascade flag (`?cascadeFull=true` / `?cascadePriceOnly=true`); the web app has no call that lists
+/// the subscriptions it will touch, so EB MCP does not guess them.
+const WELKE_ABONNEMENTEN: &str = "elk abonnement waar dit product op staat; e-Boekhouden kiest ze zelf en EB MCP kan niet vooraf laten zien welke dat zijn";
 
 /// An edit of a product: the request, the query that passes it on to subscriptions, and whether it must
 /// always be asked.
@@ -432,17 +497,17 @@ pub(super) fn artikel_gewijzigd(
     let old_rekening = id_of(now, "grootboekrekeningId");
     let rekening = match &args.tegenrekening {
         Some(new) => {
-            let new = k.books.rekening(new)?;
-            if Some(new.id) != old_rekening {
+            let (id, naam) = k.tegenrekening(new)?;
+            if Some(id) != old_rekening {
                 was_wordt(
                     &mut lines,
                     "Tegenrekening",
                     old_rekening.map_or_else(|| "geen".to_owned(), |id| k.rekening_label(id)),
-                    format!("{} {}", new.code, new.naam),
+                    naam,
                 );
                 changed = true;
             }
-            new.id
+            id
         }
         None => old_rekening
             .ok_or("Dit product heeft geen tegenrekening; geef er een met tegenrekening")?,
@@ -470,6 +535,20 @@ pub(super) fn artikel_gewijzigd(
     {
         was_wordt(&mut lines, "Actief", ja_nee(old_actief), ja_nee(new));
         actief = new;
+        changed = true;
+    }
+    // The stock flag goes out only when the administration keeps stock; then it is the one read, or the new one.
+    let old_voorraad = flag_of(now, "inVoorraad").unwrap_or(false);
+    let voorraad = k.voorraad(args.voorraad.or(k.voorraad.then_some(old_voorraad)))?;
+    if let Some(new) = voorraad
+        && new != old_voorraad
+    {
+        was_wordt(
+            &mut lines,
+            "Automatische voorraadverwerking",
+            ja_nee(old_voorraad),
+            ja_nee(new),
+        );
         changed = true;
     }
 
@@ -564,6 +643,7 @@ pub(super) fn artikel_gewijzigd(
                 "Bestaande abonnementen",
                 "alle wijzigingen van dit product worden ook doorgevoerd in de bestaande abonnementen met dit product",
             ));
+            lines.push(line("Welke abonnementen", WELKE_ABONNEMENTEN));
             (vec![("cascadeFull".to_owned(), "true".to_owned())], true)
         }
         Doorvoeren::AlleenPrijs => {
@@ -571,6 +651,7 @@ pub(super) fn artikel_gewijzigd(
                 "Bestaande abonnementen",
                 "de prijs van dit product wordt ook doorgevoerd in de bestaande abonnementen met dit product",
             ));
+            lines.push(line("Welke abonnementen", WELKE_ABONNEMENTEN));
             (
                 vec![("cascadePriceOnly".to_owned(), "true".to_owned())],
                 true,
@@ -598,7 +679,7 @@ pub(super) fn artikel_gewijzigd(
     body.insert("btw".into(), json!(btw));
     body.insert("grootboekrekeningId".into(), json!(rekening));
     body.insert("actief".into(), json!(u8::from(actief)));
-    if let Some(in_voorraad) = flag_of(now, "inVoorraad") {
+    if let Some(in_voorraad) = voorraad {
         body.insert("inVoorraad".into(), json!(u8::from(in_voorraad)));
     }
     if let Some(id) = kostenplaats {
@@ -716,18 +797,31 @@ pub(super) fn artikelgroep_gewijzigd(
 impl EbMcp {
     /// What a product is checked against before it is saved (`Keuzes`).
     async fn artikelen_keuzes(&self, run: &Run) -> Result<Keuzes, String> {
+        // The form reads the setting with `getSetting(key)`, so `acc=false`; no setting at all means off.
+        let voorraad = self
+            .artikelen_maybe(
+                run,
+                "setting/administratie.use-voorraad",
+                &[("acc".to_owned(), "false".to_owned())],
+            )
+            .await?
+            .is_some_and(|setting| setting_on(&setting));
         Ok(Keuzes {
             books: self.books(run).await?,
             btwplichtig: self.artikelen_btwplichtig(run).await?,
+            tegenrekeningen: self
+                .artikelen_list(run, "grootboekrekening/selectlist/actief/VWBAL")
+                .await?,
             groepen: self.artikelen_list(run, "artikelgroep").await?,
             eenheden: self.artikelen_list(run, "eenheid").await?,
+            voorraad,
         })
     }
 
     /// The kostenplaats of a product: the product form reads it apart (`kostenplaats/GetByArtikelId/{id}`).
     async fn artikelen_kostenplaats(&self, run: &Run, id: u64) -> Result<Option<u64>, String> {
         Ok(self
-            .artikelen_maybe(run, &format!("kostenplaats/GetByArtikelId/{id}"))
+            .artikelen_maybe(run, &format!("kostenplaats/GetByArtikelId/{id}"), &[])
             .await?
             .and_then(|kostenplaats| id_of(&kostenplaats, "id")))
     }
@@ -1209,11 +1303,17 @@ mod tests {
         Keuzes {
             books: books(),
             btwplichtig,
+            // The selectlist leaves 1300 Debiteuren out, as the form offers only active VW and BAL accounts.
+            tegenrekeningen: vec![
+                json!({"id": 80, "code": "8000", "omschrijving": "Omzet"}),
+                json!({"id": 81, "code": "8100", "omschrijving": "Omzet advies"}),
+            ],
             groepen: vec![json!({"id": 4, "code": "DIENST", "omschrijving": "Diensten"})],
             eenheden: vec![
                 json!({"id": 6, "enkelvoud": "uur", "meervoud": "uren"}),
                 json!({"id": 7, "enkelvoud": "stuk", "meervoud": "stuks"}),
             ],
+            voorraad: false,
         }
     }
 
@@ -1229,6 +1329,7 @@ mod tests {
             eenheid_id: Some(6),
             inkoopprijs: None,
             actief: None,
+            voorraad: None,
             account: None,
         }
     }
@@ -1407,6 +1508,7 @@ mod tests {
             eenheid_id: None,
             inkoopprijs: None,
             actief: None,
+            voorraad: None,
             doorvoeren: None,
             account: None,
         }
@@ -1424,7 +1526,7 @@ mod tests {
             edit.built.body,
             json!({"id": 31, "groepId": 4, "code": "UUR", "omschrijving": "Advies per uur, op locatie", "eenheidId": 6,
                 "inkoopPrijsExclusief": 0.0, "prijsExclusief": 100.0, "prijsInclusief": 121.0, "prijsLeading": "EX",
-                "btw": "HOOG_VERK_21", "grootboekrekeningId": 80, "actief": 1, "inVoorraad": 1, "kostenplaatsId": 12})
+                "btw": "HOOG_VERK_21", "grootboekrekeningId": 80, "actief": 1, "kostenplaatsId": 12})
         );
         assert!(edit.query.is_empty() && !edit.danger);
         assert_eq!(edit.built.title, "Product UUR wijzigen");
@@ -1727,5 +1829,173 @@ mod tests {
             .unwrap_err()
             .contains("hoogstens 50")
         );
+    }
+    #[test]
+    fn rounds_cents_as_e_boekhoudens_form_does() {
+        // 3,50 x 1,21 is 4,2349999... in floating point; the form's round(n, 2) makes it 4,24, not 4,23.
+        assert_eq!(prijzen(3.5, InEx::Excl, 21.0), (3.5, 4.24));
+        // And back: 4,24 incl. 21% is 3,50 excl.
+        assert_eq!(prijzen(4.24, InEx::Incl, 21.0), (3.5, 4.24));
+        let args = ArtikelToevoegenArgs {
+            prijs: 3.5,
+            ..nieuw()
+        };
+        let built = artikel_nieuw(&args, &keuzes(true)).unwrap();
+        assert_eq!(built.body["prijsInclusief"], json!(4.24));
+        assert_eq!(label(&built, "Prijs incl. btw"), Some("4,24"));
+        // A price typed with more decimals is rounded the same way.
+        assert_eq!(euros(1.005, "De prijs").unwrap(), 1.01);
+        let args = ArtikelWijzigenArgs {
+            prijs: Some(4.24),
+            bedragen: Some(InEx::Incl),
+            ..wijzigen()
+        };
+        let edit = artikel_gewijzigd(&args, &product(), None, &keuzes(true)).unwrap();
+        assert_eq!(edit.built.body["prijsExclusief"], json!(3.5));
+    }
+
+    #[test]
+    fn the_counter_account_is_one_the_form_offers() {
+        let k = keuzes(true);
+        let err = artikel_nieuw(
+            &ArtikelToevoegenArgs {
+                tegenrekening: "1300".into(),
+                ..nieuw()
+            },
+            &k,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("\"1300\"") && err.contains("actieve rekeningen"),
+            "{err}"
+        );
+        let err = artikel_gewijzigd(
+            &ArtikelWijzigenArgs {
+                tegenrekening: Some("1300".into()),
+                ..wijzigen()
+            },
+            &product(),
+            None,
+            &k,
+        )
+        .unwrap_err();
+        assert!(err.contains("actieve rekeningen"), "{err}");
+        // A product whose account is no longer offered keeps it when the edit leaves it alone.
+        let mut oud = product();
+        oud["grootboekrekeningId"] = json!(13);
+        let edit = artikel_gewijzigd(
+            &ArtikelWijzigenArgs {
+                code: Some("UUR2".into()),
+                ..wijzigen()
+            },
+            &oud,
+            None,
+            &k,
+        )
+        .unwrap();
+        assert_eq!(edit.built.body["grootboekrekeningId"], 13);
+        let edit = artikel_gewijzigd(
+            &ArtikelWijzigenArgs {
+                tegenrekening: Some("8100".into()),
+                ..wijzigen()
+            },
+            &oud,
+            None,
+            &k,
+        )
+        .unwrap();
+        assert_eq!(
+            label(&edit.built, "Tegenrekening was"),
+            Some("1300 Debiteuren")
+        );
+        assert_eq!(
+            label(&edit.built, "Tegenrekening wordt"),
+            Some("8100 Omzet advies")
+        );
+    }
+
+    #[test]
+    fn the_stock_flag_goes_out_only_when_the_administration_keeps_stock() {
+        let zonder = keuzes(true);
+        let met = Keuzes {
+            voorraad: true,
+            ..keuzes(true)
+        };
+        // A new product: left out without stock, 0 or 1 with it, and refused when asked for without it.
+        let built = artikel_nieuw(&nieuw(), &zonder).unwrap();
+        assert!(built.body.get("inVoorraad").is_none());
+        let built = artikel_nieuw(&nieuw(), &met).unwrap();
+        assert_eq!(built.body["inVoorraad"], 0);
+        let args = ArtikelToevoegenArgs {
+            voorraad: Some(true),
+            ..nieuw()
+        };
+        let built = artikel_nieuw(&args, &met).unwrap();
+        assert_eq!(built.body["inVoorraad"], 1);
+        assert_eq!(label(&built, "Automatische voorraadverwerking"), Some("ja"));
+        assert!(
+            artikel_nieuw(&args, &zonder)
+                .unwrap_err()
+                .contains("houdt geen voorraad bij")
+        );
+        // An edit: the flag read goes back with stock, and stays out without it.
+        let rename = ArtikelWijzigenArgs {
+            code: Some("UUR2".into()),
+            ..wijzigen()
+        };
+        let edit = artikel_gewijzigd(&rename, &product(), None, &met).unwrap();
+        assert_eq!(edit.built.body["inVoorraad"], 1);
+        let edit = artikel_gewijzigd(&rename, &product(), None, &zonder).unwrap();
+        assert!(edit.built.body.get("inVoorraad").is_none());
+        let edit = artikel_gewijzigd(
+            &ArtikelWijzigenArgs {
+                voorraad: Some(false),
+                ..wijzigen()
+            },
+            &product(),
+            None,
+            &met,
+        )
+        .unwrap();
+        assert_eq!(edit.built.body["inVoorraad"], 0);
+        assert_eq!(
+            label(&edit.built, "Automatische voorraadverwerking wordt"),
+            Some("nee")
+        );
+    }
+
+    #[test]
+    fn passing_an_edit_on_says_which_subscriptions_cannot_be_named() {
+        for doorvoeren in [Doorvoeren::Alles, Doorvoeren::AlleenPrijs] {
+            let args = ArtikelWijzigenArgs {
+                doorvoeren: Some(doorvoeren),
+                ..wijzigen()
+            };
+            let edit = artikel_gewijzigd(&args, &product(), None, &keuzes(true)).unwrap();
+            let welke = label(&edit.built, "Welke abonnementen").unwrap();
+            assert!(
+                welke.contains("elk abonnement") && welke.contains("niet vooraf"),
+                "{welke}"
+            );
+        }
+        let edit = artikel_gewijzigd(
+            &ArtikelWijzigenArgs {
+                code: Some("UUR2".into()),
+                ..wijzigen()
+            },
+            &product(),
+            None,
+            &keuzes(true),
+        )
+        .unwrap();
+        assert_eq!(label(&edit.built, "Welke abonnementen"), None);
+    }
+
+    #[test]
+    fn reads_the_stock_setting_as_the_form_does() {
+        assert!(setting_on(&json!({"value": "True"})));
+        assert!(setting_on(&json!({"value": true})));
+        assert!(!setting_on(&json!({"value": "false"})));
+        assert!(!setting_on(&json!({"key": "administratie.use-voorraad"})));
     }
 }
