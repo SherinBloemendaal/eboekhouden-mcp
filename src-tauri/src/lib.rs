@@ -1282,6 +1282,18 @@ pub fn run() {
             // server takes its first call. What still waited for an answer when EB MCP stopped lapses.
             app_state.log.open(logstore::log_file(&dir));
             app_state.approvals.open(approvals::history_file(&dir));
+            // Calls logged by 0.4.0 carry no wait yet: their proposals' records know when it began and ended.
+            for detail in app_state.approvals.since(0) {
+                let record = &detail.record;
+                if record.decision != Some(approvals::Decision::Auto) {
+                    app_state.log.backfill_wait(
+                        record.proposal.id,
+                        &record.proposal.tool,
+                        record.proposal.asked_at,
+                        record.decided_at,
+                    );
+                }
+            }
             app.manage(app_state.clone());
             app.manage(settings.clone());
             app.manage(Arc::new(Signins::default()));

@@ -59,20 +59,6 @@ function toggle(id: number) {
   else expanded.add(id)
 }
 
-// A toast's Bekijken opens the page on that proposal.
-watch(
-  () => route.query.open,
-  async (open) => {
-    const id = Number(open)
-    if (typeof open !== 'string' || !Number.isInteger(id)) return
-    view.value = 'queue'
-    expanded.add(id)
-    await nextTick()
-    document.getElementById(`proposal-${id}`)?.scrollIntoView?.({ block: 'nearest' })
-  },
-  { immediate: true },
-)
-
 function changes(n: number): string {
   return n === 1 ? '1 wijziging' : `${n} wijzigingen`
 }
@@ -223,6 +209,63 @@ async function copyJson() {
   }
 }
 
+// ---- Opening one proposal ----
+
+// `?open=<id>` opens the page on that proposal: a toast's Bekijken, or Verzoeken's Bekijk voorstel op Akkoord. One that
+// still waits opens in the queue; one that no longer waits opens in Geschiedenis with its detail, once the queue and
+// the history are read and it is clear which of the two holds it.
+const opening = ref<number | null>(null)
+/** The page went to Geschiedenis for `opening` already; the user may leave it while the record is still looked for. */
+let openedHistory = false
+watch(
+  () => route.query.open,
+  (open) => {
+    const id = Number(open)
+    if (typeof open !== 'string' || !Number.isInteger(id)) return
+    opening.value = id
+    openedHistory = false
+    // Expanded right away when it waits, so the card opens as it appears and does not wait for the read.
+    if (!approvalState.loaded || store.approvals.some((p) => p.id === id)) {
+      view.value = 'queue'
+      expanded.add(id)
+    }
+  },
+  { immediate: true },
+)
+watch(
+  [opening, () => approvalState.loaded, () => store.approvals, () => approvalState.historyLoaded, () => approvalState.history],
+  async () => {
+    const id = opening.value
+    if (id === null || !approvalState.loaded) return
+    if (store.approvals.some((p) => p.id === id)) {
+      opening.value = null
+      view.value = 'queue'
+      expanded.add(id)
+      await nextTick()
+      document.getElementById(`proposal-${id}`)?.scrollIntoView?.({ block: 'nearest' })
+      return
+    }
+    if (!approvalState.historyLoaded) return
+    const record = approvalState.history.find((r) => r.id === id)
+    if (!openedHistory) {
+      openedHistory = true
+      expanded.delete(id)
+      view.value = 'history'
+    }
+    // A history read before this page opened may not hold it yet: the fresh read that follows does.
+    if (!record) return
+    opening.value = null
+    openedHistory = false
+    view.value = 'history'
+    status.value = ''
+    search.value = ''
+    select(record)
+    await nextTick()
+    document.getElementById(`record-${id}`)?.scrollIntoView?.({ block: 'nearest' })
+  },
+  { immediate: true },
+)
+
 function showInQueue(id: number) {
   view.value = 'queue'
   expanded.add(id)
@@ -370,7 +413,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
           <div v-else key="list" class="split">
             <TransitionGroup name="row" tag="ul" class="history" aria-label="Geschiedenis">
               <li v-for="r in records" :key="r.id">
-                <button type="button" class="record" :class="{ sel: selectedId === r.id }" :aria-current="selectedId === r.id ? 'true' : undefined" @click="select(r)">
+                <button :id="`record-${r.id}`" type="button" class="record" :class="{ sel: selectedId === r.id }" :aria-current="selectedId === r.id ? 'true' : undefined" @click="select(r)">
                   <span class="r-time">{{ stamp(r.askedAt) }}</span>
                   <span class="r-main">
                     <span class="r-title">{{ r.title }}</span>
@@ -424,7 +467,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
                           <dt>Account</dt><dd>{{ selected.account }}</dd>
                           <dt>Gevraagd</dt><dd>{{ stamp(selected.askedAt, true) }}</dd>
                           <dt>Beantwoord</dt><dd>{{ selected.decidedAt === null ? 'Nog niet' : stamp(selected.decidedAt, true) }}</dd>
-                          <dt>Antwoord</dt><dd>{{ decisionLabel(selected.decision) }}</dd>
+                          <dt>Antwoord</dt><dd>{{ decisionLabel(selected.decision, selected.bulk) }}</dd>
                           <dt>App-versie</dt><dd class="version">{{ selected.version || 'Onbekend' }}</dd>
                         </dl>
                       </section>

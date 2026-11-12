@@ -118,6 +118,24 @@
   :root { --glass-pop: #2c2c30; }
 }
 
+/* The phases of a call whose change waited for approval (Verzoeken): preparing, waiting for the user, making the
+   change in e-Boekhouden. The wait is striped in two ambers, light on light and dark on dark, so the stripes stay
+   visible in both. */
+:root {
+  --phase-prep: #0a84ff;
+  --phase-wait: #ff9f0a;
+  --phase-wait-stripe: #ffd08a;
+  --phase-exec: #30b350;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --phase-prep: #409cff;
+    --phase-wait: #ffb340;
+    --phase-wait-stripe: #8f5a0c;
+    --phase-exec: #30d158;
+  }
+}
+
 /* The Mac's own accent color (System Settings > Appearance), with the blue above as fallback.
    Windows sets its own accent in windows.css, which wins on [data-platform]. */
 @supports (color: -apple-system-control-accent) {

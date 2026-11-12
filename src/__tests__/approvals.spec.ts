@@ -30,7 +30,7 @@ function proposal(over: Partial<Proposal> = {}): Proposal {
 }
 
 function record(over: Partial<ApprovalRecord> = {}): ApprovalRecord {
-  return { ...proposal(), decidedAt: null, decision: null, status: 'waiting', error: null, version: '0.4.0', ...over }
+  return { ...proposal(), decidedAt: null, decision: null, status: 'waiting', error: null, version: '0.4.0', bulk: false, ...over }
 }
 
 /** A promise the test settles itself, to look at the page while a command still runs. */
@@ -417,6 +417,38 @@ describe('the history', () => {
     expect(await outcomeOf(0)).toEqual([true, 'EB MCP is gestopt terwijl deze wijziging liep. Kijk in e-Boekhouden wat er al is doorgevoerd.'])
     expect(await outcomeOf(1)).toEqual([false, 'EB MCP is opnieuw gestart voordat de gebruiker antwoordde; het voorstel is vervallen. Er is niets gewijzigd.'])
     expect(await outcomeOf(2)).toEqual([false, 'Geweigerd. Er is niets gewijzigd in e-Boekhouden.'])
+  })
+
+  it('names an answer given to all waiting changes at once', async () => {
+    history = [
+      record({ id: 21, title: 'Samen goedgekeurd', status: 'done', decision: 'approved', decidedAt: 2_000, bulk: true }),
+      record({ id: 20, title: 'Samen geweigerd', status: 'refused', decision: 'refused', decidedAt: 1_000, bulk: true }),
+    ]
+    await openHistory()
+    const answerOf = async (index: number) => {
+      document.querySelectorAll<HTMLButtonElement>('.record')[index]!.click()
+      await flushPromises()
+      const dt = [...document.querySelectorAll('aside.detail .kv dt')].find((e) => e.textContent === 'Antwoord')!
+      return dt.nextElementSibling?.textContent
+    }
+    expect(await answerOf(0)).toBe('Goedgekeurd · Alles goedkeuren')
+    expect(await answerOf(1)).toBe('Geweigerd · Alles weigeren')
+  })
+
+  it('opens a record that no longer waits in Geschiedenis with its detail, from ?open=', async () => {
+    await mountAt('/akkoord?open=11')
+    expect(document.querySelector('#tab-history')?.getAttribute('aria-selected')).toBe('true')
+    expect(document.querySelector('.record.sel .r-title')?.textContent).toBe('Relatie toevoegen: Jansen')
+    expect(document.querySelector('aside.detail .detail-title')?.textContent).toBe('Relatie toevoegen: Jansen')
+    expect(invoke).toHaveBeenCalledWith('approval_get', { id: 11 })
+    expect(document.querySelectorAll('.card')).toHaveLength(0)
+  })
+
+  it('opens a record that still waits in the queue, from ?open=', async () => {
+    waiting = [proposal({ id: 9 })]
+    await mountAt('/akkoord?open=9')
+    expect(document.querySelector('#tab-queue')?.getAttribute('aria-selected')).toBe('true')
+    expect(card('Mutatie toevoegen: Geld uitgegeven').querySelector('.card-head')?.getAttribute('aria-expanded')).toBe('true')
   })
 
   it('shows the reason when the technical data cannot be loaded', async () => {
