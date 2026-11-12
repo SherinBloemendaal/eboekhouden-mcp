@@ -1647,6 +1647,25 @@ impl EbMcp {
         })
     }
 
+    /// The administration's invoice layout templates, read only when a tool names one (`sjabloon_id`).
+    async fn factuur_sjablonen(
+        &self,
+        run: &Run,
+        chosen: Option<u64>,
+    ) -> Result<Option<Value>, String> {
+        match chosen {
+            Some(_) => Ok(Some(named_rows(
+                self.fetch(
+                    run,
+                    "factuursjabloon/gridtable",
+                    grid(Some(MAX_ROWS), None)?,
+                )
+                .await?,
+            ))),
+            None => Ok(None),
+        }
+    }
+
     /// An invoice or subscription with its lines, as the tools that read or change one need it.
     async fn with_items(&self, run: &Run, path: &str, id: u64) -> Result<(Value, Value), String> {
         let now = self.fetch(run, &format!("{path}/{id}"), Vec::new()).await?;
@@ -2676,7 +2695,9 @@ impl EbMcp {
             move |this, run, args| async move {
                 let books = this.books(&run).await?;
                 let factuur_context = this.factuur_context(&run).await?;
-                let built = write::factuur_nieuw(&args, &factuur_context, &books)?;
+                let sjablonen = this.factuur_sjablonen(&run, args.sjabloon_id).await?;
+                let built =
+                    write::factuur_nieuw(&args, &factuur_context, &books, sjablonen.as_ref())?;
                 this.approve(&run, TOOL, &built, false).await?;
                 this.change(&run, "POST", "factuur/model", Some(&built.body))
                     .await
@@ -2710,7 +2731,9 @@ impl EbMcp {
             move |this, run, args| async move {
                 let (now, items) = this.with_items(&run, "factuur", args.id).await?;
                 let books = this.books(&run).await?;
-                let built = write::factuur_gewijzigd(&args, &now, &items, &books)?;
+                let sjablonen = this.factuur_sjablonen(&run, args.sjabloon_id).await?;
+                let built =
+                    write::factuur_gewijzigd(&args, &now, &items, &books, sjablonen.as_ref())?;
                 this.approve(&run, TOOL, &built, false).await?;
                 this.change_done(&run, "PUT", "factuur/model", Some(&built.body))
                     .await
