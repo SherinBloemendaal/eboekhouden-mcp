@@ -406,7 +406,8 @@ fn status_bij_belastingdienst(model: &Value) -> &'static str {
         Some(Value::String(s)) if s == "acknowledgement" => "verstuurd en geaccepteerd",
         Some(Value::String(s)) if s.is_empty() => "verstuurd, nog in behandeling",
         Some(Value::String(s)) if s == "error" => "verstuurd, maar niet geaccepteerd",
-        _ => "nog niet verstuurd",
+        // No status is also what a return filed outside e-Boekhouden has.
+        _ => "niet via e-Boekhouden verstuurd",
     }
 }
 
@@ -471,7 +472,7 @@ fn aangifte_verwerken(
         if verwerkt.is_empty() {
             "nee".to_owned()
         } else {
-            format!("ja, op {verwerkt}; dit verwerkt de aangifte opnieuw")
+            format!("ja, op {verwerkt}. Dit verwerkt de aangifte opnieuw; EB MCP weet niet of e-Boekhouden de mutaties van toen vervangt of er nieuwe bij boekt. Kijk de mutaties daarna na.")
         },
     ));
     lines.push(line(
@@ -483,7 +484,7 @@ fn aangifte_verwerken(
     }
     lines.push(line(
         "Gevolg",
-        "e-Boekhouden boekt de voorbelasting en de af te dragen btw over naar de rekening BTW R/C, met mutaties in de boekhouding. Er gaat niets naar de Belastingdienst: versturen doet de gebruiker zelf in e-Boekhouden.",
+        "e-Boekhouden boekt de voorbelasting en de af te dragen btw over naar de rekening BTW R/C, met mutaties in de boekhouding. EB MCP kan dat niet terugdraaien. Er gaat niets naar de Belastingdienst: versturen doet de gebruiker zelf in e-Boekhouden.",
     ));
     Ok(Built {
         body: Value::Object(body),
@@ -492,9 +493,10 @@ fn aangifte_verwerken(
     })
 }
 
-/// The period of a suppletie, from the return it corrects (`verzondenAangifte.identificerendeGegevens`), as the
-/// screen's `loadPeriod`: `aangiftetijdvak` 1 to 12 is a month, 21 to 30 a quarter, 40 a year (no `periodId`,
-/// which the screen then sends as 0).
+/// The period of a suppletie, from the return it corrects (`verzondenAangifte.identificerendeGegevens`):
+/// `aangiftetijdvak` 1 to 12 is a month, 21, 24, 27 and 30 the four quarters, 40 a year (no `periodId`, which
+/// the screen then sends as 0). The web app's `getEAPeriode` names 22, 23, 25, 26, 28, 29, 31 and 32 as months
+/// too, but its `loadPeriod` would book them as a quarter; those are refused rather than booked wrong.
 fn suppletie_periode(model: &Value) -> Result<(i32, &'static str, u32, String), String> {
     let ident = model
         .get("verzondenAangifte")
@@ -512,10 +514,15 @@ fn suppletie_periode(model: &Value) -> Result<(i32, &'static str, u32, String), 
             tijdvak,
             format!("{} {jaar}", MAANDEN[(tijdvak - 1) as usize]),
         )),
-        21..=30 => {
+        21 | 24 | 27 | 30 => {
             let kwartaal = (tijdvak - 21) / 3 + 1;
             Ok((jaar, "K", kwartaal, format!("{kwartaal}e kwartaal {jaar}")))
         }
+        22..=32 => Err(format!(
+            "De aangifte die deze suppletie corrigeert heeft tijdvak {tijdvak}. Dat is geen maand of kwartaal dat EB MCP kan verwerken \
+             (e-Boekhouden noemt het {} {jaar}); verwerk deze suppletie zelf in e-Boekhouden",
+            MAANDEN[(tijdvak - 21) as usize]
+        )),
         40 => Ok((jaar, "J", 0, format!("jaar {jaar}"))),
         _ => Err(format!(
             "e-Boekhouden gaf een tijdvak dat EB MCP niet kent: {tijdvak}"
@@ -556,12 +563,12 @@ fn suppletie_verwerken(model: &Value, eigen: &BtwBedragen) -> Result<Built, Stri
         if verwerkt.is_empty() {
             "nee".to_owned()
         } else {
-            format!("ja, op {verwerkt}; dit verwerkt de suppletie opnieuw")
+            format!("ja, op {verwerkt}. Dit verwerkt de suppletie opnieuw; EB MCP weet niet of e-Boekhouden de mutaties van toen vervangt of er nieuwe bij boekt. Kijk de mutaties daarna na.")
         },
     ));
     lines.push(line(
         "Gevolg",
-        "e-Boekhouden boekt de verschillen in voorbelasting en af te dragen btw over naar de rekening BTW R/C, met mutaties in de boekhouding. Er gaat niets naar de Belastingdienst: versturen doet de gebruiker zelf in e-Boekhouden.",
+        "e-Boekhouden boekt de verschillen in voorbelasting en af te dragen btw over naar de rekening BTW R/C, met mutaties in de boekhouding. EB MCP kan dat niet terugdraaien. Er gaat niets naar de Belastingdienst: versturen doet de gebruiker zelf in e-Boekhouden.",
     ));
     Ok(Built {
         body: Value::Object(body),
@@ -896,11 +903,11 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een btw-aangifte opmaken: hem verwerken in de boekhouding, zoals de knop Btw-aangifte verwerken in de boekhouding. e-Boekhouden boekt de voorbelasting en de af te dragen btw over naar de rekening BTW R/C en geeft de nummers van die mutaties. Standaard met het voorstel van e-Boekhouden uit de boekingen, of, als de aangifte al verstuurd is, met de bedragen zoals verstuurd; eigen bedragen per rubriek in hele euro's kunnen bij het voorstel, zoals in het scherm. Een aangifte die al verwerkt is, wordt zo opnieuw verwerkt. Dit verstuurt niets naar de Belastingdienst: versturen, betalen en indienen doet de gebruiker zelf in e-Boekhouden. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. De gebruiker moet dit altijd goedkeuren in EB MCP, met de periode en de bedragen per rubriek. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een btw-aangifte opmaken: hem verwerken in de boekhouding, zoals de knop Btw-aangifte verwerken in de boekhouding. e-Boekhouden boekt de voorbelasting en de af te dragen btw over naar de rekening BTW R/C en geeft de nummers van die mutaties. Standaard met het voorstel van e-Boekhouden uit de boekingen, of, als de aangifte al verstuurd is, met de bedragen zoals verstuurd; eigen bedragen per rubriek in hele euro's kunnen bij het voorstel, zoals in het scherm. Een aangifte die al verwerkt is, wordt zo opnieuw verwerkt, zoals het scherm dat aanbiedt; EB MCP weet niet of e-Boekhouden de eerdere mutaties dan vervangt of er nieuwe bij boekt. EB MCP kan het verwerken niet terugdraaien. Dit verstuurt niets naar de Belastingdienst: versturen, betalen en indienen doet de gebruiker zelf in e-Boekhouden. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. De gebruiker moet dit altijd goedkeuren in EB MCP, met de periode en de bedragen per rubriek. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Btw-aangifte verwerken",
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = false
         )
     )]
@@ -958,14 +965,11 @@ impl EbMcp {
                 if args.periode_code.trim().is_empty() {
                     return Err(Halt::Error("Geef de periodCode van de rij uit btwaangifte_correcties".into()));
                 }
-                let mut query = grid(Some(MAX_ROWS), None)?;
-                query.push(("category".into(), args.rubriek.code().into()));
+                let mut query = vec![("category".to_owned(), args.rubriek.code().to_owned())];
                 query.extend(periode.query());
-                let rows = named_rows(
-                    this.btwaangifte_get(&run, "btw-aangifte/correcties/gridtable", query)
-                        .await?,
-                );
-                let rows = rows.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+                let rows = this
+                    .btwaangifte_rows(&run, "btw-aangifte/correcties/gridtable", &query)
+                    .await?;
                 let built = verschil_negeren(
                     &rows,
                     periode,
@@ -982,11 +986,11 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een suppletie opmaken: hem verwerken in de boekhouding, zoals de knop Suppletie verwerken in de boekhouding. De suppletie corrigeert een verstuurde btw-aangifte (aangifte_id uit btwaangiftes); e-Boekhouden boekt de verschillen over naar de rekening BTW R/C en geeft de nummers van die mutaties. Standaard met het voorstel van e-Boekhouden; eigen bedragen per rubriek in hele euro's kunnen, zoals in het scherm. Alleen als e-Boekhouden voor die aangifte een suppletie toestaat (zie suppletie met aangifte_id). Dit verstuurt niets naar de Belastingdienst: versturen doet de gebruiker zelf in e-Boekhouden. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. De gebruiker moet dit altijd goedkeuren in EB MCP, met de periode en de bedragen per rubriek. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een suppletie opmaken: hem verwerken in de boekhouding, zoals de knop Suppletie verwerken in de boekhouding. De suppletie corrigeert een verstuurde btw-aangifte (aangifte_id uit btwaangiftes); e-Boekhouden boekt de verschillen over naar de rekening BTW R/C en geeft de nummers van die mutaties. Standaard met het voorstel van e-Boekhouden; eigen bedragen per rubriek in hele euro's kunnen, zoals in het scherm. Alleen als e-Boekhouden voor die aangifte een suppletie toestaat (zie suppletie met aangifte_id). Een suppletie die al verwerkt is, wordt zo opnieuw verwerkt; EB MCP weet niet of e-Boekhouden de eerdere mutaties dan vervangt of er nieuwe bij boekt. EB MCP kan het verwerken niet terugdraaien. Dit verstuurt niets naar de Belastingdienst: versturen doet de gebruiker zelf in e-Boekhouden. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. De gebruiker moet dit altijd goedkeuren in EB MCP, met de periode en de bedragen per rubriek. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Suppletie verwerken",
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = false
         )
     )]
@@ -1107,7 +1111,7 @@ mod tests {
         assert_eq!(value_of(&built, "Al verwerkt"), "nee");
         assert_eq!(
             value_of(&built, "Bij de Belastingdienst"),
-            "nog niet verstuurd"
+            "niet via e-Boekhouden verstuurd"
         );
         assert!(value_of(&built, "Gevolg").contains("Er gaat niets naar de Belastingdienst"));
         assert!(!built.lines.iter().any(|l| l.label == "Let op"));
@@ -1188,7 +1192,7 @@ mod tests {
         );
         assert_eq!(
             value_of(&built, "Al verwerkt"),
-            "ja, op 05-10-2026 14:12; dit verwerkt de aangifte opnieuw"
+            "ja, op 05-10-2026 14:12. Dit verwerkt de aangifte opnieuw; EB MCP weet niet of e-Boekhouden de mutaties van toen vervangt of er nieuwe bij boekt. Kijk de mutaties daarna na."
         );
         assert_eq!(
             value_of(&built, "Bij de Belastingdienst"),
@@ -1401,6 +1405,38 @@ mod tests {
             ),
             (json!("J"), json!(0))
         );
+        // B1: only 21, 24, 27 and 30 are quarters; the codes between are months the web app names, refused.
+        for (tijdvak, kwartaal) in [(21, 1), (24, 2), (27, 3), (30, 4)] {
+            let mut model = suppletie_model();
+            model["verzondenAangifte"]["identificerendeGegevens"]["aangiftetijdvak"] =
+                json!(tijdvak);
+            let built = suppletie_verwerken(&model, &BtwBedragen::default()).unwrap();
+            assert_eq!(built.body["periodId"], kwartaal, "{tijdvak}");
+            assert_eq!(
+                built.title,
+                format!("Suppletie verwerken: {kwartaal}e kwartaal 2026")
+            );
+        }
+        for (tijdvak, maand) in [
+            (22, "februari"),
+            (23, "maart"),
+            (25, "mei"),
+            (26, "juni"),
+            (28, "augustus"),
+            (29, "september"),
+            (31, "november"),
+            (32, "december"),
+        ] {
+            let mut model = suppletie_model();
+            model["verzondenAangifte"]["identificerendeGegevens"]["aangiftetijdvak"] =
+                json!(tijdvak.to_string());
+            let refused = suppletie_verwerken(&model, &BtwBedragen::default()).unwrap_err();
+            assert!(
+                refused.contains(&format!("tijdvak {tijdvak}")) && refused.contains(maand),
+                "{refused}"
+            );
+            assert!(refused.contains("zelf in e-Boekhouden"), "{refused}");
+        }
         let mut vreemd = suppletie_model();
         vreemd["verzondenAangifte"]["identificerendeGegevens"]["aangiftetijdvak"] = json!(35);
         assert!(suppletie_verwerken(&vreemd, &BtwBedragen::default()).is_err());
