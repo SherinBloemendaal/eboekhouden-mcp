@@ -4646,7 +4646,8 @@ impl ServerHandler for EbMcp {
                  hij antwoordt meteen met status wacht en een voorstel_id, en voert de wijziging zelf uit zodra de gebruiker goedkeurt. \
                  Vertel de gebruiker dat er in EB MCP een wijziging op akkoord wacht, ga gerust verder met ander werk, \
                  en vraag de uitkomst later op met akkoord_status (met voorstel_id voor één voorstel en zijn resultaat; zonder voor alles van de laatste 24 uur). \
-                 Een btw-aangifte, ICP-opgave of suppletie versturen, indienen of betalen kan EB MCP niet: dat doet de gebruiker zelf in e-Boekhouden. \
+                 Een btw-aangifte, ICP-opgave of suppletie versturen, indienen of betalen kan EB MCP niet: dat doet de gebruiker zelf. \
+                 Wel kan btwaangifte_betaallink de iDEAL-link van een verstuurde aangifte opzoeken: toon die link aan de gebruiker om zelf te openen, open of volg hem nooit zelf. \
                  Zegt een tool dat de uitkomst onbekend is (een mail of bestand dat mogelijk al weg is), probeer het dan niet opnieuw maar laat de gebruiker eerst kijken. \
                  Staat er meer dan één account in EB MCP, dan moet elke tool de account-parameter meekrijgen; status zegt welke accounts er zijn.",
             )

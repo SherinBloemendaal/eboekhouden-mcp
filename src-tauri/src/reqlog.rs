@@ -621,7 +621,7 @@ impl RequestLog {
                 e.outcome = outcome;
                 e.duration_ms = now.saturating_sub(e.at);
                 e.bytes = result.map(|r| r.to_string().len()).unwrap_or(0);
-                e.result = result.map(|r| shorten(r).0);
+                e.result = result.map(|r| shorten(&without_pay_links(r)).0);
                 e.error = error;
                 done = Some(e.clone());
             }
@@ -674,7 +674,7 @@ impl RequestLog {
         ));
         let (response, truncated) = match &call.json {
             Some(json) => {
-                let (value, cut) = shorten(json);
+                let (value, cut) = shorten(&without_pay_links(json));
                 (Some(value), cut)
             }
             None => (None, false),
@@ -929,6 +929,30 @@ pub fn normalize(path: &str) -> String {
 }
 
 /// A copy small enough to keep: long lists keep their first 50 items and say how many were cut.
+/// A copy without links to pay something: the value under `startPaymentUrl`, `payUrl` or `betaallink` is
+/// replaced by the mask, at any depth. A link to pay a btw return is for the user to open once; it has no
+/// business in the request log, the approval history on disk or an export.
+pub fn without_pay_links(value: &Value) -> Value {
+    const LINKS: [&str; 3] = ["startpaymenturl", "payurl", "betaallink"];
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    let link = LINKS.contains(&key.to_ascii_lowercase().as_str());
+                    let kept = if link && !value.is_null() {
+                        Value::String(MASK.to_owned())
+                    } else {
+                        without_pay_links(value)
+                    };
+                    (key.clone(), kept)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_pay_links).collect()),
+        other => other.clone(),
+    }
+}
+
 pub(crate) fn shorten(value: &Value) -> (Value, bool) {
     if value.to_string().len() <= BODY_LIMIT {
         return (value.clone(), false);
@@ -1419,6 +1443,30 @@ mod tests {
         assert_eq!(stats.errors, 2);
         assert_eq!(stats.endpoints["factuursjabloon/editor/{id}/NL"].errors, 0);
         assert_eq!(stats.endpoints["relatie/gridtable"].errors, 2);
+    }
+
+    #[test]
+    fn a_link_to_pay_never_lands_in_the_log() {
+        let log = RequestLog::default();
+        let id = log.start_mcp("Claude", "btwaangifte_betaallink", json!({"id": 5}), None);
+        let mut answer = call("aangifte/pay/5", 200, 30);
+        answer.json = Some(json!({"startPaymentUrl": "https://betalen.example/abc"}));
+        let eb = log.add_eb(&answer, Some(id), "Claude", None, true);
+        log.finish_mcp(
+            id,
+            Outcome::Ok,
+            Some(&json!({"data": {"betaallink": "https://betalen.example/abc", "periode": "3e kwartaal 2026"}})),
+            None,
+        );
+        let kept = serde_json::to_string(&log.export_entries()).unwrap();
+        assert!(!kept.contains("betalen.example"), "{kept}");
+        assert!(kept.contains("3e kwartaal 2026"));
+        let Some(Entry::Eb(e)) = log.get(eb) else {
+            panic!()
+        };
+        assert_eq!(e.response.unwrap()["startPaymentUrl"], MASK);
+        // A row of the list that has no link yet keeps its null.
+        assert!(without_pay_links(&json!({"payUrl": null}))["payUrl"].is_null());
     }
 
     #[test]

@@ -26,7 +26,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::logstore;
-use crate::reqlog::{APP_VERSION, MASK, shorten};
+use crate::reqlog::{APP_VERSION, MASK, shorten, without_pay_links};
 use crate::state::now_ms;
 
 /// How many records the history keeps. Older answered ones go first; waiting and running ones stay.
@@ -186,6 +186,20 @@ pub struct Detail {
     pub log_id: Option<u64>,
     /// When the change finished running.
     pub finished_at: Option<u64>,
+}
+
+impl Detail {
+    /// The record as it is written to the history file or an export: without a link to pay something. In
+    /// memory the result keeps it, because `akkoord_status` is how the AI client gets the outcome of a
+    /// change that waited, and for a payment link the link is that outcome. After a restart it is gone.
+    fn for_disk(&self) -> Detail {
+        Detail {
+            args: without_pay_links(&self.args),
+            body: without_pay_links(&self.body),
+            result: self.result.as_ref().map(without_pay_links),
+            ..self.clone()
+        }
+    }
 }
 
 /// The user's answer, or why there is none, as the waiting change hears it.
@@ -674,7 +688,7 @@ impl Approvals {
                 app_version: APP_VERSION.to_owned(),
                 saved_at: now_ms(),
                 next: inner.next,
-                records: inner.records.iter().cloned().collect(),
+                records: inner.records.iter().map(Detail::for_disk).collect(),
             }
         };
         logstore::write_gz(file, &snapshot)?;
@@ -689,7 +703,7 @@ impl Approvals {
         hidden: &[String],
         exported_at: &DateTime<Local>,
     ) -> Result<Vec<String>, String> {
-        let records: Vec<Detail> = self.lock().records.iter().cloned().collect();
+        let records: Vec<Detail> = self.lock().records.iter().map(Detail::for_disk).collect();
         let mut lines = vec![json!({
             "type": "header",
             "exportFormat": EXPORT_FORMAT,
@@ -759,6 +773,39 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn a_link_to_pay_stays_in_memory_and_off_the_disk() {
+        let dir = TempDir::new();
+        let file = history_file(&dir.0);
+        let approvals = Approvals::default();
+        approvals.open(file.clone());
+        let id = approvals.record_auto(ask(Uuid::new_v4(), "Betaallink"), technical(), 10);
+        approvals.finish(
+            id,
+            Ok(&json!({"data": {"betaallink": "https://betalen.example/abc", "periode": "3e kwartaal 2026"}})),
+            20,
+        );
+        // The client asks for the outcome and gets the link.
+        let now = approvals.get(id).unwrap();
+        assert_eq!(
+            now.result.unwrap()["data"]["betaallink"],
+            "https://betalen.example/abc"
+        );
+        // The file and the export do not hold it.
+        approvals.save().unwrap();
+        let mut text = String::new();
+        GzDecoder::new(std::fs::File::open(&file).unwrap())
+            .read_to_string(&mut text)
+            .unwrap();
+        assert!(!text.contains("betalen.example"), "{text}");
+        assert!(text.contains("3e kwartaal 2026"));
+        let lines = approvals
+            .export_lines(&[], &Local::now())
+            .unwrap()
+            .join("\n");
+        assert!(!lines.contains("betalen.example"), "{lines}");
     }
 
     #[tokio::test]
