@@ -54,9 +54,9 @@ pub struct UurWijzigenArgs {
     pub project_id: Option<u64>,
     /// Andere activiteit (id).
     pub activiteit_id: Option<u64>,
-    /// Nieuw aantal uren; 0 maakt het leeg.
+    /// Nieuw aantal uren; 0 maakt het veld leeg (het gaat dan niet mee, zoals een leeg veld in e-Boekhouden).
     pub uren: Option<f64>,
-    /// Nieuw aantal kilometers; 0 maakt het leeg.
+    /// Nieuw aantal kilometers; 0 maakt het veld leeg (het gaat dan niet mee, zoals een leeg veld in e-Boekhouden).
     pub kilometers: Option<f64>,
     /// Nieuwe opmerkingen; een lege tekst maakt ze leeg.
     pub opmerkingen: Option<String>,
@@ -255,7 +255,7 @@ pub struct UrenPerProjectArgs {
     pub van: Option<String>,
     /// Einde van de periode, JJJJ-MM-DD (standaard vandaag).
     pub tot: Option<String>,
-    /// Groeperen op deze activiteit (id).
+    /// Alleen deze activiteit (id).
     pub activiteit_id: Option<u64>,
     /// uren (standaard) of euro.
     pub weergave: Option<Weergave>,
@@ -273,7 +273,7 @@ pub struct UrenPerActiviteitArgs {
     pub van: Option<String>,
     /// Einde van de periode, JJJJ-MM-DD (standaard vandaag).
     pub tot: Option<String>,
-    /// Groeperen op dit project (id).
+    /// Alleen dit project (id).
     pub project_id: Option<u64>,
     /// uren (standaard) of euro.
     pub weergave: Option<Weergave>,
@@ -289,9 +289,9 @@ pub struct UrenPerActiviteitArgs {
 pub struct UrenPerJaarArgs {
     /// Het jaar (standaard dit jaar): 1 januari tot en met 31 december.
     pub jaar: Option<i32>,
-    /// Groeperen op dit project (id).
+    /// Alleen dit project (id).
     pub project_id: Option<u64>,
-    /// Groeperen op deze activiteit (id).
+    /// Alleen deze activiteit (id).
     pub activiteit_id: Option<u64>,
     /// uren (standaard) of euro.
     pub weergave: Option<Weergave>,
@@ -396,6 +396,11 @@ fn aantal(value: f64, what: &str) -> Result<f64, String> {
         return Err(format!("{what} moet een getal van 0 tot 100000 zijn"));
     }
     Ok((value * 100.0).round() / 100.0)
+}
+
+/// An amount of 0 is an empty field: the forms leave an empty field out of what they send.
+fn leeg_bij_nul(value: Option<f64>) -> Option<f64> {
+    value.filter(|v| *v != 0.0)
 }
 
 /// A name the forms require, trimmed, with their maximum length.
@@ -514,15 +519,17 @@ impl Namen {
 /// medewerker is chosen, the amounts that are filled in, the date as an object.
 pub(super) fn uur_nieuw(args: &UurToevoegenArgs, namen: &Namen) -> Result<Built, String> {
     let datum = parse_date(&args.datum)?;
-    let uren = args
-        .uren
-        .map(|u| aantal(u, "Het aantal uren"))
-        .transpose()?;
-    let km = args
-        .kilometers
-        .map(|k| aantal(k, "Het aantal kilometers"))
-        .transpose()?;
-    if uren.unwrap_or(0.0) == 0.0 && km.unwrap_or(0.0) == 0.0 {
+    let uren = leeg_bij_nul(
+        args.uren
+            .map(|u| aantal(u, "Het aantal uren"))
+            .transpose()?,
+    );
+    let km = leeg_bij_nul(
+        args.kilometers
+            .map(|k| aantal(k, "Het aantal kilometers"))
+            .transpose()?,
+    );
+    if uren.is_none() && km.is_none() {
         return Err("Aantal is niet ingevuld: geef uren of kilometers".into());
     }
     let opmerkingen =
@@ -592,11 +599,11 @@ pub(super) fn uur_gewijzigd(
         .unwrap_or(datum_nu);
     let number = |key: &str| now.get(key).and_then(Value::as_f64);
     let uren = match args.uren {
-        Some(u) => Some(aantal(u, "Het aantal uren")?),
+        Some(u) => leeg_bij_nul(Some(aantal(u, "Het aantal uren")?)),
         None => number("aantalUren"),
     };
     let km = match args.kilometers {
-        Some(k) => Some(aantal(k, "Het aantal kilometers")?),
+        Some(k) => leeg_bij_nul(Some(aantal(k, "Het aantal kilometers")?)),
         None => number("aantalKilometers"),
     };
     if uren.unwrap_or(0.0) == 0.0 && km.unwrap_or(0.0) == 0.0 {
@@ -726,15 +733,22 @@ pub(super) fn uur_weg(id: u64, now: &Value, namen: &Namen) -> Built {
 // ---------------------------------------------------------------- projecten
 
 /// The ids of a project's users as `GET project/{id}` gives them (`users`: ids, or objects with an id).
-pub(super) fn gebruiker_ids(list: Option<&Value>) -> Vec<u64> {
-    list.and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_u64().or_else(|| id_of(item, "id")))
-                .collect()
-        })
-        .unwrap_or_default()
+pub(super) fn gebruiker_ids(list: Option<&Value>) -> Result<Vec<u64>, String> {
+    let items = list
+        .and_then(Value::as_array)
+        .ok_or("e-Boekhouden gaf de gebruikers van dit project in een onbekende vorm terug")?;
+    let ids: Vec<u64> = items
+        .iter()
+        .filter_map(|item| item.as_u64().or_else(|| id_of(item, "id")))
+        .collect();
+    // An entry that is no id would otherwise drop out, and the change would take that user off the project.
+    if ids.len() < items.len() {
+        return Err(
+            "e-Boekhouden gaf de gebruikers van dit project in een onbekende vorm terug; er is niets gewijzigd"
+                .into(),
+        );
+    }
+    Ok(ids)
 }
 
 fn gebruikers_kiezen(ids: &[u64], gebruikers: &[(u64, String)]) -> Result<Vec<u64>, String> {
@@ -833,7 +847,7 @@ pub(super) fn project_gewijzigd(
     };
     let facturabel = flag("facturabel", args.facturabel, false);
     let actief = flag("actief", args.actief, true);
-    let users_nu = gebruiker_ids(now.get("users"));
+    let users_nu = gebruiker_ids(now.get("users"))?;
     let users = match &args.gebruiker_ids {
         Some(ids) => gebruikers_kiezen(ids, gebruikers)?,
         None => users_nu.clone(),
@@ -903,9 +917,28 @@ pub(super) fn project_gewijzigd(
 
 // ---------------------------------------------------------------- activiteiten
 
+/// The value of a setting as `GET setting/{key}?acc=false` gives it (`{key, value}`); `None` when the
+/// administration never set it (the answer is null, which the forms read as "not on"). Any other shape is
+/// refused rather than guessed.
+pub(super) fn setting_waarde(answer: &Value, what: &str) -> Result<Option<String>, String> {
+    match answer {
+        Value::Null => Ok(None),
+        Value::Object(object) => match object.get("value") {
+            Some(Value::String(value)) => Ok(Some(value.clone())),
+            _ => Err(format!(
+                "e-Boekhouden gaf de instelling {what} in een onbekende vorm terug; er is niets gewijzigd"
+            )),
+        },
+        _ => Err(format!(
+            "e-Boekhouden gaf de instelling {what} in een onbekende vorm terug; er is niets gewijzigd"
+        )),
+    }
+}
+
 /// What an activity's sales side may point at, read the way the activity form reads it: the omzetrekeningen
 /// (`grootboekrekening/search?rekeningCategorie=VW,BAL&actief=true`), the sales btw codes valid today
-/// (`btwinfo/info/VERK`, without AFW_VERK) and whether the administration charges btw (`btwinfo/btwplichtig`).
+/// (`btwinfo/info/VERK`, without AFW_VERK) and whether the administration charges btw (the setting
+/// `administratie.niet-btw-plichtig`, which the form reads with `getSetting`).
 #[derive(Debug, Default)]
 pub(super) struct Verkoop {
     /// (id, code, naam)
@@ -919,9 +952,12 @@ impl Verkoop {
     pub(super) fn from_api(
         rekeningen: &Value,
         btw: &Value,
-        btwplichtig: &Value,
+        niet_btw_plichtig: &Value,
         vandaag: Date,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        // As the form: `E && E.value.toLocaleLowerCase() === "true"` means not btw-plichtig.
+        let niet_btw_plichtig = setting_waarde(niet_btw_plichtig, "niet btw-plichtig")?
+            .is_some_and(|v| v.to_lowercase() == "true");
         let rekeningen = rekeningen
             .as_array()
             .map(|items| {
@@ -955,12 +991,11 @@ impl Verkoop {
                     .collect()
             })
             .unwrap_or_default();
-        Self {
+        Ok(Self {
             rekeningen,
             btw,
-            // The form treats an administration as btw-plichtig unless told otherwise.
-            btwplichtig: btwplichtig.as_bool().unwrap_or(true),
-        }
+            btwplichtig: !niet_btw_plichtig,
+        })
     }
 
     fn rekening(&self, code: &str) -> Result<u64, String> {

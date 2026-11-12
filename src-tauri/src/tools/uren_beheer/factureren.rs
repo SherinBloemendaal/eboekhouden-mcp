@@ -151,6 +151,13 @@ pub(super) fn uren_factureren(
                 .into(),
         );
     }
+    // A row without an id cannot be sent; leaving it out would invoice less than the user approves.
+    let zonder_id = rows.iter().filter(|r| id_of(r, "id").is_none()).count();
+    if zonder_id > 0 {
+        return Err(format!(
+            "e-Boekhouden gaf {zonder_id} urenregel(s) zonder id terug; er is niets gefactureerd"
+        ));
+    }
     let (groepen, los) = per_relatie(rows, projecten);
     if !los.is_empty() {
         return Err(format!(
@@ -236,6 +243,40 @@ pub(super) fn uren_factureren(
     })
 }
 
+/// The fields of an invoicing row that decide what its invoice holds.
+const BEPALEND: [&str; 6] = [
+    "projectId",
+    "activiteit",
+    "aantalUren",
+    "uurtarief",
+    "aantalKilometers",
+    "kilometertarief",
+];
+
+/// The rows approved against the list as it is read again after the approval: every approved row must still
+/// be there, not yet invoiced, with the same project, activity, amounts and tariffs. The approval can wait for
+/// hours, and the user approved what they saw.
+pub(super) fn nog_zoals_goedgekeurd(goedgekeurd: &[Value], nu: &[Value]) -> Result<(), String> {
+    for row in goedgekeurd {
+        let id = id_of(row, "id");
+        let zelfde = nu
+            .iter()
+            .find(|n| id.is_some() && id_of(n, "id") == id)
+            .is_some_and(|n| {
+                BEPALEND.iter().all(|key| {
+                    row.get(*key).unwrap_or(&Value::Null) == n.get(*key).unwrap_or(&Value::Null)
+                })
+            });
+        if !zelfde {
+            return Err(
+                "De uren zijn intussen gewijzigd of al gefactureerd; er is niets gefactureerd. Vraag het opnieuw aan."
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The invoice a number names, from `factuur/searchexisting` (factuurId, factuurNummer, relatieBedrijf,
 /// factuurDatum): only an exact match on the number.
 pub(super) fn factuur_bij_nummer(list: &Value, nummer: &str) -> Result<Value, String> {
@@ -253,15 +294,55 @@ pub(super) fn factuur_bij_nummer(list: &Value, nummer: &str) -> Result<Value, St
         .ok_or_else(|| format!("Geen bestaande factuur met nummer {nummer:?} gevonden"))
 }
 
-/// Hours added to an invoice that exists (`POST uur/bestaand/factureren` with `{uren, factuurId}`).
+/// Hours added to an invoice that exists (`POST uur/bestaand/factureren` with `{uren, factuurId}`). Every hour
+/// must be on the list of hours not invoiced yet (`lijst`, read as `uren_factureren` reads it), and its project
+/// must belong to the relatie of the invoice (`factuur_relatie`, from `GET factuur/{id}`).
 pub(super) fn uren_bij_factuur(
     factuur: &Value,
+    factuur_relatie: u64,
     uren: &[(u64, Value)],
+    lijst: &[Value],
+    projecten: &HashMap<u64, ProjectRelatie>,
     namen: &Namen,
 ) -> Result<Built, String> {
     let factuur_id = id_of(factuur, "factuurId").ok_or("De factuur heeft geen id")?;
     if uren.is_empty() {
         return Err("Geef minstens één urenregel in uur_ids".into());
+    }
+    let niet_open: Vec<String> = uren
+        .iter()
+        .filter(|(id, _)| !lijst.iter().any(|r| id_of(r, "id") == Some(*id)))
+        .map(|(id, _)| id.to_string())
+        .collect();
+    if !niet_open.is_empty() {
+        return Err(format!(
+            "Deze urenregels staan niet bij de nog niet gefactureerde uren (al gefactureerd of onbekend): {}",
+            niet_open.join(", ")
+        ));
+    }
+    let mut relaties: Vec<String> = Vec::new();
+    for (id, uur) in uren {
+        let relatie = id_of(uur, "projectId").and_then(|p| projecten.get(&p));
+        match relatie {
+            Some(r) if r.relatie_id == factuur_relatie => {
+                let naam = known(r.relatie.clone());
+                if !relaties.contains(&naam) {
+                    relaties.push(naam);
+                }
+            }
+            Some(r) => {
+                return Err(format!(
+                    "Urenregel {id} hoort bij een project van {}, niet bij de relatie van factuur {}",
+                    known(r.relatie.clone()),
+                    text_of(factuur, "factuurNummer")
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "Urenregel {id} heeft geen project met een relatie, dus hoort niet op deze factuur"
+                ));
+            }
+        }
     }
     let nummer = text_of(factuur, "factuurNummer");
     let datum = factuur
@@ -272,6 +353,7 @@ pub(super) fn uren_bij_factuur(
         line("Factuur", &nummer),
         line("Relatie", known(text_of(factuur, "relatieBedrijf"))),
         line("Factuurdatum", datum),
+        line("Relatie van de uren", relaties.join(", ")),
     ];
     let (mut totaal_uren, mut totaal_km) = (0.0, 0.0);
     for (id, uur) in uren {
