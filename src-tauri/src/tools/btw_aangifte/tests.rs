@@ -31,21 +31,21 @@ fn source(requests: bool) -> String {
         };
         format!("{}{}", &text[..a], &text[b + end.len()..])
     }
-    fn without_tests(text: &str) -> &str {
-        text.split("#[cfg(test)]\nmod tests {").next().unwrap()
-    }
     let mut main = cut(
         include_str!("../btw_aangifte.rs"),
         "// filing-paths:start",
         "// filing-paths:end",
     );
-    if requests {
-        main = cut(&main, "// requests:start", "// requests:end");
-    }
+    main = if requests {
+        cut(&main, "// requests:start", "// requests:end")
+    } else {
+        cut(&main, "// pay-link:start", "// pay-link:end")
+    };
     [
         main.as_str(),
         without_tests(include_str!("omzet.rs")),
         without_tests(include_str!("icp.rs")),
+        without_tests(include_str!("betaallink.rs")),
     ]
     .concat()
 }
@@ -167,6 +167,8 @@ fn the_source_names_no_filing_path_and_reaches_e_boekhouden_only_through_the_gua
         "icp_regels",
         "icp_eigen_regel",
         "icp_opgave_inhoud",
+        // The one pay request, checked on its own below.
+        "btwaangifte_betaling_starten",
         // Fields and methods of this part's own value types (BtwPeriode, IcpPeriode, BtwBedragen).
         "jaar",
         "soort",
@@ -211,6 +213,7 @@ fn the_source_names_no_filing_path_and_reaches_e_boekhouden_only_through_the_gua
         assert!(
             rest.starts_with("btwaangifte_omzet_router()")
                 || rest.starts_with("btwaangifte_icp_router()")
+                || rest.starts_with("btwaangifte_betaal_router()")
                 || rest.starts_with("new(")
                 || rest.chars().next().is_some_and(char::is_uppercase),
             "Self::{}",
@@ -219,6 +222,57 @@ fn the_source_names_no_filing_path_and_reaches_e_boekhouden_only_through_the_gua
         from += at + 6;
     }
     assert!(!code.contains("EbMcp::"), "a call by the type's name");
+}
+
+/// The one exception to the guard asks for `aangifte/pay/{id}` with a numeric id and nothing else, and only
+/// the betaallink tool calls it, after its approval.
+#[test]
+fn the_pay_request_builds_one_path_and_runs_only_after_approval_in_its_tool() {
+    let main = include_str!("../btw_aangifte.rs");
+    let block =
+        &main[main.find("// pay-link:start").unwrap()..main.find("// pay-link:end").unwrap()];
+    let code: Vec<&str> = block
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("//"))
+        .collect();
+    assert_eq!(
+        code,
+        [
+            "async fn btwaangifte_betaling_starten(&self, run: &Run, id: u64) -> Result<Value, Halt> {",
+            "self.fetch(run, &format!(\"aangifte/pay/{id}\"), Vec::new())",
+            ".await",
+            ".map_err(Halt::Error)",
+            "}",
+        ],
+        "the pay request changed: check it still asks for exactly one numeric path"
+    );
+    // Outside its block, the pay request is named once: in the betaallink tool, after the approval.
+    let elsewhere = source(false);
+    assert_eq!(
+        elsewhere.matches("btwaangifte_betaling_starten").count(),
+        3,
+        "its mentions in the two module docs and its one call"
+    );
+    let tool = without_tests(include_str!("betaallink.rs"));
+    let approve = tool
+        .find("this.approve(&run, TOOL, &built, true)")
+        .expect("the tool asks, with danger");
+    let call = tool
+        .find("this.btwaangifte_betaling_starten(")
+        .expect("the tool makes the request");
+    assert!(approve < call, "the request comes after the approval");
+    assert_eq!(
+        tool.matches("this.btwaangifte_betaling_starten(").count(),
+        1
+    );
+    for other in [include_str!("omzet.rs"), include_str!("icp.rs")] {
+        assert!(!other.contains("btwaangifte_betaling_starten"));
+    }
+}
+
+fn without_tests(text: &str) -> &str {
+    text.split("#[cfg(test)]\nmod tests {").next().unwrap()
 }
 
 // ---------------------------------------------------------------- end to end
@@ -267,7 +321,7 @@ async fn btw_mock(seen: Seen) -> String {
     use axum::http::{Method, StatusCode, Uri};
     use axum::response::IntoResponse;
     let app = axum::Router::new().fallback(
-        move |method: Method, uri: Uri, body: axum::body::Bytes| {
+        move |method: Method, uri: Uri, headers: axum::http::HeaderMap, body: axum::body::Bytes| {
             let seen = seen.clone();
             async move {
                 let path = uri.path().trim_start_matches("/v1/api/").to_owned();
@@ -281,22 +335,36 @@ async fn btw_mock(seen: Seen) -> String {
                 let offset: usize = param(uri.query(), "offset")
                     .and_then(|o| o.parse().ok())
                     .unwrap_or(0);
+                // Payment links point back at this stand-in, so a request to one would be seen.
+                let host = headers
+                    .get("host")
+                    .and_then(|h| h.to_str().ok())
+                    .unwrap_or("127.0.0.1")
+                    .to_owned();
                 let answer = match (method.as_str(), path.as_str()) {
+                    ("GET", "aangifte/pay/5") => {
+                        json!({"startPaymentUrl": format!("http://{host}/betaal/sessie-5")})
+                    }
+                    ("GET", "aangifte/pay/16") => json!({"startPaymentUrl": null}),
                     // The filing paths: answered, so a request would be seen.
                     (_, p) if files_literally(p) => json!(true),
                     ("GET", "aangifte/gridtable") => grid_of(
-                        &["id", "datum", "soort", "periode", "status"],
-                        json!([[5, "2026-10-20", "OB", "3e kwartaal 2026", "Geaccepteerd"],
-                               [6, "2026-11-01", "SUP", "2e kwartaal 2026", "Geaccepteerd"],
-                               [9, "2026-10-21", "ICP", "3e kwartaal 2026", "Geaccepteerd"],
-                               [12, "2026-10-21", "Btw", "3e kwartaal 2026", ""]]),
+                        &["id", "datum", "soort", "periode", "status", "canPay", "iDeal", "payUrl", "lastPayStatus", "lastPayDate", "mustPayDiff"],
+                        json!([[5, "2026-10-20", "OB", "3e kwartaal 2026", "Geaccepteerd", true, true, null, null, null, false],
+                               [6, "2026-11-01", "SUP", "2e kwartaal 2026", "Geaccepteerd", true, true, format!("http://{host}/betaal/bestaand-6"), "Open", null, false],
+                               [9, "2026-10-21", "ICP", "3e kwartaal 2026", "Geaccepteerd", false, false, null, null, null, false],
+                               [12, "2026-10-21", "Btw", "3e kwartaal 2026", "", false, false, null, null, null, false],
+                               [13, "2026-04-20", "OB", "1e kwartaal 2026", "Geaccepteerd", false, true, null, null, null, false],
+                               [14, "2026-01-20", "OB", "4e kwartaal 2025", "Geaccepteerd", true, true, null, "Success", "20-01-2026 10:00", false],
+                               [15, "2025-10-20", "OB", "3e kwartaal 2025", "Geaccepteerd", true, true, null, "Betaald", null, false],
+                               [16, "2026-07-20", "OB", "2e kwartaal 2026", "Geaccepteerd", true, true, null, null, null, false]]),
                     ),
                     ("GET", "aangifte/5") => json!({"id": 5, "periode": "3e kwartaal 2026"}),
                     (
                         "GET",
                         "aangifte/aangifteomzetbelasting/5" | "aangifte/aangifteomzetbelasting/6",
                     ) => {
-                        json!({"berekening": {"voorbelasting": 600}})
+                        json!({"berekening": {"voorbelasting": 600, "totaalTeBetalenTerugTeVragen": 1234}})
                     }
                     (
                         "GET",
@@ -958,4 +1026,135 @@ async fn opens_and_keeps_the_icp_opgave_only_after_approval_and_never_files() {
                "jaar": "2026", "periodType": "K", "periodId": "2"})
     );
     eb.filed_nothing(30);
+}
+
+#[tokio::test]
+async fn shows_a_pay_link_after_approval_and_never_pays_opens_or_files() {
+    use crate::accounts::WriteMode;
+    use approvals::Status;
+    let eb = Harness::new().await;
+    let pay_requests = |eb: &Harness| -> Vec<String> {
+        eb.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p, _)| files_literally(p))
+            .map(|(m, p, _)| format!("{m} {p}"))
+            .collect()
+    };
+
+    // Writing off: refused before anything is read.
+    let (is_error, text) = eb.call("btwaangifte_betaallink", json!({"id": 5})).await;
+    assert!(is_error && text.contains("alleen-lezen"), "{text}");
+    assert!(eb.seen.lock().unwrap().is_empty());
+
+    // Even an account that needs no approval: what cannot be paid says so, and nothing is asked or started.
+    eb.set_write(WriteMode::Auto);
+    for (id, want) in [
+        (13, "kan in e-Boekhouden niet met iDEAL betaald worden"),
+        (14, "al via iDEAL betaald op 20-01-2026 10:00"),
+        (15, "op een andere manier betaald"),
+        (9, "niet met iDEAL"),
+        (99, "geen verstuurde aangifte met id 99"),
+    ] {
+        let (is_error, text) = eb.call("btwaangifte_betaallink", json!({"id": id})).await;
+        assert!(is_error && text.contains(want), "{id}: {text}");
+        assert!(!text.contains("http"), "no link for {id}: {text}");
+    }
+    assert!(
+        eb.state.approvals.history(None).is_empty(),
+        "nothing was asked"
+    );
+
+    // A link the row has already comes back at once: no approval, no request to pay.
+    let (is_error, text) = eb.call("btwaangifte_betaallink", json!({"id": 6})).await;
+    assert!(!is_error, "{text}");
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        answer["data"]["betaallink"]
+            .as_str()
+            .unwrap()
+            .ends_with("/betaal/bestaand-6"),
+        "{text}"
+    );
+    assert_eq!(answer["data"]["bestond_al"], true);
+    assert_eq!(answer["data"]["soort"], "suppletie");
+    assert_eq!(answer["data"]["te_betalen"], "1234,00");
+    assert!(
+        answer["data"]["let_op"]
+            .as_str()
+            .unwrap()
+            .contains("Open de link niet")
+    );
+    assert!(eb.state.approvals.history(None).is_empty());
+    assert!(pay_requests(&eb).is_empty());
+
+    // A new link always asks, also on this account; refused: no payment is started.
+    let (is_error, text) = eb.call("btwaangifte_betaallink", json!({"id": 5})).await;
+    assert!(!is_error, "{text}");
+    let id = waiting_id(&text);
+    let proposal = eb
+        .state
+        .approvals
+        .list()
+        .into_iter()
+        .find(|p| p.id == id)
+        .unwrap();
+    assert!(proposal.danger);
+    assert_eq!(
+        proposal.title,
+        "Betaallink opvragen: btw-aangifte 3e kwartaal 2026"
+    );
+    let lines = eb.lines_of(id);
+    assert!(
+        lines.contains(&("Te betalen".into(), "1234,00".into())),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|(l, v)| l == "Betalen" && v.contains("opent de link nooit")),
+        "{lines:?}"
+    );
+    assert!(pay_requests(&eb).is_empty(), "nothing before the answer");
+    assert_eq!(eb.refuse(&text).await.status, Status::Refused);
+    assert!(pay_requests(&eb).is_empty(), "a refusal starts nothing");
+
+    // Approved: exactly one request to pay, and the link in the answer.
+    let (_, text) = eb.call("btwaangifte_betaallink", json!({"id": 5})).await;
+    let id = waiting_id(&text);
+    assert!(pay_requests(&eb).is_empty());
+    assert_eq!(eb.approve(&text).await.status, Status::Done);
+    assert_eq!(pay_requests(&eb), ["GET aangifte/pay/5"]);
+    let result = eb.state.approvals.get(id).unwrap().result.unwrap();
+    let data = &result["data"];
+    assert!(
+        data["betaallink"]
+            .as_str()
+            .unwrap()
+            .ends_with("/betaal/sessie-5"),
+        "{result}"
+    );
+    assert_eq!(data["bestond_al"], false);
+    assert_eq!(data["periode"], "3e kwartaal 2026");
+    assert_eq!(data["te_betalen"], "1234,00");
+    assert!(data["let_op"].as_str().unwrap().contains("kan verlopen"));
+
+    // e-Boekhouden answers without a link: an error, nothing to show.
+    let (_, text) = eb.call("btwaangifte_betaallink", json!({"id": 16})).await;
+    let record = eb.approve(&text).await;
+    assert_eq!(record.status, Status::Failed);
+    assert!(record.error.unwrap_or_default().contains("geen betaallink"));
+
+    // Only this tool, only after approval, only these two; no other filing path; and no link was ever opened.
+    assert_eq!(
+        pay_requests(&eb),
+        ["GET aangifte/pay/5", "GET aangifte/pay/16"]
+    );
+    for (method, path, _) in eb.seen.lock().unwrap().iter() {
+        assert!(
+            !path.contains("betaal/"),
+            "EB MCP fetched a payment link: {method} {path}"
+        );
+    }
 }
