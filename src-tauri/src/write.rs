@@ -1104,8 +1104,57 @@ pub struct FactuurToevoegenArgs {
     pub kenmerk: Option<String>,
     /// De factuur meteen boeken als mutatie (standaard zoals het in e-Boekhouden is ingesteld).
     pub direct_boeken: Option<bool>,
+    /// Id van het factuursjabloon voor de opmaak (uit sjablonen met soort factuur; standaard het sjabloon dat de administratie heeft ingesteld).
+    pub sjabloon_id: Option<u64>,
     /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
+}
+
+/// The invoice layout template a tool asks for, checked against the administration's own
+/// (`factuursjabloon/gridtable`, rows with names): it must be there and active. Gives its id and name.
+pub fn factuur_sjabloon(id: u64, sjablonen: Option<&Value>) -> Result<(u64, String), String> {
+    let rows: Vec<Value> = match sjablonen {
+        Some(Value::Array(rows)) => rows.clone(),
+        Some(grid) => grid
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let naam = |row: &Value| {
+        row.get("naam")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    let inactief = |row: &Value| {
+        row.get("inactief")
+            .is_some_and(|v| v.as_bool() == Some(true) || v.as_u64() == Some(1))
+    };
+    let actief = || {
+        rows.iter()
+            .filter(|r| !inactief(r))
+            .filter_map(|r| Some(format!("{} ({})", naam(r), r.get("id")?.as_u64()?)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match rows
+        .iter()
+        .find(|r| r.get("id").and_then(Value::as_u64) == Some(id))
+    {
+        None => Err(format!(
+            "Geen factuursjabloon met id {id} in deze administratie. Kies uit: {}",
+            actief()
+        )),
+        Some(row) if inactief(row) => Err(format!(
+            "Factuursjabloon {} staat op inactief. Kies een actief sjabloon: {}",
+            naam(row),
+            actief()
+        )),
+        Some(row) => Ok((id, naam(row))),
+    }
 }
 
 /// What a new invoice takes from the administration's settings.
@@ -1120,10 +1169,12 @@ pub struct FactuurContext {
     pub vandaag: Date,
 }
 
+/// `sjablonen` is the administration's `factuursjabloon/gridtable`, read only when the tool names a template.
 pub fn factuur_nieuw(
     args: &FactuurToevoegenArgs,
     context: &FactuurContext,
     books: &Books,
+    sjablonen: Option<&Value>,
 ) -> Result<Built, String> {
     let in_ex = args.bedragen.unwrap_or(InEx::Excl);
     let datum = args
@@ -1137,6 +1188,10 @@ pub fn factuur_nieuw(
         return Err("Geef een factuurnummer".into());
     }
     let (items, item_lines) = factuur_items(&args.regels, in_ex, books)?;
+    let sjabloon = args
+        .sjabloon_id
+        .map(|id| factuur_sjabloon(id, sjablonen))
+        .transpose()?;
     let boeken = args.direct_boeken.unwrap_or(context.verwerken);
     let mut factuur = Map::new();
     factuur.insert("relatieId".into(), json!(args.relatie_id));
@@ -1144,7 +1199,10 @@ pub fn factuur_nieuw(
     factuur.insert("inEx".into(), json!(in_ex.code()));
     factuur.insert("datum".into(), date_object(datum));
     factuur.insert("termijn".into(), json!(args.termijn.unwrap_or(0)));
-    factuur.insert("sjabloonId".into(), json!(context.sjabloon_id));
+    factuur.insert(
+        "sjabloonId".into(),
+        json!(sjabloon.as_ref().map_or(context.sjabloon_id, |(id, _)| *id)),
+    );
     factuur.insert("emailSjabloonId".into(), Value::Null);
     factuur.insert("type".into(), json!("N"));
     factuur.insert("btwLaag".into(), json!(0));
@@ -1177,6 +1235,9 @@ pub fn factuur_nieuw(
             format!("{} dagen", args.termijn.unwrap_or(0)),
         ),
     ];
+    if let Some((_, naam)) = &sjabloon {
+        lines.push(line("Factuursjabloon", naam));
+    }
     lines.extend(item_lines);
     lines.push(line(
         "Boeken",
@@ -1211,6 +1272,8 @@ pub struct FactuurWijzigenArgs {
     pub bedragen: Option<InEx>,
     /// Vervangt alle regels van de factuur. Laat weg om ze te houden.
     pub regels: Option<Vec<FactuurRegelArg>>,
+    /// Ander factuursjabloon voor de opmaak (id uit sjablonen met soort factuur).
+    pub sjabloon_id: Option<u64>,
     /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
@@ -1278,11 +1341,13 @@ fn factuur_kept(now: &Value, kind: &str) -> Result<Map<String, Value>, String> {
     Ok(kept)
 }
 
+/// `sjablonen` is the administration's `factuursjabloon/gridtable`, read only when the tool names a template.
 pub fn factuur_gewijzigd(
     args: &FactuurWijzigenArgs,
     now: &Value,
     items: &Value,
     books: &Books,
+    sjablonen: Option<&Value>,
 ) -> Result<Built, String> {
     let mut factuur = factuur_kept(now, "deze factuur")?;
     let old_nummer = now
@@ -1332,6 +1397,18 @@ pub fn factuur_gewijzigd(
         lines.push(line("Kenmerk wordt", kenmerk.trim()));
         factuur.insert("kenmerk".into(), json!(kenmerk.trim()));
         changed = true;
+    }
+    if let Some(id) = args.sjabloon_id {
+        let (id, naam) = factuur_sjabloon(id, sjablonen)?;
+        let old = now.get("sjabloonId").and_then(Value::as_u64);
+        if old != Some(id) {
+            let was = old
+                .and_then(|old| factuur_sjabloon(old, sjablonen).ok())
+                .map_or_else(|| "onbekend".to_owned(), |(_, naam)| naam);
+            lines.push(line("Factuursjabloon wordt", format!("{naam} (was {was})")));
+            factuur.insert("sjabloonId".into(), json!(id));
+            changed = true;
+        }
     }
     let mut item_changes = json!({"insert": [], "update": [], "delete": []});
     match &args.regels {
@@ -2738,9 +2815,10 @@ mod tests {
             factuurtekst: None,
             kenmerk: None,
             direct_boeken: None,
+            sjabloon_id: None,
             account: None,
         };
-        let built = factuur_nieuw(&args, &context(), &books()).unwrap();
+        let built = factuur_nieuw(&args, &context(), &books(), None).unwrap();
         // The body the web form posted to factuur/model for F00003.
         assert_eq!(
             built.body,
@@ -2759,20 +2837,22 @@ mod tests {
         incl.bedragen = Some(InEx::Incl);
         incl.direct_boeken = Some(false);
         incl.regels[0].prijs = 1.09;
-        let body = factuur_nieuw(&incl, &context(), &books()).unwrap().body;
+        let body = factuur_nieuw(&incl, &context(), &books(), None)
+            .unwrap()
+            .body;
         assert_eq!(body["factuurItems"]["insert"][0]["prijsExcl"], 1.0);
         assert_eq!(body["factuurItems"]["insert"][0]["prijsIncl"], 1.09);
         assert!(body.get("verwerk").is_none());
         incl.regels[0].btw_code = "HOOG_INK_21".into();
         assert!(
-            factuur_nieuw(&incl, &context(), &books())
+            factuur_nieuw(&incl, &context(), &books(), None)
                 .unwrap_err()
                 .contains("inkoop")
         );
         incl.regels[0].btw_code = "AFW_VERK".into();
-        assert!(factuur_nieuw(&incl, &context(), &books()).is_err());
+        assert!(factuur_nieuw(&incl, &context(), &books(), None).is_err());
         incl.regels.clear();
-        assert!(factuur_nieuw(&incl, &context(), &books()).is_err());
+        assert!(factuur_nieuw(&incl, &context(), &books(), None).is_err());
     }
 
     fn factuur_now() -> (Value, Value) {
@@ -2796,14 +2876,15 @@ mod tests {
             kenmerk: None,
             bedragen: None,
             regels: None,
+            sjabloon_id: None,
             account: None,
         };
         assert!(
-            factuur_gewijzigd(&args, &now, &items, &books()).is_err(),
+            factuur_gewijzigd(&args, &now, &items, &books(), None).is_err(),
             "nothing to change"
         );
         args.factuurtekst = Some("Bedankt".into());
-        let body = factuur_gewijzigd(&args, &now, &items, &books())
+        let body = factuur_gewijzigd(&args, &now, &items, &books(), None)
             .unwrap()
             .body;
         assert_eq!(body["factuur"]["id"], 73391389);
@@ -2821,7 +2902,7 @@ mod tests {
         // A new number takes its mutatie along; new lines replace the old ones.
         args.nummer = Some("F00009".into());
         args.regels = Some(vec![factuurregel()]);
-        let body = factuur_gewijzigd(&args, &now, &items, &books())
+        let body = factuur_gewijzigd(&args, &now, &items, &books(), None)
             .unwrap()
             .body;
         assert_eq!(
@@ -2830,6 +2911,109 @@ mod tests {
         );
         assert_eq!(body["factuurItems"]["delete"], json!([148611205]));
         assert_eq!(body["factuurItems"]["insert"].as_array().unwrap().len(), 1);
+    }
+
+    fn sjablonen() -> Value {
+        json!({"data": [
+            {"id": 878203, "naam": "Factuursjabloon", "inactief": false, "type": "E"},
+            {"id": 900001, "naam": "Engels", "inactief": false, "type": "E"},
+            {"id": 900002, "naam": "Oud", "inactief": true, "type": "A"}
+        ]})
+    }
+
+    #[test]
+    fn an_invoice_takes_the_layout_template_it_is_given() {
+        let mut args = FactuurToevoegenArgs {
+            relatie_id: 46484769,
+            datum: None,
+            nummer: None,
+            termijn: None,
+            bedragen: None,
+            regels: vec![factuurregel()],
+            factuurtekst: None,
+            kenmerk: None,
+            direct_boeken: None,
+            sjabloon_id: Some(900001),
+            account: None,
+        };
+        let built = factuur_nieuw(&args, &context(), &books(), Some(&sjablonen())).unwrap();
+        assert_eq!(built.body["factuur"]["sjabloonId"], 900001);
+        assert!(
+            built
+                .lines
+                .iter()
+                .any(|l| l.label == "Factuursjabloon" && l.value == "Engels"),
+            "{:?}",
+            built.lines
+        );
+        // Unknown, inactive, or not read: refused before anything is asked.
+        args.sjabloon_id = Some(5);
+        let unknown = factuur_nieuw(&args, &context(), &books(), Some(&sjablonen())).unwrap_err();
+        assert!(
+            unknown.contains("Geen factuursjabloon met id 5")
+                && unknown.contains("Factuursjabloon (878203), Engels (900001)")
+                && !unknown.contains("Oud"),
+            "{unknown}"
+        );
+        args.sjabloon_id = Some(900002);
+        assert!(
+            factuur_nieuw(&args, &context(), &books(), Some(&sjablonen()))
+                .unwrap_err()
+                .contains("inactief")
+        );
+        args.sjabloon_id = Some(900001);
+        assert!(factuur_nieuw(&args, &context(), &books(), None).is_err());
+        // Without one the administration's own stays, and no line is added.
+        args.sjabloon_id = None;
+        let built = factuur_nieuw(&args, &context(), &books(), None).unwrap();
+        assert_eq!(built.body["factuur"]["sjabloonId"], 878203);
+        assert!(!built.lines.iter().any(|l| l.label == "Factuursjabloon"));
+        // Plain arrays are read too.
+        assert_eq!(
+            factuur_sjabloon(878203, Some(&sjablonen()["data"])),
+            Ok((878203, "Factuursjabloon".to_owned()))
+        );
+    }
+
+    #[test]
+    fn an_invoice_edit_shows_the_old_and_the_new_template() {
+        let (now, items) = factuur_now();
+        let mut args = FactuurWijzigenArgs {
+            id: 73391389,
+            datum: None,
+            nummer: None,
+            termijn: None,
+            factuurtekst: None,
+            kenmerk: None,
+            bedragen: None,
+            regels: None,
+            sjabloon_id: Some(900001),
+            account: None,
+        };
+        let built = factuur_gewijzigd(&args, &now, &items, &books(), Some(&sjablonen())).unwrap();
+        assert_eq!(built.body["factuur"]["sjabloonId"], 900001);
+        assert!(
+            built
+                .lines
+                .iter()
+                .any(|l| l.label == "Factuursjabloon wordt"
+                    && l.value == "Engels (was Factuursjabloon)"),
+            "{:?}",
+            built.lines
+        );
+        // The template it has already is no change.
+        args.sjabloon_id = Some(878203);
+        assert!(
+            factuur_gewijzigd(&args, &now, &items, &books(), Some(&sjablonen()))
+                .unwrap_err()
+                .contains("niets gewijzigd")
+        );
+        args.sjabloon_id = Some(900002);
+        assert!(
+            factuur_gewijzigd(&args, &now, &items, &books(), Some(&sjablonen()))
+                .unwrap_err()
+                .contains("inactief")
+        );
     }
 
     #[test]
