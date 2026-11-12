@@ -261,8 +261,8 @@ impl Ontvanger {
     /// The addresses the relatie has, named, or `None` when it has none.
     fn adressen(&self) -> Option<String> {
         let named: Vec<String> = [
-            ("voor herinneringen", &self.herinnering),
-            ("voor facturen", &self.factuur),
+            ("herinneringen", &self.herinnering),
+            ("facturen", &self.factuur),
             ("algemeen", &self.algemeen),
         ]
         .into_iter()
@@ -313,12 +313,19 @@ pub(super) fn aanmaning(
         "Codes",
         "e-Boekhouden vult codes als [NAAM], [FACTNUMMER] en [OPENSTAAND] per relatie en factuur in",
     ));
+    // Which address gets the mail is e-Boekhouden's choice, and the bundle does not show it: the approval says
+    // so and lists what EB MCP knows of each relatie, without claiming who receives it or how many mails go out.
+    lines.push(line(
+        "Ontvanger",
+        "e-Boekhouden kiest zelf naar welk e-mailadres van de relatie de herinnering gaat",
+    ));
     for ontvanger in ontvangers {
         lines.push(line(
-            &format!("Aan {}", known(&ontvanger.naam)),
-            ontvanger.adressen().unwrap_or_else(|| {
-                "geen e-mailadres bekend: e-Boekhouden verstuurt deze niet".to_owned()
-            }),
+            &format!("Relatie {}", known(&ontvanger.naam)),
+            match ontvanger.adressen() {
+                Some(adressen) => format!("bekende e-mailadressen: {adressen}"),
+                None => "EB MCP kent geen e-mailadres van deze relatie; e-Boekhouden verstuurt dan niets aan haar".to_owned(),
+            },
         ));
     }
     for post in posten {
@@ -432,6 +439,17 @@ pub(super) fn afboeken(
     let mut totaal = 0.0;
     for post in posten {
         let amount = round2(bedrag.unwrap_or(post.open));
+        // An own amount writes off part of what is open, in the same direction: a creditor post open at -500 is
+        // never written off with +500, which would book 1000 the wrong way.
+        if bedrag.is_some() && (amount * post.open < 0.0 || amount.abs() > round2(post.open).abs())
+        {
+            return Err(format!(
+                "Factuur {}: het bedrag {} past niet bij wat er open staat ({}); geef een bedrag met hetzelfde teken, hoogstens het openstaande bedrag",
+                post.factuur,
+                money(amount),
+                money(post.open)
+            ));
+        }
         if !amount.is_finite() || amount == 0.0 {
             return Err(format!(
                 "Factuur {}: er is niets af te boeken (bedrag {})",
@@ -526,6 +544,46 @@ pub(super) fn afgeboekt(answer: &Value) -> Result<Value, String> {
         ));
     }
     Ok(json!({"afgeboekt": gelukt, "fouten": fouten}))
+}
+
+/// What e-Boekhouden answered on `OpenPost/aanmaning`. `Err` only when the answer says that nothing was sent
+/// (`sendEmails` is there and 0). Any other answer that does not say how many went out may still have sent mail:
+/// it comes back as an unknown outcome with the advice to look at the history first, never as a plain error
+/// that invites sending the same reminder again.
+pub(super) fn verzonden(answer: &Value) -> Result<Value, String> {
+    let zonder = field(answer, "noEmail")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    match field(answer, "sendEmails").map(Value::as_u64) {
+        Some(Some(0)) => Err(if zonder > 0 {
+            format!(
+                "e-Boekhouden heeft geen herinnering verstuurd: bij {zonder} relatie(s) is geen e-mailadres bekend"
+            )
+        } else {
+            "e-Boekhouden heeft geen herinnering verstuurd en gaf geen uitleg".to_owned()
+        }),
+        Some(Some(verstuurd)) => Ok(json!({
+            "uitkomst": "verstuurd",
+            "verstuurd": verstuurd,
+            "niet_verstuurd_zonder_emailadres": zonder,
+        })),
+        _ => Ok(json!({
+            "uitkomst": "onbekend",
+            "antwoord_van_e_boekhouden": answer,
+            "let_op": "e-Boekhouden nam de opdracht aan maar zei niet hoeveel herinneringen er zijn verstuurd. Er kan dus al e-mail zijn verstuurd. Probeer het niet opnieuw voordat de historie (aanmaning_historie per factuur) is bekeken, en vertel de gebruiker dat de uitkomst onbekend is.",
+        })),
+    }
+}
+
+/// Whether the answer of `POST auth` says the signed-in user is an accountant (`isAccountant`), as
+/// e-Boekhouden's own app reads it (`!!t.isAccountant`).
+pub(super) fn is_accountant(auth: &Value) -> bool {
+    match field(auth, "isAccountant") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().is_some_and(|n| n != 0.0),
+        Some(Value::String(s)) => !s.is_empty(),
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------- berichten
