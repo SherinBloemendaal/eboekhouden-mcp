@@ -522,9 +522,29 @@ impl EbMcp {
 
 /// The sum of the `bedrag` column, as the screen's "Totaal".
 fn totaal(rows: &[Value]) -> f64 {
+    // The sum of no lines is negative zero in Rust; adding zero makes it the plain 0 a reader expects.
     rows.iter()
         .map(|row| number(row.get("bedrag")).unwrap_or(0.0))
-        .sum()
+        .sum::<f64>()
+        + 0.0
+}
+
+#[cfg(test)]
+mod totaal_tests {
+    use super::*;
+
+    #[test]
+    fn a_rubriek_without_lines_totals_plain_zero() {
+        assert!(totaal(&[]).is_sign_positive());
+        assert_eq!(serde_json::json!(totaal(&[])).to_string(), "0.0");
+        assert_eq!(
+            totaal(&[
+                serde_json::json!({"bedrag": 12}),
+                serde_json::json!({"bedrag": 3})
+            ]),
+            15.0
+        );
+    }
 }
 
 // ---------------------------------------------------------------- the tools
