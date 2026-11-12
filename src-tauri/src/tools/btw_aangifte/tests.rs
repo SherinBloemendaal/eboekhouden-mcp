@@ -3,6 +3,25 @@
 use super::*;
 use std::sync::{Arc, Mutex, RwLock};
 
+/// The paths that file, pay or confirm, written out here on their own, so the tests do not judge the guard
+/// by the guard. A path is one of them when it starts with or contains one of these, lowercase.
+const FILING_LITERAL: &[&str] = &[
+    "btw-aangifte/createandsend",
+    "suppletie/createandsend",
+    "icpopgave/dosend/",
+    "btw-aangifte-be/",
+    "klantenlisting/process",
+    "/bevestigen",
+    "aangifte/pay/",
+    "aangifte/paystatus",
+    "/andersbetaald",
+];
+
+fn files_literally(path: &str) -> bool {
+    let path = format!("/{}", path.to_ascii_lowercase().trim_start_matches('/'));
+    FILING_LITERAL.iter().any(|part| path.contains(part))
+}
+
 /// The source of this part without its tests, without the list of filing paths and, with `requests`, without
 /// the two functions that make its requests.
 fn source(requests: bool) -> String {
@@ -31,6 +50,40 @@ fn source(requests: bool) -> String {
     .concat()
 }
 
+/// Every `self.<name>` and `this.<name>` in `code`, with what follows the name.
+fn members(code: &str) -> Vec<String> {
+    let bytes = code.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = Vec::new();
+    for word in ["self", "this"] {
+        let mut from = 0;
+        while let Some(at) = code[from..].find(word) {
+            let start = from + at;
+            from = start + word.len();
+            if start > 0 && ident(bytes[start - 1]) {
+                continue;
+            }
+            let mut i = from;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() || bytes[i] != b'.' {
+                continue;
+            }
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let name_start = i;
+            while i < bytes.len() && ident(bytes[i]) {
+                i += 1;
+            }
+            out.push(code[name_start..i].to_owned());
+        }
+    }
+    out
+}
+
 #[test]
 fn refuses_every_path_that_files_pays_or_confirms() {
     for path in [
@@ -39,13 +92,17 @@ fn refuses_every_path_that_files_pays_or_confirms() {
         "suppletie/createandsend",
         "icpopgave/dosend/2026/K/3",
         "btw-aangifte-be/verwerk",
-        "btw-aangifte-be/download",
+        "btw-aangifte-be/download?jaar=2026",
         "btw-aangifte-be/bevestigen/4",
         "btw-aangifte-be/annuleren/4",
+        "klantenlisting/process",
+        "klantenlisting/2026/bevestigen",
         "aangifte/pay/12",
         "aangifte/paystatus/abc",
+        "aangifte/paystatusgrid/12",
         "aangifte/12/andersbetaald",
     ] {
+        assert!(files_literally(path), "the literal list misses {path}");
         let refused = refuse_filing(path).unwrap_err();
         assert!(
             refused.contains("Er is niets verstuurd"),
@@ -59,44 +116,99 @@ fn refuses_every_path_that_files_pays_or_confirms() {
         "btw-aangifte/correcties/toggleignore",
         "icpopgave/regels",
         "icpopgave",
+        "icpopgave/2026/K/3",
         "aangifte/gridtable",
         "aangifte/12",
+        "klantenlisting/gridtable",
     ] {
+        assert!(!files_literally(path), "{path}");
         assert_eq!(refuse_filing(path), Ok(()), "{path}");
     }
 }
 
-/// Every request of this part goes through the two guarded functions, and no path that files is written
-/// anywhere else in the part: no tool can reach one.
+/// No path that files is written anywhere in the part but in its list; and the only calls that can reach
+/// e-Boekhouden are the two guarded functions: every `self.`/`this.` in the part is on a short list of this
+/// part's own helpers, the steps every tool takes, and fields of its own small types.
 #[test]
-fn the_source_names_no_filing_path_and_makes_no_unguarded_request() {
+fn the_source_names_no_filing_path_and_reaches_e_boekhouden_only_through_the_guard() {
     let code = source(false).to_ascii_lowercase();
-    for part in FILING {
+    for pattern in FILING {
+        let literal = pattern.split("{}").next().unwrap();
         assert!(
-            !code.contains(part),
-            "{part} appears outside the list of filing paths"
+            !code.contains(literal),
+            "{literal} appears outside the list of filing paths"
         );
     }
+
     let code = source(true);
-    for call in [
-        ".fetch(",
-        ".change(",
-        ".change_done(",
-        ".simple(",
-        "api_send",
-        "api_get",
-        "api_download",
-        "api_editor",
-        ".first_active(",
-        ".with_items(",
-        ".books(",
-        ".factuur_context(",
-    ] {
+    const ALLOWED: &[&str] = &[
+        // The steps of every tool in tools.rs: logging, approval and the task; none of them calls e-Boekhouden.
+        "begin",
+        "end",
+        "refuse",
+        "write_tool",
+        "approve",
+        // The two guarded requests, and this part's helpers built on them only (their bodies are scanned too).
+        "btwaangifte_get",
+        "btwaangifte_send",
+        "btwaangifte_rows",
+        "btwaangifte_sent",
+        "icp_opgave_van",
+        "icp_regels",
+        "icp_eigen_regel",
+        "icp_opgave_inhoud",
+        // Fields and methods of this part's own value types (BtwPeriode, IcpPeriode, BtwBedragen).
+        "jaar",
+        "soort",
+        "id",
+        "months",
+        "first_month",
+        "get",
+        "btw_1a",
+        "btw_1b",
+        "btw_1c",
+        "btw_1d",
+        "btw_2a",
+        "btw_4a",
+        "btw_4b",
+        "btw_5b",
+        "btw_5d",
+    ];
+    let found = members(&code);
+    assert!(
+        found.contains(&"btwaangifte_get".to_owned()),
+        "the scan finds calls"
+    );
+    for name in &found {
         assert!(
-            !code.contains(call),
-            "{call} makes a request around btwaangifte_get and btwaangifte_send"
+            ALLOWED.contains(&name.as_str()),
+            "self.{name} or this.{name} is not on the list of calls that cannot reach e-Boekhouden"
         );
     }
+    for word in [
+        "api_", "reqwest", "state.", "client.", ".fetch(", ".change(", ".change_", "save_pdf",
+        "editor_",
+    ] {
+        let hits: Vec<&str> = code
+            .lines()
+            .filter(|l| l.contains(word) && !l.trim_start().starts_with("//"))
+            .collect();
+        assert!(hits.is_empty(), "{word} in {hits:?}");
+    }
+    let mut from = 0;
+    while let Some(at) = code[from..].find("Self::") {
+        let rest = &code[from + at + 6..];
+        assert!(
+            rest.starts_with("btwaangifte_omzet_router()")
+                || rest.starts_with("btwaangifte_icp_router()")
+                || rest.starts_with("new(")
+                || rest.chars().next().is_some_and(char::is_uppercase),
+            "Self::{}",
+            &rest[..rest.len().min(30)]
+        );
+        from += at + 6;
+    }
+    assert!(!code.contains("EbMcp::"), "a call by the type's name");
 }
 
 // ---------------------------------------------------------------- end to end
@@ -109,82 +221,155 @@ fn grid_of(names: &[&str], rows: Value) -> Value {
     json!({"colMetadata": names.iter().map(|n| json!({"name": n})).collect::<Vec<_>>(), "data": rows, "rowCount": count, "limit": 200, "offset": 0})
 }
 
+/// A query parameter of a request uri.
+fn param(query: Option<&str>, key: &str) -> Option<String> {
+    query?.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| v.to_owned())
+    })
+}
+
+/// Rubriek 1a of the opgave of the third quarter: 201 lines, so a second page; line 77 is the last one, on it.
+fn rubriek_1a(offset: usize) -> Value {
+    let all: Vec<Value> = (0..201)
+        .map(|n| {
+            if n == 200 {
+                json!([77, "1e kwartaal 2026", "Duitsland (DE)", "DE123456789", 100])
+            } else {
+                json!([
+                    1000 + n,
+                    "1e kwartaal 2026",
+                    "Belgie (BE)",
+                    "BE0123456789",
+                    1
+                ])
+            }
+        })
+        .collect();
+    let page: Vec<Value> = all.into_iter().skip(offset).take(200).collect();
+    json!({"colMetadata": [{"name": "id"}, {"name": "tijdvak"}, {"name": "land"}, {"name": "btwNummer"}, {"name": "bedrag"}],
+           "data": page, "rowCount": 201, "limit": 200, "offset": offset})
+}
+
 /// A stand-in for e-Boekhouden's btw screens. It answers the filing paths too, so a request to one would be
 /// seen; the test checks that none comes.
 async fn btw_mock(seen: Seen) -> String {
     use axum::http::{Method, StatusCode, Uri};
     use axum::response::IntoResponse;
-    let app = axum::Router::new().fallback(move |method: Method, uri: Uri, body: axum::body::Bytes| {
-        let seen = seen.clone();
-        async move {
-            let path = uri.path().trim_start_matches("/v1/api/").to_owned();
-            let full = match uri.query() {
-                Some(q) => format!("{path}?{q}"),
-                None => path.clone(),
-            };
-            let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            seen.lock().unwrap().push((method.to_string(), full, body));
-            let empty = || grid_of(&["id"], json!([]));
-            let answer = match (method.as_str(), path.as_str()) {
-                ("GET", "aangifte/gridtable") => grid_of(
-                    &["id", "datum", "soort", "periode", "status"],
-                    json!([[5, "2026-10-20", "OB", "3e kwartaal 2026", "Geaccepteerd"],
-                           [6, "2026-11-01", "SUP", "2e kwartaal 2026", "Geaccepteerd"],
-                           [9, "2026-10-21", "ICP", "3e kwartaal 2026", "Geaccepteerd"],
-                           [12, "2026-10-21", "Btw", "3e kwartaal 2026", ""]]),
-                ),
-                ("GET", "aangifte/5") => json!({"id": 5, "periode": "3e kwartaal 2026"}),
-                ("GET", "aangifte/aangifteomzetbelasting/5" | "aangifte/aangifteomzetbelasting/6") => {
-                    json!({"berekening": {"voorbelasting": 600}})
-                }
-                ("GET", "suppletie/getSuppletieDetails/5" | "suppletie/getSuppletieDetails/6") => json!({"id": 6}),
-                ("GET", "suppletie/canSuppletie/5") => json!({"succes": true, "melding": ""}),
-                ("GET", "suppletie/canSuppletie/7") => json!({"succes": false, "melding": "Er loopt al een suppletie"}),
-                ("GET", "suppletie/getSuppletie/5") => json!({
-                    "periodDescription": "3e kwartaal 2026", "saldoAlAangegeven": 1500,
-                    "verzondenAangifte": {"identificerendeGegevens": {"aangiftejaar": "2026", "aangiftetijdvak": "27"}},
-                    "rubrieken": [{"rubriekCode": "1a", "btwVoorgesteld": 2100}, {"rubriekCode": "5b", "btwVoorgesteld": 400}]
-                }),
-                ("GET", "btw-aangifte/aangifte") => json!({
-                    "periodDescription": "3e kwartaal 2026", "eaStatus": null, "bhDatum": "",
-                    "rubrieken": [{"rubriekCode": "1a", "btwVoorgesteld": 2100}, {"rubriekCode": "1b", "btwVoorgesteld": 90},
-                                  {"rubriekCode": "5b", "btwVoorgesteld": 630}]
-                }),
-                ("GET", "mutatie/btw-specificatie/gridtable") => grid_of(
-                    &["mutatieNr", "datum", "omschrijving", "btw"],
-                    json!([[3908, "2026-08-02", "Factuur 12", "HOOG_VERK_21"]]),
-                ),
-                ("GET", "btw-aangifte/correcties/gridtable") => grid_of(
-                    &["period", "periodCode", "omzetVerschil", "btwVerschil", "verschilGenegeerd"],
-                    json!([["1e kwartaal 2026", "261", 500, 105, false]]),
-                ),
-                ("GET", "icpopgave/2026/K/3") => json!({"id": 55, "eaPeriod": "2026K3", "jaar": 2026, "periodType": "K", "period": 3,
+    let app = axum::Router::new().fallback(
+        move |method: Method, uri: Uri, body: axum::body::Bytes| {
+            let seen = seen.clone();
+            async move {
+                let path = uri.path().trim_start_matches("/v1/api/").to_owned();
+                let full = match uri.query() {
+                    Some(q) => format!("{path}?{q}"),
+                    None => path.clone(),
+                };
+                let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                seen.lock().unwrap().push((method.to_string(), full, body));
+                let empty = || grid_of(&["id"], json!([]));
+                let offset: usize = param(uri.query(), "offset")
+                    .and_then(|o| o.parse().ok())
+                    .unwrap_or(0);
+                let answer = match (method.as_str(), path.as_str()) {
+                    // The filing paths: answered, so a request would be seen.
+                    (_, p) if files_literally(p) => json!(true),
+                    ("GET", "aangifte/gridtable") => grid_of(
+                        &["id", "datum", "soort", "periode", "status"],
+                        json!([[5, "2026-10-20", "OB", "3e kwartaal 2026", "Geaccepteerd"],
+                               [6, "2026-11-01", "SUP", "2e kwartaal 2026", "Geaccepteerd"],
+                               [9, "2026-10-21", "ICP", "3e kwartaal 2026", "Geaccepteerd"],
+                               [12, "2026-10-21", "Btw", "3e kwartaal 2026", ""]]),
+                    ),
+                    ("GET", "aangifte/5") => json!({"id": 5, "periode": "3e kwartaal 2026"}),
+                    (
+                        "GET",
+                        "aangifte/aangifteomzetbelasting/5" | "aangifte/aangifteomzetbelasting/6",
+                    ) => {
+                        json!({"berekening": {"voorbelasting": 600}})
+                    }
+                    (
+                        "GET",
+                        "suppletie/getSuppletieDetails/5" | "suppletie/getSuppletieDetails/6",
+                    ) => json!({"id": 6}),
+                    ("GET", "suppletie/canSuppletie/5") => json!({"succes": true, "melding": ""}),
+                    ("GET", "suppletie/canSuppletie/7") => {
+                        json!({"succes": false, "melding": "Er loopt al een suppletie"})
+                    }
+                    ("GET", "suppletie/getSuppletie/5") => json!({
+                        "periodDescription": "3e kwartaal 2026", "saldoAlAangegeven": 1500,
+                        "verzondenAangifte": {"identificerendeGegevens": {"aangiftejaar": "2026", "aangiftetijdvak": "27"}},
+                        "rubrieken": [{"rubriekCode": "1a", "btwVoorgesteld": 2100}, {"rubriekCode": "5b", "btwVoorgesteld": 400}]
+                    }),
+                    ("GET", "btw-aangifte/aangifte")
+                        if param(uri.query(), "periodId").as_deref() == Some("2") =>
+                    {
+                        // The second quarter was sent already, with other amounts than the books give now.
+                        json!({
+                            "periodDescription": "2e kwartaal 2026", "eaStatus": "acknowledgement", "bhDatum": "03-07-2026 10:00",
+                            "rubrieken": [{"rubriekCode": "1a", "btwVoorgesteld": 2500}, {"rubriekCode": "5b", "btwVoorgesteld": 700}],
+                            "verzondenAangifte": {
+                                "doorUBinnenland": {"omzetbelastingHoog": "2400", "omzetbelastingLaag": "0"},
+                                "aanUBinnenland": {"omzetbelastingVerlegd": 0},
+                                "aanUBuitenland": {"omzetbelastingBuitenEUInvoer": 0, "omzetbelastingGoederenBinnenEU": 12},
+                                "berekening": {"voorbelasting": "650", "kleineOndernemersregeling": 0}
+                            }
+                        })
+                    }
+                    ("GET", "btw-aangifte/aangifte") => json!({
+                        "periodDescription": "3e kwartaal 2026", "eaStatus": null, "bhDatum": "",
+                        "rubrieken": [{"rubriekCode": "1a", "btwVoorgesteld": 2100}, {"rubriekCode": "1b", "btwVoorgesteld": 90},
+                                      {"rubriekCode": "5b", "btwVoorgesteld": 630}]
+                    }),
+                    ("GET", "mutatie/btw-specificatie/gridtable") => grid_of(
+                        &["mutatieNr", "datum", "omschrijving", "btw"],
+                        json!([[3908, "2026-08-02", "Factuur 12", "HOOG_VERK_21"]]),
+                    ),
+                    ("GET", "btw-aangifte/correcties/gridtable") => grid_of(
+                        &[
+                            "period",
+                            "periodCode",
+                            "omzetVerschil",
+                            "btwVerschil",
+                            "verschilGenegeerd",
+                        ],
+                        json!([["1e kwartaal 2026", "261", 500, 105, false]]),
+                    ),
+                    ("GET", "icpopgave/2026/K/3") => {
+                        json!({"id": 55, "eaPeriod": "2026K3", "jaar": 2026, "periodType": "K", "period": 3,
                                                         "btwNummer": "NL001234567B01", "bedrijf": "Studio Noord", "contactpersoon": "Lisa",
-                                                        "telefoon": "", "onderdeelFiscaleEenheid": ""}),
-                ("GET", "icpopgave/9") => json!({"id": 9, "jaar": 2026, "periodType": "K", "period": 3}),
-                ("GET", "icpopgave/regels/2026K3/1A/gridtable") => grid_of(
-                    &["id", "tijdvak", "land", "btwNummer", "bedrag"],
-                    json!([[77, "1e kwartaal 2026", "Duitsland (DE)", "DE123456789", 100]]),
-                ),
-                ("GET", "icpopgave/regels/77") => json!({"id": 77, "bedrag": 100, "btwNummer": "DE123456789", "land": "DE",
-                                                         "jaar": 2026, "periodType": "K", "periodId": 1}),
-                ("GET", "icpopgave/landen") => json!([{"code": "DE", "land": "Duitsland", "einddatum": null},
-                                                      {"code": "BE", "land": "Belgie", "einddatum": null}]),
-                ("GET", p) if p.starts_with("icpopgave/regels/") || p.starts_with("aangifte/2026K3/") => empty(),
-                ("POST", "btw-aangifte/verwerk") => json!([4001, 4002]),
-                ("POST", "suppletie/verwerk") => json!([4003]),
-                ("POST", "btw-aangifte/correcties/toggleignore") => json!(true),
-                ("PUT", "icpopgave") => json!(true),
-                ("POST", "icpopgave/regels") => json!({"id": 78}),
-                ("PUT", "icpopgave/regels") => json!(true),
-                ("DELETE", "icpopgave/regels/77") => json!(true),
-                // The filing paths: answered, so a request would be seen.
-                (_, p) if refuse_filing(p).is_err() => json!(true),
-                _ => return StatusCode::NOT_FOUND.into_response(),
-            };
-            axum::Json(answer).into_response()
-        }
-    });
+                                                        "telefoon": "", "onderdeelFiscaleEenheid": ""})
+                    }
+                    ("GET", "icpopgave/9") => {
+                        json!({"id": 9, "jaar": 2026, "periodType": "K", "period": 3})
+                    }
+                    ("GET", "icpopgave/regels/2026K3/1A/gridtable") => rubriek_1a(offset),
+                    ("GET", "icpopgave/regels/77") => {
+                        json!({"id": 77, "bedrag": 100, "btwNummer": "DE123456789", "land": "DE",
+                                                         "jaar": 2026, "periodType": "K", "periodId": 1})
+                    }
+                    ("GET", "icpopgave/landen") => {
+                        json!([{"code": "DE", "land": "Duitsland", "einddatum": null},
+                                                      {"code": "BE", "land": "Belgie", "einddatum": null}])
+                    }
+                    ("GET", p)
+                        if p.starts_with("icpopgave/regels/") || p.starts_with("aangifte/2026K3/") =>
+                    {
+                        empty()
+                    }
+                    ("POST", "btw-aangifte/verwerk") => json!([4001, 4002]),
+                    ("POST", "suppletie/verwerk") => json!([4003]),
+                    ("POST", "btw-aangifte/correcties/toggleignore") => json!(true),
+                    ("PUT", "icpopgave") => json!(true),
+                    ("POST", "icpopgave/regels") => json!({"id": 78}),
+                    ("PUT", "icpopgave/regels") => json!(true),
+                    ("DELETE", "icpopgave/regels/77") => json!(true),
+                    _ => return StatusCode::NOT_FOUND.into_response(),
+                };
+                axum::Json(answer).into_response()
+            }
+        },
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -231,163 +416,230 @@ async fn settled(state: &crate::state::AppState, id: u64) -> approvals::Record {
     panic!("proposal {id} did not settle");
 }
 
-#[tokio::test]
-async fn reads_draws_up_and_corrects_only_after_approval_and_never_files() {
-    use crate::accounts::{AccountInput, Store, WriteMode};
-    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let seen: Seen = Arc::default();
-    let jar = Arc::new(crate::state::testing::FakeJar::default());
-    let state = Arc::new(crate::state::testing::state_with(
-        jar,
-        &btw_mock(seen.clone()).await,
-    ));
-    let input = |mode: WriteMode| AccountInput {
-        label: "Studio Noord".into(),
-        username: "lisa@studionoord.example".into(),
-        store: Store::System,
-        op_ref: None,
-        op_title: None,
-        op_vault: None,
-        write: mode,
-    };
-    let account = state.accounts.add(input(WriteMode::Off)).unwrap();
-    state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
-    state.add_session(account.id, &account.label, "sessie");
-    let set_write = |mode: WriteMode| state.accounts.update(account.id, input(mode)).unwrap();
+/// EB MCP on a stand-in for e-Boekhouden, with one account and an MCP session. Each test makes its own,
+/// because EB MCP allows 60 requests a minute per running app.
+struct Harness {
+    state: Arc<crate::state::AppState>,
+    account: uuid::Uuid,
+    seen: Seen,
+    http: reqwest::Client,
+    url: String,
+    session: Option<String>,
+}
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let mcp = crate::mcp::router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
-    tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
-    let http = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{port}{}", crate::mcp::PATH);
-    let post = |body: Value, session: Option<String>| {
-        let mut request = http
-            .post(&url)
+const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+impl Harness {
+    async fn new() -> Self {
+        use crate::accounts::WriteMode;
+        let seen: Seen = Arc::default();
+        let jar = Arc::new(crate::state::testing::FakeJar::default());
+        let state = Arc::new(crate::state::testing::state_with(
+            jar,
+            &btw_mock(seen.clone()).await,
+        ));
+        let account = state.accounts.add(Self::input(WriteMode::Off)).unwrap();
+        state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
+        state.add_session(account.id, &account.label, "sessie");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mcp = crate::mcp::router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
+        tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
+        let mut harness = Self {
+            state,
+            account: account.id,
+            seen,
+            http: reqwest::Client::new(),
+            url: format!("http://127.0.0.1:{port}{}", crate::mcp::PATH),
+            session: None,
+        };
+        let init = harness
+            .post(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}}))
+            .await;
+        harness.session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        harness
+            .post(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        harness
+    }
+
+    fn input(mode: crate::accounts::WriteMode) -> crate::accounts::AccountInput {
+        crate::accounts::AccountInput {
+            label: "Studio Noord".into(),
+            username: "lisa@studionoord.example".into(),
+            store: crate::accounts::Store::System,
+            op_ref: None,
+            op_title: None,
+            op_vault: None,
+            write: mode,
+        }
+    }
+
+    fn set_write(&self, mode: crate::accounts::WriteMode) {
+        self.state
+            .accounts
+            .update(self.account, Self::input(mode))
+            .unwrap();
+    }
+
+    async fn post(&self, body: Value) -> reqwest::Response {
+        let mut request = self
+            .http
+            .post(&self.url)
             .bearer_auth(TOKEN)
             .header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", "2025-06-18")
             .json(&body);
-        if let Some(s) = session {
+        if let Some(s) = &self.session {
             request = request.header("mcp-session-id", s);
         }
-        request.send()
-    };
-    let init = post(
-        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}}),
-        None,
-    )
-    .await
-    .unwrap();
-    let session = init
-        .headers()
-        .get("mcp-session-id")
-        .map(|v| v.to_str().unwrap().to_owned());
-    post(
-        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-        session.clone(),
-    )
-    .await
-    .unwrap();
-    let call = |tool: &'static str, arguments: Value| {
-        let request = post(
-            json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}),
-            session.clone(),
-        );
-        async move { answer_of(&request.await.unwrap().text().await.unwrap()) }
-    };
-    let changes = |seen: &Seen| -> Vec<(String, String, Value)> {
-        seen.lock()
+        request.send().await.unwrap()
+    }
+
+    async fn call(&self, tool: &str, arguments: Value) -> (bool, String) {
+        let response = self
+            .post(json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}))
+            .await;
+        answer_of(&response.text().await.unwrap())
+    }
+
+    /// The requests that were no read, in order.
+    fn changes(&self) -> Vec<(String, String, Value)> {
+        self.seen
+            .lock()
             .unwrap()
             .iter()
             .filter(|(method, _, _)| method != "GET")
             .cloned()
             .collect()
-    };
+    }
+
+    /// How often the opgave of the third quarter of 2026 was opened.
+    fn opened(&self) -> usize {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p, _)| p == "icpopgave/2026/K/3")
+            .count()
+    }
+
+    fn lines_of(&self, id: u64) -> Vec<(String, String)> {
+        self.state
+            .approvals
+            .list()
+            .into_iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| (l.label.clone(), l.value.clone()))
+            .collect()
+    }
+
+    /// Approves the change a "waiting" answer names, and waits until it ran.
+    async fn approve(&self, text: &str) -> approvals::Record {
+        let id = waiting_id(text);
+        assert!(self.state.approvals.decide(id, true, 10));
+        settled(&self.state, id).await
+    }
+
+    async fn refuse(&self, text: &str) -> approvals::Record {
+        let id = waiting_id(text);
+        assert!(self.state.approvals.decide(id, false, 10));
+        settled(&self.state, id).await
+    }
+
+    /// Not one request of the run went to a path that files, pays or confirms, by the list written out in
+    /// this file, not by the guard under test.
+    fn filed_nothing(&self, at_least: usize) {
+        let all = self.seen.lock().unwrap();
+        assert!(all.len() >= at_least, "the run made its requests");
+        for (method, path, _) in all.iter() {
+            assert!(!files_literally(path), "{method} {path}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn reads_and_draws_up_returns_only_after_approval_and_never_files() {
+    use crate::accounts::WriteMode;
+    use approvals::Status;
+    let eb = Harness::new().await;
 
     // Reading works on a read-only account.
-    let (is_error, text) = call("btwaangiftes", json!({})).await;
+    let (is_error, text) = eb.call("btwaangiftes", json!({})).await;
     assert!(!is_error && text.contains("\"soort\":\"OB\""), "{text}");
-    let (is_error, text) = call("suppleties", json!({})).await;
+    let (is_error, text) = eb.call("suppleties", json!({})).await;
     assert!(!is_error, "{text}");
     let list: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(list["data"]["data"].as_array().unwrap().len(), 1);
     assert_eq!(list["data"]["data"][0]["id"], 6);
-    let (is_error, text) = call("icp_opgaven", json!({})).await;
-    assert!(!is_error, "{text}");
-    let list: Value = serde_json::from_str(&text).unwrap();
-    let ids: Vec<&Value> = list["data"]["data"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| &r["id"])
-        .collect();
-    assert_eq!(ids, [&json!(9)], "the Belgian return is not an ICP-opgave");
-    let (is_error, text) = call("btwaangifte", json!({"id": 5})).await;
+    let (is_error, text) = eb.call("btwaangifte", json!({"id": 5})).await;
     assert!(!is_error && text.contains("voorbelasting"), "{text}");
-    let (is_error, text) = call(
-        "btwaangifte_mutaties",
-        json!({"jaar": 2026, "periode": 3, "rubriek": "1a"}),
-    )
-    .await;
+    let (is_error, text) = eb
+        .call(
+            "btwaangifte_mutaties",
+            json!({"jaar": 2026, "periode": 3, "rubriek": "1a"}),
+        )
+        .await;
     assert!(!is_error && text.contains("\"mutatieNr\":3908"), "{text}");
-    assert!(seen.lock().unwrap().iter().any(|(_, p, _)| {
+    assert!(eb.seen.lock().unwrap().iter().any(|(_, p, _)| {
         p.starts_with("mutatie/btw-specificatie/gridtable")
             && p.contains("periodStart=20260701")
             && p.contains("periodEnd=20260930")
             && p.contains("category=1a")
     }));
-    let (is_error, text) = call(
-        "btwaangifte_correcties",
-        json!({"jaar": 2026, "periode": 3, "rubriek": "1a"}),
-    )
-    .await;
+    let (is_error, text) = eb
+        .call(
+            "btwaangifte_correcties",
+            json!({"jaar": 2026, "periode": 3, "rubriek": "1a"}),
+        )
+        .await;
     assert!(
         !is_error && text.contains("\"periodCode\":\"261\""),
         "{text}"
     );
-    let (is_error, text) = call("suppletie", json!({"aangifte_id": 5})).await;
+    let (is_error, text) = eb.call("suppletie", json!({"aangifte_id": 5})).await;
     assert!(
         !is_error && text.contains("\"kan_suppletie\":true"),
         "{text}"
     );
-    let (is_error, text) = call("suppletie", json!({"aangifte_id": 7})).await;
+    let (is_error, text) = eb.call("suppletie", json!({"aangifte_id": 7})).await;
     assert!(
         !is_error && text.contains("Er loopt al een suppletie"),
         "{text}"
     );
-    let (is_error, _) = call("suppletie", json!({"id": 6, "aangifte_id": 5})).await;
+    let (is_error, _) = eb
+        .call("suppletie", json!({"id": 6, "aangifte_id": 5}))
+        .await;
     assert!(is_error);
-    let (is_error, text) = call(
-        "icp_opgave",
-        json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3}),
-    )
-    .await;
-    assert!(
-        !is_error && text.contains("\"totaal\":100.0") && text.contains("\"verzendingen\""),
-        "{text}"
-    );
-    let (is_error, text) = call("icp_opgave", json!({"id": 9})).await;
-    assert!(!is_error && text.contains("\"3b\""), "{text}");
-    assert!(changes(&seen).is_empty(), "reading changed nothing");
+    assert!(eb.changes().is_empty(), "reading changed nothing");
 
     // Writing is off: refused, nothing read or asked.
-    let before = seen.lock().unwrap().len();
-    let (is_error, text) = call("btwaangifte_verwerken", json!({"jaar": 2026, "periode": 3})).await;
+    let before = eb.seen.lock().unwrap().len();
+    let (is_error, text) = eb
+        .call("btwaangifte_verwerken", json!({"jaar": 2026, "periode": 3}))
+        .await;
     assert!(is_error && text.contains("alleen-lezen"), "{text}");
-    assert_eq!(seen.lock().unwrap().len(), before);
-    assert_eq!(state.approvals.count(), 0);
+    assert_eq!(eb.seen.lock().unwrap().len(), before);
+    assert_eq!(eb.state.approvals.count(), 0);
 
-    // Even without approval set for the account, these always ask; refused: nothing goes out.
-    set_write(WriteMode::Auto);
-    let (is_error, text) = call(
-        "btwaangifte_verwerken",
-        json!({"jaar": 2026, "periode": 3, "btw_5b": 700}),
-    )
-    .await;
+    // Even without approval set for the account, drawing up always asks; refused: nothing goes out.
+    eb.set_write(WriteMode::Auto);
+    let (is_error, text) = eb
+        .call(
+            "btwaangifte_verwerken",
+            json!({"jaar": 2026, "periode": 3, "btw_5b": 700}),
+        )
+        .await;
     assert!(!is_error, "{text}");
     let id = waiting_id(&text);
-    let proposal = state
+    let proposal = eb
+        .state
         .approvals
         .list()
         .into_iter()
@@ -395,11 +647,7 @@ async fn reads_draws_up_and_corrects_only_after_approval_and_never_files() {
         .unwrap();
     assert!(proposal.danger);
     assert_eq!(proposal.title, "Btw-aangifte verwerken: 3e kwartaal 2026");
-    let lines: Vec<(String, String)> = proposal
-        .lines
-        .iter()
-        .map(|l| (l.label.clone(), l.value.clone()))
-        .collect();
+    let lines = eb.lines_of(id);
     assert!(
         lines.contains(&("Periode".into(), "3e kwartaal 2026".into())),
         "{lines:?}"
@@ -415,93 +663,55 @@ async fn reads_draws_up_and_corrects_only_after_approval_and_never_files() {
         lines.contains(&("Saldo (5g)".into(), "1490,00 te betalen".into())),
         "{lines:?}"
     );
-    assert!(state.approvals.decide(id, false, 1));
-    assert_eq!(settled(&state, id).await.status, approvals::Status::Refused);
-    assert!(changes(&seen).is_empty());
+    assert!(lines.contains(&(
+        "Bij de Belastingdienst".into(),
+        "niet via e-Boekhouden verstuurd".into()
+    )));
+    assert_eq!(eb.refuse(&text).await.status, Status::Refused);
+    assert!(eb.changes().is_empty());
 
-    // Approved: exactly the screen's request.
-    set_write(WriteMode::Ask);
-    let mut approved = 0;
-    let mut approve_last = |text: String| {
-        approved += 1;
-        let id = waiting_id(&text);
-        assert!(
-            state
-                .approvals
-                .list()
-                .iter()
-                .any(|p| p.id == id && p.danger)
-        );
-        assert!(state.approvals.decide(id, true, 10 + approved));
-        id
-    };
-    let (_, text) = call("btwaangifte_verwerken", json!({"jaar": 2026, "periode": 3})).await;
-    assert!(changes(&seen).is_empty(), "nothing before the answer");
-    let id = approve_last(text);
-    assert_eq!(settled(&state, id).await.status, approvals::Status::Done);
-    assert_eq!(
-        changes(&seen),
-        vec![(
-            "POST".into(),
-            "btw-aangifte/verwerk".into(),
-            json!({
-                "s1aBtw": 2100, "s1bBtw": 90, "s1cBtw": 0, "s1dBtw": 0, "s2aBtw": 0, "s4aBtw": 0, "s4bBtw": 0,
-                "s5bBtw": 630, "s5dBtw": 0, "periodYear": 2026, "periodType": "K", "periodId": 3
-            })
-        )]
+    // Approved: exactly the screen's request, made only after the answer.
+    eb.set_write(WriteMode::Ask);
+    let (_, text) = eb
+        .call("btwaangifte_verwerken", json!({"jaar": 2026, "periode": 3}))
+        .await;
+    assert!(eb.changes().is_empty(), "nothing before the answer");
+    assert_eq!(eb.approve(&text).await.status, Status::Done);
+
+    // A return sent already is drawn up with what was sent, as the screen does.
+    let (_, text) = eb
+        .call("btwaangifte_verwerken", json!({"jaar": 2026, "periode": 2}))
+        .await;
+    let lines = eb.lines_of(waiting_id(&text));
+    assert!(
+        lines.contains(&("Bedragen".into(), "zoals de aangifte verstuurd is".into())),
+        "{lines:?}"
     );
+    assert!(lines.contains(&(
+        "Bij de Belastingdienst".into(),
+        "verstuurd en geaccepteerd".into()
+    )));
+    assert!(
+        lines
+            .iter()
+            .any(|(l, v)| l == "Al verwerkt" && v.contains("EB MCP weet niet")),
+        "{lines:?}"
+    );
+    assert_eq!(eb.approve(&text).await.status, Status::Done);
 
-    let (_, text) = call("suppletie_verwerken", json!({"aangifte_id": 5})).await;
-    let id = approve_last(text);
-    assert_eq!(settled(&state, id).await.status, approvals::Status::Done);
-    let (_, text) = call(
-        "btwaangifte_verschil_negeren",
-        json!({"jaar": 2026, "periode": 3, "rubriek": "1a", "periode_code": "261"}),
-    )
-    .await;
-    let id = approve_last(text);
-    assert_eq!(settled(&state, id).await.status, approvals::Status::Done);
-    let (_, text) = call(
-        "icp_opgave_wijzigen",
-        json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3, "telefoon": "0612345678"}),
-    )
-    .await;
-    let id = approve_last(text);
-    assert_eq!(settled(&state, id).await.status, approvals::Status::Done);
+    let (_, text) = eb
+        .call("suppletie_verwerken", json!({"aangifte_id": 5}))
+        .await;
+    assert_eq!(eb.approve(&text).await.status, Status::Done);
+    let (_, text) = eb
+        .call(
+            "btwaangifte_verschil_negeren",
+            json!({"jaar": 2026, "periode": 3, "rubriek": "1a", "periode_code": "261"}),
+        )
+        .await;
+    assert_eq!(eb.approve(&text).await.status, Status::Done);
 
-    // A bad line is refused before anything is asked or sent.
-    let asked = state.approvals.history(None).len();
-    let (is_error, text) = call("icp_regel_toevoegen", json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3, "rubriek": "1a",
-        "land": "US", "btw_nummer": "US12345", "bedrag": 10, "correctie_jaar": 2026, "correctie_periode_type": "kwartaal", "correctie_periode": 1})).await;
-    assert!(is_error && text.contains("Onbekende landcode"), "{text}");
-    assert_eq!(state.approvals.history(None).len(), asked);
-
-    let (_, text) = call("icp_regel_toevoegen", json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3, "rubriek": "1a",
-        "land": "de", "btw_nummer": "DE987654321", "bedrag": -40, "correctie_jaar": 2026, "correctie_periode_type": "kwartaal", "correctie_periode": 2})).await;
-    let id = approve_last(text);
-    assert_eq!(settled(&state, id).await.status, approvals::Status::Done);
-    let (_, text) = call(
-        "icp_regel_wijzigen",
-        json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3, "id": 77, "bedrag": 120}),
-    )
-    .await;
-    let id = approve_last(text);
-    assert_eq!(settled(&state, id).await.status, approvals::Status::Done);
-    let (_, text) = call(
-        "icp_regel_verwijderen",
-        json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3, "id": 77}),
-    )
-    .await;
-    let id = approve_last(text);
-    assert_eq!(settled(&state, id).await.status, approvals::Status::Done);
-    let (is_error, text) = call(
-        "icp_regel_verwijderen",
-        json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3, "id": 99}),
-    )
-    .await;
-    assert!(is_error && text.contains("Regel 99"), "{text}");
-
-    let changes = changes(&seen);
+    let changes = eb.changes();
     assert_eq!(
         changes
             .iter()
@@ -509,45 +719,233 @@ async fn reads_draws_up_and_corrects_only_after_approval_and_never_files() {
             .collect::<Vec<_>>(),
         [
             "POST btw-aangifte/verwerk",
+            "POST btw-aangifte/verwerk",
             "POST suppletie/verwerk",
             "POST btw-aangifte/correcties/toggleignore",
+        ]
+    );
+    assert_eq!(
+        changes[0].2,
+        json!({"s1aBtw": 2100, "s1bBtw": 90, "s1cBtw": 0, "s1dBtw": 0, "s2aBtw": 0, "s4aBtw": 0, "s4bBtw": 0,
+               "s5bBtw": 630, "s5dBtw": 0, "periodYear": 2026, "periodType": "K", "periodId": 3})
+    );
+    assert_eq!(
+        changes[1].2,
+        json!({"s1aBtw": 2400, "s1bBtw": 0, "s1cBtw": 0, "s1dBtw": 0, "s2aBtw": 0, "s4aBtw": 0, "s4bBtw": 12,
+               "s5bBtw": 650, "s5dBtw": 0, "periodYear": 2026, "periodType": "K", "periodId": 2}),
+        "the amounts as sent, not the books of now"
+    );
+    assert_eq!(
+        changes[2].2,
+        json!({"s1aBtw": 2100, "s1bBtw": 0, "s1cBtw": 0, "s1dBtw": 0, "s2aBtw": 0, "s4aBtw": 0, "s4bBtw": 0,
+               "s5bBtw": 400, "s5dBtw": 0, "periodYear": 2026, "periodType": "K", "periodId": 3})
+    );
+    assert_eq!(
+        changes[3].2,
+        json!({"category": "1a", "periodCode": "261", "btw": 105, "omzet": 500, "delete": false})
+    );
+    eb.filed_nothing(20);
+}
+
+#[tokio::test]
+async fn opens_and_keeps_the_icp_opgave_only_after_approval_and_never_files() {
+    use crate::accounts::WriteMode;
+    use approvals::Status;
+    let eb = Harness::new().await;
+
+    // Reading a sent opgave works on a read-only account; nothing opens the opgave of a period.
+    let (is_error, text) = eb.call("icp_opgaven", json!({})).await;
+    assert!(!is_error, "{text}");
+    let list: Value = serde_json::from_str(&text).unwrap();
+    let ids: Vec<&Value> = list["data"]["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| &r["id"])
+        .collect();
+    assert_eq!(ids, [&json!(9)], "the Belgian return is not an ICP-opgave");
+    let (is_error, text) = eb.call("icp_opgave", json!({"id": 9})).await;
+    assert!(!is_error && text.contains("\"3b\""), "{text}");
+    assert_eq!(eb.opened(), 0);
+
+    // Opening a period asks like a change; writing off: refused, and nothing opened.
+    let (is_error, _) = eb
+        .call(
+            "icp_opgave_openen",
+            json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3}),
+        )
+        .await;
+    assert!(is_error);
+    assert_eq!(eb.opened(), 0);
+
+    eb.set_write(WriteMode::Ask);
+    let (is_error, text) = eb
+        .call(
+            "icp_opgave_openen",
+            json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3}),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    assert!(
+        eb.lines_of(waiting_id(&text))
+            .iter()
+            .any(|(l, v)| l == "Gevolg" && v.contains("lege opgave"))
+    );
+    assert_eq!(eb.opened(), 0, "nothing opened before the answer");
+    assert_eq!(eb.refuse(&text).await.status, Status::Refused);
+    assert_eq!(eb.opened(), 0);
+
+    // Approved: the opgave with every line of rubriek 1a, past the first page of 200; the total counts all 201.
+    let (_, text) = eb
+        .call(
+            "icp_opgave_openen",
+            json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3}),
+        )
+        .await;
+    let id = waiting_id(&text);
+    assert_eq!(eb.approve(&text).await.status, Status::Done);
+    assert_eq!(eb.opened(), 1);
+    let detail = eb.state.approvals.get(id).unwrap();
+    let result = detail
+        .result
+        .clone()
+        .unwrap_or_else(|| panic!("{:?}", detail.record));
+    let rubriek = &result["data"]["rubrieken"]["1a"];
+    assert_eq!(rubriek["regels"].as_array().unwrap().len(), 201, "{result}");
+    assert_eq!(rubriek["totaal"], 300.0);
+    assert!(eb.seen.lock().unwrap().iter().any(|(_, p, _)| {
+        p.starts_with("icpopgave/regels/2026K3/1A/gridtable") && p.contains("offset=200")
+    }));
+
+    // The details: the period is opened only after the approval.
+    let before = eb.opened();
+    let (_, text) = eb
+        .call(
+            "icp_opgave_wijzigen",
+            json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3, "telefoon": "0612345678"}),
+        )
+        .await;
+    assert_eq!(eb.opened(), before, "not opened before the answer");
+    assert_eq!(eb.approve(&text).await.status, Status::Done);
+
+    // A bad line is refused before anything is asked or sent.
+    let asked = eb.state.approvals.history(None).len();
+    let (is_error, text) = eb
+        .call(
+            "icp_regel_toevoegen",
+            json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3, "rubriek": "1a", "land": "US",
+                   "btw_nummer": "US12345", "bedrag": 10, "correctie_jaar": 2026, "correctie_periode_type": "kwartaal", "correctie_periode": 1}),
+        )
+        .await;
+    assert!(is_error && text.contains("Onbekende landcode"), "{text}");
+    let (is_error, text) = eb
+        .call(
+            "icp_regel_toevoegen",
+            json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3, "rubriek": "4", "land": "BE",
+                   "btw_nummer": "BE0123456789", "bedrag": 10, "correctie_jaar": 2026, "correctie_periode_type": "kwartaal", "correctie_periode": 1}),
+        )
+        .await;
+    assert!(is_error && text.contains("Rubriek 4"), "{text}");
+    assert_eq!(eb.state.approvals.history(None).len(), asked);
+
+    let (_, text) = eb
+        .call(
+            "icp_regel_toevoegen",
+            json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3, "rubriek": "1a", "land": "de",
+                   "btw_nummer": "DE987654321", "bedrag": -40, "correctie_jaar": 2026, "correctie_periode_type": "kwartaal", "correctie_periode": 2}),
+        )
+        .await;
+    assert_eq!(eb.approve(&text).await.status, Status::Done);
+    // An A-B-C supply: rubriek 4, without a corrected period.
+    let (_, text) = eb
+        .call(
+            "icp_regel_toevoegen",
+            json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3, "rubriek": "4", "land": "BE",
+                   "btw_nummer": "BE0123456789", "bedrag": 2500}),
+        )
+        .await;
+    let lines = eb.lines_of(waiting_id(&text));
+    assert!(
+        lines.contains(&(
+            "Rubriek".into(),
+            "4 Intracommunautaire A-B-C-leveringen".into()
+        )),
+        "{lines:?}"
+    );
+    assert!(!lines.iter().any(|(l, _)| l == "Gecorrigeerd tijdvak"));
+    assert_eq!(eb.approve(&text).await.status, Status::Done);
+    // Line 77 sits on the second page of rubriek 1a; its corrected period moves to the second quarter.
+    let (_, text) = eb
+        .call(
+            "icp_regel_wijzigen",
+            json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3, "id": 77, "bedrag": 120,
+                   "correctie_jaar": 2026, "correctie_periode_type": "kwartaal", "correctie_periode": 2}),
+        )
+        .await;
+    let lines = eb.lines_of(waiting_id(&text));
+    assert!(
+        lines.contains(&("Gecorrigeerd tijdvak was".into(), "1e kwartaal 2026".into())),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&(
+            "Gecorrigeerd tijdvak wordt".into(),
+            "2e kwartaal 2026".into()
+        )),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&("Bedrag was".into(), "100,00".into())),
+        "{lines:?}"
+    );
+    assert_eq!(eb.approve(&text).await.status, Status::Done);
+    let (_, text) = eb
+        .call(
+            "icp_regel_verwijderen",
+            json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3, "id": 77}),
+        )
+        .await;
+    assert_eq!(eb.approve(&text).await.status, Status::Done);
+    let (is_error, text) = eb
+        .call(
+            "icp_regel_verwijderen",
+            json!({"jaar": 2026, "periode_type": "kwartaal", "periode": 3, "id": 99}),
+        )
+        .await;
+    assert!(is_error && text.contains("Regel 99"), "{text}");
+
+    let changes = eb.changes();
+    assert_eq!(
+        changes
+            .iter()
+            .map(|(m, p, _)| format!("{m} {p}"))
+            .collect::<Vec<_>>(),
+        [
             "PUT icpopgave",
+            "POST icpopgave/regels",
             "POST icpopgave/regels",
             "PUT icpopgave/regels",
             "DELETE icpopgave/regels/77",
         ]
     );
     assert_eq!(
-        changes[1].2,
-        json!({"s1aBtw": 2100, "s1bBtw": 0, "s1cBtw": 0, "s1dBtw": 0, "s2aBtw": 0, "s4aBtw": 0, "s4bBtw": 0,
-               "s5bBtw": 400, "s5dBtw": 0, "periodYear": 2026, "periodType": "K", "periodId": 3})
-    );
-    assert_eq!(
-        changes[2].2,
-        json!({"category": "1a", "periodCode": "261", "btw": 105, "omzet": 500, "delete": false})
-    );
-    assert_eq!(
-        changes[3].2,
+        changes[0].2,
         json!({"id": 55, "btwNummer": "NL001234567B01", "bedrijf": "Studio Noord", "contactpersoon": "Lisa",
                "telefoon": "0612345678", "onderdeelFiscaleEenheid": ""})
     );
     assert_eq!(
-        changes[4].2,
+        changes[1].2,
         json!({"bedrag": -40, "btwNummer": "DE987654321", "rubriek": "1A", "eaPeriode": "2026K3", "land": "DE",
                "jaar": "2026", "periodType": "K", "periodId": "2"})
     );
     assert_eq!(
-        changes[5].2,
-        json!({"id": 77, "bedrag": 120, "btwNummer": "DE123456789", "rubriek": "1A", "eaPeriode": "2026K3", "land": "DE",
-               "jaar": "2026", "periodType": "K", "periodId": "1"})
+        changes[2].2,
+        json!({"bedrag": 2500, "btwNummer": "BE0123456789", "rubriek": "4", "eaPeriode": "2026K3", "land": "BE"})
     );
-
-    // Not one request of the whole run went to a path that files, pays or confirms.
-    for (method, path, _) in seen.lock().unwrap().iter() {
-        assert_eq!(
-            refuse_filing(path.split('?').next().unwrap()),
-            Ok(()),
-            "{method} {path}"
-        );
-    }
+    assert_eq!(
+        changes[3].2,
+        json!({"id": 77, "bedrag": 120, "btwNummer": "DE123456789", "rubriek": "1A", "eaPeriode": "2026K3", "land": "DE",
+               "jaar": "2026", "periodType": "K", "periodId": "2"})
+    );
+    eb.filed_nothing(30);
 }

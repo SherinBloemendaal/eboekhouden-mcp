@@ -38,6 +38,7 @@ pub(super) const WRITES: &[&str] = &[
     "btwaangifte_verwerken",
     "btwaangifte_verschil_negeren",
     "suppletie_verwerken",
+    "icp_opgave_openen",
     "icp_opgave_wijzigen",
     "icp_regel_toevoegen",
     "icp_regel_wijzigen",
@@ -45,7 +46,11 @@ pub(super) const WRITES: &[&str] = &[
 ];
 /// The ones in `WRITES` that cannot be undone.
 #[cfg(test)]
-pub(super) const DESTRUCTIVE: &[&str] = &["icp_regel_verwijderen"];
+pub(super) const DESTRUCTIVE: &[&str] = &[
+    "btwaangifte_verwerken",
+    "suppletie_verwerken",
+    "icp_regel_verwijderen",
+];
 
 impl EbMcp {
     /// The tools of this part: the btw-aangifte and the suppletie, and the ICP-opgave.
@@ -55,31 +60,53 @@ impl EbMcp {
 }
 
 // filing-paths:start
-/// What files a return, an ICP-opgave or a suppletie with the Belastingdienst, or pays or confirms one, in
-/// e-Boekhouden's own web app (public bundle, 2026-11-12). Lowercase parts of a path under /v1/api/:
+/// What files a return, an ICP-opgave, a suppletie or a client listing with the tax authority, or pays or
+/// confirms one, in e-Boekhouden's own web app (public bundle, 2026-11-12). Paths under /v1/api/, lowercase;
+/// `{}` stands for one segment, and a path is refused when these segments appear in it one after the other:
 ///
 /// - `POST btw-aangifte/createandsend`: the btw-aangifte, "Aangifte nu elektronisch versturen".
 /// - `POST suppletie/createandsend`: the suppletie, "Suppletie versturen".
 /// - `GET icpopgave/dosend/{jaar}/{periodType}/{periodId}`: the ICP-opgave, "Opgave elektronisch versturen".
 /// - `btw-aangifte-be/...`: the Belgian return; its `verwerk` makes the file for Intervat in the same request,
 ///   `bevestigen` and `annuleren` confirm or undo that it was sent.
-/// - `GET aangifte/pay/{id}`, `aangifte/paystatus/...`: paying a return to the Belastingdienst with iDEAL.
+/// - `klantenlisting/process`, `klantenlisting/{id}/bevestigen`: the Belgian client listing, made and confirmed.
+/// - `GET aangifte/pay/{id}`, `aangifte/paystatus/...`, `aangifte/paystatusgrid/...`: paying a return with iDEAL.
 /// - `GET aangifte/{id}/andersbetaald`: marking a return as paid some other way.
 const FILING: &[&str] = &[
     "createandsend",
     "dosend",
     "btw-aangifte-be",
+    "klantenlisting/process",
+    "klantenlisting/{}/bevestigen",
     "aangifte/pay",
+    "aangifte/paystatus",
+    "aangifte/paystatusgrid",
     "andersbetaald",
 ];
 // filing-paths:end
 
+/// Whether the segments of `pattern` (`{}` for any one) appear in `path` one after the other.
+fn has_segments(path: &[&str], pattern: &str) -> bool {
+    let pattern: Vec<&str> = pattern.split('/').collect();
+    path.windows(pattern.len()).any(|window| {
+        window
+            .iter()
+            .zip(&pattern)
+            .all(|(got, want)| *want == "{}" || got == want)
+    })
+}
+
 /// Refuses a path that files, pays or confirms a return. Every request of this part passes here first.
 fn refuse_filing(path: &str) -> Result<(), String> {
-    let path = path.trim().trim_matches('/').to_ascii_lowercase();
-    if FILING.iter().any(|part| path.contains(part)) {
+    let path = path.trim().to_ascii_lowercase();
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if FILING
+        .iter()
+        .any(|pattern| has_segments(&segments, pattern))
+    {
         return Err(
-            "EB MCP verstuurt, betaalt en bevestigt geen btw-aangifte, ICP-opgave of suppletie bij de Belastingdienst. \
+            "EB MCP verstuurt, betaalt en bevestigt geen btw-aangifte, ICP-opgave, suppletie of klantenlisting bij de belastingdienst. \
              Dat doet de gebruiker zelf in e-Boekhouden. Er is niets verstuurd."
                 .into(),
         );
@@ -115,18 +142,20 @@ impl EbMcp {
 // requests:end
 
 impl EbMcp {
-    /// The list of returns sent ("Verstuurde aangiftes"), all of it, as named rows. It holds btw-aangiftes,
-    /// suppleties and ICP-opgaven together; the screen tells them apart by `soort`.
-    async fn btwaangifte_sent(&self, run: &Run) -> Result<Vec<Value>, String> {
-        /// Pages of `MAX_ROWS`; a few returns a year, so this is decades.
-        const PAGES: u32 = 10;
+    /// Every row of a grid, page by page, as named rows; `query` holds the grid's own filters.
+    async fn btwaangifte_rows(
+        &self,
+        run: &Run,
+        path: &str,
+        query: &[(String, String)],
+    ) -> Result<Vec<Value>, String> {
+        /// Pages of `MAX_ROWS`: ten thousand rows, far more than a return or an opgave has.
+        const PAGES: u32 = 50;
         let mut rows = Vec::new();
         for page in 0..PAGES {
-            let query = grid(Some(MAX_ROWS), Some(page * MAX_ROWS))?;
-            let answer = named_rows(
-                self.btwaangifte_get(run, "aangifte/gridtable", query)
-                    .await?,
-            );
+            let mut page_query = grid(Some(MAX_ROWS), Some(page * MAX_ROWS))?;
+            page_query.extend(query.iter().cloned());
+            let answer = named_rows(self.btwaangifte_get(run, path, page_query).await?);
             let found = answer
                 .get("data")
                 .and_then(Value::as_array)
@@ -144,9 +173,15 @@ impl EbMcp {
             }
         }
         Err(format!(
-            "Er staan meer dan {} verstuurde aangiftes in e-Boekhouden; gebruik btwaangiftes met offset om ze te bladeren",
+            "e-Boekhouden gaf meer dan {} rijen op {path}; EB MCP leest er niet meer dan dat",
             PAGES * MAX_ROWS
         ))
+    }
+
+    /// The list of returns sent ("Verstuurde aangiftes"), all of it, as named rows. It holds btw-aangiftes,
+    /// suppleties and ICP-opgaven together; the screen tells them apart by `soort`.
+    async fn btwaangifte_sent(&self, run: &Run) -> Result<Vec<Value>, String> {
+        self.btwaangifte_rows(run, "aangifte/gridtable", &[]).await
     }
 }
 
@@ -371,17 +406,20 @@ impl IcpPeriode {
     }
 
     /// From what e-Boekhouden gives for an opgave or a line: `jaar`, `periodType` and `period` or `periodId`.
+    /// None when one of them is missing or out of range.
     fn from_record(record: &Value, id_key: &str) -> Option<Self> {
         let jaar = number(record.get("jaar")).ok()? as i32;
-        let soort = match record.get("periodType").and_then(Value::as_str)? {
-            "M" => "M",
-            "2M" => "2M",
-            "K" => "K",
-            "J" => "J",
+        let tijdvak = match record.get("periodType").and_then(Value::as_str)? {
+            "M" => IcpTijdvak::Maand,
+            "2M" => IcpTijdvak::TweeMaanden,
+            "K" => IcpTijdvak::Kwartaal,
+            "J" => IcpTijdvak::Jaar,
             _ => return None,
         };
-        let id = number(record.get(id_key)).ok()? as u32;
-        Some(Self { jaar, soort, id })
+        // A missing or odd period number is no period: the checks of `new` decide, so nothing indexes out of range.
+        let id = number(record.get(id_key)).ok()?;
+        let id = (id.fract() == 0.0 && (1.0..=12.0).contains(&id)).then_some(id as u32);
+        Self::new(jaar, Some(tijdvak), id).ok()
     }
 
     fn first_month(self) -> u32 {

@@ -8,12 +8,18 @@ use super::*;
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct IcpOpgaveArgs {
-    /// Id van een verstuurde ICP-opgave (uit icp_opgaven). Of geef jaar, periode_type en periode.
-    pub id: Option<u64>,
+    /// Id van een verstuurde ICP-opgave (uit icp_opgaven).
+    pub id: u64,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct IcpOpgaveOpenenArgs {
     /// Jaar van de opgave, 2010 tot en met dit jaar.
-    pub jaar: Option<i32>,
+    pub jaar: i32,
     /// maand, twee_maanden, kwartaal of jaar.
-    pub periode_type: Option<IcpTijdvak>,
+    pub periode_type: IcpTijdvak,
     /// Nummer van de maand (1 tot 12), de twee maanden (1 tot 4) of het kwartaal (1 tot 4). Niet nodig bij jaar.
     pub periode: Option<u32>,
     /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
@@ -128,7 +134,7 @@ pub struct IcpRegelWijzigenArgs {
     pub periode_type: IcpTijdvak,
     /// Nummer van de maand (1 tot 12), de twee maanden (1 tot 4) of het kwartaal (1 tot 4). Niet nodig bij jaar.
     pub periode: Option<u32>,
-    /// Id van de regel (uit icp_opgave).
+    /// Id van de regel (uit icp_opgave_openen).
     pub id: u64,
     /// Nieuwe landcode.
     pub land: Option<String>,
@@ -154,7 +160,7 @@ pub struct IcpRegelVerwijderenArgs {
     pub periode_type: IcpTijdvak,
     /// Nummer van de maand (1 tot 12), de twee maanden (1 tot 4) of het kwartaal (1 tot 4). Niet nodig bij jaar.
     pub periode: Option<u32>,
-    /// Id van de regel (uit icp_opgave).
+    /// Id van de regel (uit icp_opgave_openen).
     pub id: u64,
     /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
@@ -308,17 +314,12 @@ fn rubriek_line(rubriek: IcpRubriek) -> approvals::Line {
     )
 }
 
-/// The details of the opgave (`PUT icpopgave`), as the screen's form sends them: all five, with the new ones
-/// over what e-Boekhouden has.
-fn opgave_wijzigen(
-    opgave: &Value,
-    periode: IcpPeriode,
-    args: &IcpOpgaveWijzigenArgs,
-) -> Result<Built, String> {
-    let id = opgave
-        .get("id")
-        .and_then(Value::as_u64)
-        .ok_or("e-Boekhouden gaf de ICP-opgave zonder id")?;
+/// A new detail of the opgave: its request key, its label for the user, and its value.
+type Veld = (&'static str, &'static str, String);
+
+/// The details the user wants changed, checked as the screen's form does; before anything is read, because
+/// opening the opgave of a period may make one.
+fn opgave_velden(args: &IcpOpgaveWijzigenArgs) -> Result<Vec<Veld>, String> {
     // key, label, new value, longest, only letters, digits, + and *
     let velden: [(&str, &str, Option<&String>, usize, bool); 5] = [
         ("btwNummer", "OB-nummer", args.ob_nummer.as_ref(), 50, true),
@@ -339,13 +340,9 @@ fn opgave_wijzigen(
             true,
         ),
     ];
-    let mut body = serde_json::Map::new();
-    body.insert("id".into(), json!(id));
-    let mut lines = vec![line("ICP-opgave", periode.naam())];
+    let mut out = Vec::new();
     for (key, label, new, max, code) in velden {
-        let before = text_of(opgave, key);
         let Some(new) = new.map(|v| v.trim().to_owned()) else {
-            body.insert(key.into(), opgave.get(key).cloned().unwrap_or(Value::Null));
             continue;
         };
         if new.chars().count() > max {
@@ -360,40 +357,74 @@ fn opgave_wijzigen(
                 "{label} kan alleen letters, cijfers, '+' en '*' bevatten"
             ));
         }
-        body.insert(key.into(), json!(new));
-        if new != before {
-            lines.push(line(&format!("{label} was"), known(before)));
-            lines.push(line(
-                &format!("{label} wordt"),
-                if new.is_empty() {
-                    "(leeg)".to_owned()
-                } else {
-                    new
-                },
-            ));
-        }
+        out.push((key, label, new));
     }
-    if lines.len() == 1 {
+    if out.is_empty() {
         return Err("Er is niets gewijzigd: geef aan wat er anders moet".into());
     }
+    Ok(out)
+}
+
+/// What the user approves for new details: the period and the new values. The values of now are read only
+/// after the approval, because opening the opgave of a period may make one in e-Boekhouden.
+fn opgave_wijzigen(periode: IcpPeriode, velden: &[Veld]) -> Built {
+    let mut lines = vec![line("ICP-opgave", periode.naam())];
+    for (_, label, new) in velden {
+        lines.push(line(
+            &format!("{label} wordt"),
+            if new.is_empty() {
+                "(leeg)".to_owned()
+            } else {
+                new.clone()
+            },
+        ));
+    }
+    lines.push(line(
+        "Let op",
+        "EB MCP leest de huidige gegevens pas na het akkoord: het openen van een tijdvak zonder opgave kan in e-Boekhouden een lege opgave maken. Het antwoord van de tool noemt de oude waarden.",
+    ));
     lines.push(line(
         "Gevolg",
         "de gegevens van de ICP-opgave veranderen in e-Boekhouden. Er gaat niets naar de Belastingdienst.",
     ));
-    Ok(Built {
-        body: Value::Object(body),
+    Built {
+        body: Value::Null,
         title: format!("ICP-opgave wijzigen: {}", periode.naam()),
         lines,
-    })
+    }
 }
 
-/// The rows of a grid answer, named.
-fn rows_of(grid: Value) -> Vec<Value> {
-    named_rows(grid)
-        .get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
+/// The request of the screen's form (`PUT icpopgave`): all five details, the new ones over what e-Boekhouden
+/// has; and what changed, old and new.
+fn opgave_body(opgave: &Value, velden: &[Veld]) -> Result<(Value, Value), String> {
+    let id = opgave
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or("e-Boekhouden gaf de ICP-opgave zonder id")?;
+    let mut body = serde_json::Map::new();
+    body.insert("id".into(), json!(id));
+    let mut changed = Vec::new();
+    for key in [
+        "btwNummer",
+        "bedrijf",
+        "contactpersoon",
+        "telefoon",
+        "onderdeelFiscaleEenheid",
+    ] {
+        match velden.iter().find(|(k, _, _)| *k == key) {
+            Some((_, label, new)) => {
+                let was = text_of(opgave, key);
+                if &was != new {
+                    changed.push(json!({"veld": label, "was": was, "wordt": new}));
+                }
+                body.insert(key.into(), json!(new));
+            }
+            None => {
+                body.insert(key.into(), opgave.get(key).cloned().unwrap_or(Value::Null));
+            }
+        }
+    }
+    Ok((Value::Object(body), Value::Array(changed)))
 }
 
 /// What the tools that change an opgave need of it: its period, its `eaPeriod` (which the lines and the status
@@ -427,13 +458,10 @@ impl EbMcp {
         })
     }
 
-    /// The lines of one rubriek of an opgave not sent yet.
+    /// The lines of one rubriek of an opgave not sent yet, every page of them.
     async fn icp_regels(&self, run: &Run, ea: &str, rubriek: &str) -> Result<Vec<Value>, String> {
         let path = format!("icpopgave/regels/{ea}/{rubriek}/gridtable");
-        Ok(rows_of(
-            self.btwaangifte_get(run, &path, grid(Some(MAX_ROWS), None)?)
-                .await?,
-        ))
+        self.btwaangifte_rows(run, &path, &[]).await
     }
 
     /// A line the user keeps himself, found in the rubrieken of the opgave, with its rubriek and its own record.
@@ -461,9 +489,34 @@ impl EbMcp {
             }
         }
         Err(format!(
-            "Regel {id} staat niet bij de regels van rubriek 1a, 1b, 2 of 4 van de ICP-opgave over {}; zie icp_opgave",
+            "Regel {id} staat niet bij de regels van rubriek 1a, 1b, 2 of 4 van de ICP-opgave over {}; zie icp_opgave_openen",
             opgave.periode.naam()
         ))
+    }
+}
+
+impl EbMcp {
+    /// An opened opgave with its lines per rubriek and the sendings of its period, every row of them.
+    async fn icp_opgave_inhoud(&self, run: &Run, periode: IcpPeriode) -> Result<Value, String> {
+        let opgave = self.icp_opgave_van(run, periode).await?;
+        let mut regels = serde_json::Map::new();
+        for rubriek in ICP_RUBRIEKEN {
+            let rows = self.icp_regels(run, &opgave.ea_segment, rubriek).await?;
+            regels.insert(
+                rubriek.to_ascii_lowercase(),
+                json!({"naam": icp_rubriek_naam(rubriek), "totaal": totaal(&rows), "regels": rows}),
+            );
+        }
+        let verzendingen = self
+            .btwaangifte_rows(
+                run,
+                &format!("aangifte/{}/gridtable", opgave.ea_segment),
+                &[],
+            )
+            .await?;
+        Ok(
+            json!({"periode": periode.naam(), "opgave": opgave.record, "rubrieken": regels, "verzendingen": verzendingen}),
+        )
     }
 }
 
@@ -502,7 +555,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Eén ICP-opgave met al zijn regels per rubriek en het totaal per rubriek. Met id (uit icp_opgaven): een verstuurde opgave. Met jaar, periode_type en periode: de opgave van dat tijdvak zoals e-Boekhouden hem opmaakt, met de verzendingen van dat tijdvak; rubriek 3a en 3b komen uit de boekingen, 1a, 1b, 2 en 4 houdt de gebruiker zelf bij met icp_regel_toevoegen.",
+        description = "Eén verstuurde ICP-opgave, op id (uit icp_opgaven), met al zijn regels per rubriek en het totaal per rubriek. De opgave van een tijdvak dat nog niet verstuurd is opent icp_opgave_openen.",
         annotations(title = "ICP-opgave", read_only_hint = true)
     )]
     async fn icp_opgave(
@@ -510,81 +563,81 @@ impl EbMcp {
         Parameters(args): Parameters<IcpOpgaveArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        let id = args.id;
+        let source = format!("icpopgave/{id}");
         let run = match self.begin(&context, "icp_opgave", &args, args.account.as_deref()) {
             Ok(run) => run,
             Err(answer) => return Ok(answer),
         };
-        let gekozen = match (args.id, args.jaar) {
-            (Some(id), None) if args.periode_type.is_none() && args.periode.is_none() => {
-                Ok(Err(id))
+        let result = async {
+            let opgave = self.btwaangifte_get(&run, &source, Vec::new()).await?;
+            if opgave.is_null() {
+                return Err(format!("e-Boekhouden heeft geen ICP-opgave {id}"));
             }
-            (None, Some(jaar)) => IcpPeriode::opgave(jaar, args.periode_type, args.periode).map(Ok),
-            _ => Err(
-                "Geef id (een verstuurde opgave) of jaar, periode_type en periode, niet allebei"
-                    .to_owned(),
-            ),
-        };
-        let gekozen = match gekozen {
-            Ok(gekozen) => gekozen,
-            Err(message) => return Ok(self.refuse(run, message)),
-        };
-        let (source, result) = match gekozen {
-            Err(id) => {
-                let source = format!("icpopgave/{id}");
-                let result = async {
-                    let opgave = self.btwaangifte_get(&run, &source, Vec::new()).await?;
-                    if opgave.is_null() {
-                        return Err(format!("e-Boekhouden heeft geen ICP-opgave {id}"));
-                    }
-                    let icl = number(opgave.get("jaar"))? < 2010.0;
-                    let mut regels = serde_json::Map::new();
-                    for rubriek in if icl { &ICL_RUBRIEKEN[..] } else { &ICP_RUBRIEKEN[..] } {
-                        let path = format!("icpopgave/regels/id/{id}/{rubriek}/gridtable");
-                        let rows = rows_of(
-                            self.btwaangifte_get(&run, &path, grid(Some(MAX_ROWS), None)?)
-                                .await?,
-                        );
-                        regels.insert(
-                            rubriek.to_ascii_lowercase(),
-                            json!({"naam": icp_rubriek_naam(rubriek), "totaal": totaal(&rows), "regels": rows}),
-                        );
-                    }
-                    Ok(json!({"opgave": opgave, "rubrieken": regels}))
-                }
-                .await;
-                (source, result)
+            let icl = number(opgave.get("jaar"))? < 2010.0;
+            let mut regels = serde_json::Map::new();
+            for rubriek in if icl {
+                &ICL_RUBRIEKEN[..]
+            } else {
+                &ICP_RUBRIEKEN[..]
+            } {
+                let path = format!("icpopgave/regels/id/{id}/{rubriek}/gridtable");
+                let rows = self.btwaangifte_rows(&run, &path, &[]).await?;
+                regels.insert(
+                    rubriek.to_ascii_lowercase(),
+                    json!({"naam": icp_rubriek_naam(rubriek), "totaal": totaal(&rows), "regels": rows}),
+                );
             }
-            Ok(periode) => {
-                let source = periode.path();
-                let result = async {
-                    let opgave = self.icp_opgave_van(&run, periode).await?;
-                    let mut regels = serde_json::Map::new();
-                    for rubriek in ICP_RUBRIEKEN {
-                        let rows = self.icp_regels(&run, &opgave.ea_segment, rubriek).await?;
-                        regels.insert(
-                            rubriek.to_ascii_lowercase(),
-                            json!({"naam": icp_rubriek_naam(rubriek), "totaal": totaal(&rows), "regels": rows}),
-                        );
-                    }
-                    let verzendingen = rows_of(
-                        self.btwaangifte_get(
-                            &run,
-                            &format!("aangifte/{}/gridtable", opgave.ea_segment),
-                            grid(Some(MAX_ROWS), None)?,
-                        )
-                        .await?,
-                    );
-                    Ok(json!({"periode": periode.naam(), "opgave": opgave.record, "rubrieken": regels, "verzendingen": verzendingen}))
-                }
-                .await;
-                (source, result)
-            }
-        };
+            Ok(json!({"opgave": opgave, "rubrieken": regels}))
+        }
+        .await;
         Ok(self.end(run, &source, result))
     }
 
     #[tool(
-        description = "De gegevens van een ICP-opgave wijzigen: OB-nummer, bedrijf, contactpersoon, telefoon en onderdeel fiscale eenheid, zoals Opslaan in het scherm ICP-opgave. Wat je niet noemt blijft zoals het is. Dit verstuurt niets naar de Belastingdienst: versturen doet de gebruiker zelf in e-Boekhouden. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "De ICP-opgave van een tijdvak openen zoals het scherm ICP-opgave dat doet, met al zijn regels per rubriek, het totaal per rubriek en de verzendingen van dat tijdvak. Rubriek 3a en 3b komen uit de boekingen; 1a, 1b, 2 en 4 houdt de gebruiker zelf bij met icp_regel_toevoegen. Let op: bestaat er voor het tijdvak nog geen opgave, dan maakt e-Boekhouden bij het openen mogelijk een lege opgave aan (dat is nog niet nagegaan); daarom vraagt dit akkoord zoals een wijziging. Dit verstuurt niets naar de Belastingdienst. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        annotations(
+            title = "ICP-opgave openen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn icp_opgave_openen(
+        &self,
+        Parameters(args): Parameters<IcpOpgaveOpenenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "icp_opgave_openen";
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
+            "ICP-opgave geopend; data geeft de opgave met zijn regels. Er is niets naar de Belastingdienst gestuurd.",
+            move |this, run, args| async move {
+                let periode = IcpPeriode::opgave(args.jaar, Some(args.periode_type), args.periode)?;
+                let built = Built {
+                    body: Value::Null,
+                    title: format!("ICP-opgave openen: {}", periode.naam()),
+                    lines: vec![
+                        line("ICP-opgave", periode.naam()),
+                        line(
+                            "Gevolg",
+                            "EB MCP opent de opgave van dit tijdvak zoals het scherm ICP-opgave dat doet en leest de regels. Bestaat er nog geen opgave, dan maakt e-Boekhouden daarbij mogelijk een lege opgave aan. Er gaat niets naar de Belastingdienst.",
+                        ),
+                    ],
+                };
+                this.approve(&run, TOOL, &built, false).await?;
+                Ok(this.icp_opgave_inhoud(&run, periode).await?)
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "De gegevens van een ICP-opgave wijzigen: OB-nummer, bedrijf, contactpersoon, telefoon en onderdeel fiscale eenheid, zoals Opslaan in het scherm ICP-opgave. Wat je niet noemt blijft zoals het is. EB MCP opent de opgave van het tijdvak pas na het akkoord (zonder opgave maakt e-Boekhouden daarbij mogelijk een lege), dus het akkoord toont de nieuwe waarden en het antwoord de oude. Dit verstuurt niets naar de Belastingdienst: versturen doet de gebruiker zelf in e-Boekhouden. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "ICP-opgave wijzigen",
             read_only_hint = false,
@@ -607,18 +660,23 @@ impl EbMcp {
             "ICP-opgave gewijzigd. Er is niets naar de Belastingdienst gestuurd.",
             move |this, run, args| async move {
                 let periode = IcpPeriode::opgave(args.jaar, Some(args.periode_type), args.periode)?;
-                let opgave = this.icp_opgave_van(&run, periode).await?;
-                let built = opgave_wijzigen(&opgave.record, periode, &args)?;
+                let velden = opgave_velden(&args)?;
+                let built = opgave_wijzigen(periode, &velden);
                 this.approve(&run, TOOL, &built, true).await?;
-                this.btwaangifte_send(&run, "PUT", "icpopgave", Some(&built.body))
-                    .await
+                // Only now: opening the period may make an opgave.
+                let opgave = this.icp_opgave_van(&run, periode).await?;
+                let (body, gewijzigd) = opgave_body(&opgave.record, &velden)?;
+                let antwoord = this
+                    .btwaangifte_send(&run, "PUT", "icpopgave", Some(&body))
+                    .await?;
+                Ok(json!({"antwoord": antwoord, "gewijzigd": gewijzigd}))
             },
         )
         .await
     }
 
     #[tool(
-        description = "Een regel toevoegen aan een ICP-opgave, zoals Toevoegen in het scherm: een correctie van een eerder tijdvak (rubriek 1a leveringen, 1b diensten, 2 A-B-C-leveringen, met het gecorrigeerde tijdvak) of een A-B-C-levering (rubriek 4). Rubriek 3a en 3b komen uit de boekingen. Nodig: het tijdvak van de opgave, land, btw-nummer van de afnemer en bedrag in hele euro's. Dit verstuurt niets naar de Belastingdienst. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een regel toevoegen aan een ICP-opgave, zoals Toevoegen in het scherm: een correctie van een eerder tijdvak (rubriek 1a leveringen, 1b diensten, 2 A-B-C-leveringen, met het gecorrigeerde tijdvak) of een A-B-C-levering (rubriek 4). Rubriek 3a en 3b komen uit de boekingen. Nodig: het tijdvak van de opgave, land, btw-nummer van de afnemer en bedrag in hele euro's. EB MCP opent de opgave van het tijdvak pas na het akkoord; zonder opgave maakt e-Boekhouden daarbij mogelijk een lege. Dit verstuurt niets naar de Belastingdienst. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "ICP-regel toevoegen",
             read_only_hint = false,
@@ -651,7 +709,6 @@ impl EbMcp {
                     args.correctie_periode,
                     today().0,
                 )?;
-                let opgave = this.icp_opgave_van(&run, periode).await?;
                 let landen = this.btwaangifte_get(&run, "icpopgave/landen", Vec::new()).await?;
                 let (code, land_naam) = land(&landen, &args.land, args.rubriek, periode.start())?;
                 let mut lines = vec![
@@ -664,22 +721,24 @@ impl EbMcp {
                 if let Some(p) = gecorrigeerd {
                     lines.push(line("Gecorrigeerd tijdvak", p.naam()));
                 }
-                lines.push(line("Gevolg", "de regel komt in de ICP-opgave in e-Boekhouden. Er gaat niets naar de Belastingdienst."));
+                lines.push(line("Gevolg", "de regel komt in de ICP-opgave in e-Boekhouden. Is er voor dit tijdvak nog geen opgave, dan maakt e-Boekhouden die mogelijk aan. Er gaat niets naar de Belastingdienst."));
                 let built = Built {
-                    body: regel_body(None, args.rubriek, &opgave.ea_periode, &code, &btw_nummer, bedrag, gecorrigeerd),
+                    body: Value::Null,
                     title: format!("ICP-regel toevoegen: {} {}", land_naam, euro_whole(bedrag)),
                     lines,
                 };
                 this.approve(&run, TOOL, &built, true).await?;
-                this.btwaangifte_send(&run, "POST", "icpopgave/regels", Some(&built.body))
-                    .await
+                // Only now: opening the period may make an opgave.
+                let opgave = this.icp_opgave_van(&run, periode).await?;
+                let body = regel_body(None, args.rubriek, &opgave.ea_periode, &code, &btw_nummer, bedrag, gecorrigeerd);
+                this.btwaangifte_send(&run, "POST", "icpopgave/regels", Some(&body)).await
             },
         )
         .await
     }
 
     #[tool(
-        description = "Een regel van een ICP-opgave wijzigen, op id (uit icp_opgave): land, btw-nummer, bedrag of het gecorrigeerde tijdvak. Alleen de regels die de gebruiker zelf bijhoudt (rubriek 1a, 1b, 2 en 4). Wat je niet noemt blijft zoals het is. Dit verstuurt niets naar de Belastingdienst. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een regel van een ICP-opgave wijzigen, op id (uit icp_opgave_openen): land, btw-nummer, bedrag of het gecorrigeerde tijdvak. Alleen de regels die de gebruiker zelf bijhoudt (rubriek 1a, 1b, 2 en 4), in een opgave die al bestaat: geef het tijdvak waarin icp_opgave_openen de regel liet zien. Wat je niet noemt blijft zoals het is. Dit verstuurt niets naar de Belastingdienst. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "ICP-regel wijzigen",
             read_only_hint = false,
@@ -702,6 +761,8 @@ impl EbMcp {
             "Regel van de ICP-opgave gewijzigd. Er is niets naar de Belastingdienst gestuurd.",
             move |this, run, args| async move {
                 let periode = IcpPeriode::opgave(args.jaar, Some(args.periode_type), args.periode)?;
+                // Before the approval: the line, and so the opgave, exists already (from icp_opgave_openen), so
+                // opening its period makes nothing; a period without the line ends here with a refusal.
                 let opgave = this.icp_opgave_van(&run, periode).await?;
                 let (rubriek, regel) = this.icp_eigen_regel(&run, &opgave, args.id).await?;
                 let was_land = text_of(&regel, "land");
@@ -728,16 +789,16 @@ impl EbMcp {
                 let (code, land_naam) = land(&landen, args.land.as_deref().unwrap_or(&was_land), rubriek, periode.start())?;
 
                 let mut lines = vec![line("ICP-opgave", periode.naam()), rubriek_line(rubriek)];
-                let mut change = |label: &str, before: String, after: String| {
+                let mut toon = |label: &str, before: String, after: String| {
                     if before != after {
                         lines.push(line(&format!("{label} was"), known(before)));
                         lines.push(line(&format!("{label} wordt"), after));
                     }
                 };
-                change("Land", was_land.to_ascii_uppercase(), code.clone());
-                change("Btw-nummer afnemer", was_nummer, btw_nummer.clone());
-                change("Bedrag", euro_whole(was_bedrag.round() as i64), euro_whole(bedrag));
-                change(
+                toon("Land", was_land.to_ascii_uppercase(), code.clone());
+                toon("Btw-nummer afnemer", was_nummer, btw_nummer.clone());
+                toon("Bedrag", euro_whole(was_bedrag.round() as i64), euro_whole(bedrag));
+                toon(
                     "Gecorrigeerd tijdvak",
                     was_tijdvak.filter(|_| rubriek.corrigeert()).map(IcpPeriode::naam).unwrap_or_default(),
                     gecorrigeerd.map(IcpPeriode::naam).unwrap_or_default(),
@@ -760,7 +821,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een regel van een ICP-opgave verwijderen, op id (uit icp_opgave). Alleen de regels die de gebruiker zelf bijhoudt (rubriek 1a, 1b, 2 en 4). Dit is niet terug te draaien. Dit verstuurt niets naar de Belastingdienst. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een regel van een ICP-opgave verwijderen, op id (uit icp_opgave_openen). Alleen de regels die de gebruiker zelf bijhoudt (rubriek 1a, 1b, 2 en 4), in een opgave die al bestaat: geef het tijdvak waarin icp_opgave_openen de regel liet zien. Dit is niet terug te draaien. Dit verstuurt niets naar de Belastingdienst. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "ICP-regel verwijderen",
             read_only_hint = false,
@@ -783,6 +844,8 @@ impl EbMcp {
             "Regel van de ICP-opgave verwijderd. Er is niets naar de Belastingdienst gestuurd.",
             move |this, run, args| async move {
                 let periode = IcpPeriode::opgave(args.jaar, Some(args.periode_type), args.periode)?;
+                // Before the approval: the line, and so the opgave, exists already (from icp_opgave_openen), so
+                // opening its period makes nothing; a period without the line ends here with a refusal.
                 let opgave = this.icp_opgave_van(&run, periode).await?;
                 let (rubriek, regel) = this.icp_eigen_regel(&run, &opgave, args.id).await?;
                 let bedrag = number(regel.get("bedrag"))?;
@@ -996,17 +1059,8 @@ mod tests {
             onderdeel_fiscale_eenheid: None,
             account: None,
         };
-        let built = opgave_wijzigen(
-            &opgave,
-            kwartaal(2026, 3),
-            &args(Some("NL001234567B02"), Some("0612345678")),
-        )
-        .unwrap();
-        assert_eq!(
-            built.body,
-            json!({"id": 55, "btwNummer": "NL001234567B02", "bedrijf": "Studio Noord", "contactpersoon": "Lisa",
-                   "telefoon": "0612345678", "onderdeelFiscaleEenheid": ""})
-        );
+        let velden = opgave_velden(&args(Some("NL001234567B02"), Some("0612345678"))).unwrap();
+        let built = opgave_wijzigen(kwartaal(2026, 3), &velden);
         assert_eq!(built.title, "ICP-opgave wijzigen: 3e kwartaal 2026");
         let labels: Vec<(&str, &str)> = built
             .lines
@@ -1014,39 +1068,87 @@ mod tests {
             .map(|l| (l.label.as_str(), l.value.as_str()))
             .collect();
         assert!(
-            labels.contains(&("OB-nummer was", "NL001234567B01")),
+            labels.contains(&("ICP-opgave", "3e kwartaal 2026")),
             "{labels:?}"
         );
         assert!(labels.contains(&("OB-nummer wordt", "NL001234567B02")));
-        assert!(labels.contains(&("Telefoon was", "onbekend")));
+        assert!(labels.contains(&("Telefoon wordt", "0612345678")));
         assert!(
-            !labels.iter().any(|(l, _)| l.starts_with("Contactpersoon")),
-            "unchanged is not shown"
+            labels
+                .iter()
+                .any(|(l, v)| *l == "Let op" && v.contains("lege opgave"))
+        );
+        let (body, gewijzigd) = opgave_body(&opgave, &velden).unwrap();
+        assert_eq!(
+            body,
+            json!({"id": 55, "btwNummer": "NL001234567B02", "bedrijf": "Studio Noord", "contactpersoon": "Lisa",
+                   "telefoon": "0612345678", "onderdeelFiscaleEenheid": ""})
+        );
+        assert_eq!(
+            gewijzigd,
+            json!([{"veld": "OB-nummer", "was": "NL001234567B01", "wordt": "NL001234567B02"},
+                   {"veld": "Telefoon", "was": "", "wordt": "0612345678"}]),
+            "the same contactpersoon is no change"
         );
         assert!(
-            opgave_wijzigen(&opgave, kwartaal(2026, 3), &args(None, None))
-                .unwrap_err()
-                .contains("niets gewijzigd")
+            opgave_velden(&IcpOpgaveWijzigenArgs {
+                contactpersoon: None,
+                ..args(None, None)
+            })
+            .unwrap_err()
+            .contains("niets gewijzigd")
         );
         assert!(
-            opgave_wijzigen(&opgave, kwartaal(2026, 3), &args(Some("NL 0012"), None))
+            opgave_velden(&args(Some("NL 0012"), None))
                 .unwrap_err()
                 .contains("letters")
         );
         assert!(
-            opgave_wijzigen(
-                &opgave,
-                kwartaal(2026, 3),
-                &args(None, Some("+31 6 1234 5678 9"))
-            )
-            .unwrap_err()
-            .contains("14")
+            opgave_velden(&args(None, Some("+31 6 1234 5678 9")))
+                .unwrap_err()
+                .contains("14")
         );
         assert!(
-            opgave_wijzigen(&json!({}), kwartaal(2026, 3), &args(Some("NL1"), None))
+            opgave_body(&json!({}), &velden)
                 .unwrap_err()
                 .contains("zonder id")
         );
+    }
+
+    #[test]
+    fn a_period_from_a_record_without_a_usable_number_is_no_period() {
+        // M10: a missing or odd period number gives None instead of a panic in naam() or first_month().
+        for record in [
+            json!({"jaar": 2026, "periodType": "K"}),
+            json!({"jaar": 2026, "periodType": "K", "periodId": 0}),
+            json!({"jaar": 2026, "periodType": "M", "periodId": 13}),
+            json!({"jaar": 2026, "periodType": "2M", "periodId": 5}),
+            json!({"jaar": 2026, "periodType": "K", "periodId": 2.5}),
+            json!({"jaar": 2026, "periodType": "K", "periodId": "x"}),
+            json!({"periodType": "K", "periodId": 1}),
+            json!({"jaar": 2026, "periodType": "W", "periodId": 1}),
+        ] {
+            assert_eq!(
+                IcpPeriode::from_record(&record, "periodId"),
+                None,
+                "{record}"
+            );
+        }
+        let jaar = IcpPeriode::from_record(
+            &json!({"jaar": 2025, "periodType": "J", "periodId": 2025}),
+            "periodId",
+        )
+        .unwrap();
+        assert_eq!(
+            (jaar.naam(), jaar.path()),
+            ("jaar 2025".to_owned(), "icpopgave/2025/J/2025".to_owned())
+        );
+        let maand = IcpPeriode::from_record(
+            &json!({"jaar": "2026", "periodType": "M", "periodId": "12"}),
+            "periodId",
+        )
+        .unwrap();
+        assert_eq!(maand.naam(), "december 2026");
     }
 
     #[test]
