@@ -5,6 +5,7 @@ mod creds;
 mod ebapi;
 mod glass;
 mod hub;
+mod lenient;
 mod logstore;
 mod mcp;
 mod reqlog;

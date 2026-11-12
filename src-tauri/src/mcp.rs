@@ -588,8 +588,10 @@ mod tests {
         // refused before the user is asked anything: booking it would put the same money in the books twice.
         let unknown = post(
             serde_json::json!({"jsonrpc": "2.0", "id": 30, "method": "tools/call", "params": {"name": "mutatie_toevoegen", "arguments": {
-                "soort": "geld_uitgegeven", "datum": "2026-11-06", "rekening": "1010", "omschrijving": "Parkeergarage",
-                "regels": [{"tegenrekening": "4550", "bedrag": 2}], "bankregel_id": 1
+                // The account code as a number, as a client sent it (2026-11-12): read as the text 1010, so the
+                // call gets as far as the bank line instead of being refused for its kind.
+                "soort": "geld_uitgegeven", "datum": "2026-11-06", "rekening": 1010, "omschrijving": "Parkeergarage",
+                "regels": [{"tegenrekening": 4550, "bedrag": "2"}], "bankregel_id": 1
             }}}),
             session.clone(),
         )

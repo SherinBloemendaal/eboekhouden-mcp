@@ -2228,7 +2228,7 @@ pub fn part_tools() -> [Vec<&'static str>; 3] {
 impl EbMcp {
     /// The router of tools.rs itself plus the one of every part.
     fn routers() -> ToolRouter<Self> {
-        Self::tool_router()
+        let mut all = Self::tool_router()
             + Self::mijn_gegevens_router()
             + Self::uren_beheer_router()
             + Self::artikelen_router()
@@ -2236,7 +2236,16 @@ impl EbMcp {
             + Self::open_posten_acties_router()
             + Self::inrichting_router()
             + Self::btw_aangifte_router()
-            + Self::verkoop_router()
+            + Self::verkoop_router();
+        // A field that may be left out names one plain type, so a client sends a code as text (lenient.rs).
+        for route in all.map.values_mut() {
+            let mut schema = Value::Object((*route.attr.input_schema).clone());
+            crate::lenient::plain_optional_types(&mut schema);
+            if let Value::Object(schema) = schema {
+                route.attr.input_schema = Arc::new(schema);
+            }
+        }
+        all
     }
 }
 
@@ -4671,6 +4680,22 @@ fn server_info() -> Implementation {
 // The router is named: without it the macro serves `Self::tool_router()`, the tools of this file alone.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for EbMcp {
+    /// As the macro would write it, with one step before the tool reads its arguments: a value of the wrong
+    /// kind that can only mean one thing gets the kind the tool's schema asks for (lenient.rs).
+    async fn call_tool(
+        &self,
+        mut request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        if let Some(arguments) = request.arguments.as_mut()
+            && let Some(route) = self.tool_router.map.get(request.name.as_ref())
+        {
+            crate::lenient::fit(arguments, &route.attr.input_schema);
+        }
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(call).await
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(server_info())
@@ -4695,6 +4720,61 @@ impl ServerHandler for EbMcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_tool_names_one_plain_type_for_a_field_that_may_be_left_out() {
+        fn nullable_types(value: &Value, found: &mut Vec<String>, at: &str) {
+            match value {
+                Value::Object(object) => {
+                    if let Some(Value::Array(types)) = object.get("type")
+                        && types.iter().any(|t| t.as_str() == Some("null"))
+                    {
+                        found.push(at.to_owned());
+                    }
+                    for (name, inner) in object {
+                        nullable_types(inner, found, &format!("{at}.{name}"));
+                    }
+                }
+                Value::Array(items) => items.iter().for_each(|i| nullable_types(i, found, at)),
+                _ => {}
+            }
+        }
+        let tools = EbMcp::routers().list_all();
+        assert!(tools.len() > 170);
+        let mut found = Vec::new();
+        for tool in &tools {
+            nullable_types(
+                &Value::Object((*tool.input_schema).clone()),
+                &mut found,
+                &tool.name,
+            );
+        }
+        assert!(
+            found.is_empty(),
+            "a client reads these as untyped and sends a code as a number: {found:?}"
+        );
+        // The field the bug was reported on, and one inside a list.
+        let mutatie = tools
+            .iter()
+            .find(|t| t.name == "mutatie_toevoegen")
+            .unwrap();
+        assert_eq!(
+            mutatie.input_schema["properties"]["rekening"]["type"],
+            "string"
+        );
+        assert_eq!(
+            mutatie.input_schema["properties"]["bankregel_id"]["type"],
+            "integer"
+        );
+        // Still optional: only what the tool cannot do without is required.
+        let required: Vec<&str> = mutatie.input_schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(required, ["soort", "datum"]);
+    }
 
     #[test]
     fn names_itself_e_boekhouden_mcp_with_the_app_icon() {
