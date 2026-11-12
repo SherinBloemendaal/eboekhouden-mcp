@@ -1243,11 +1243,11 @@ fn families() -> Vec<Family> {
     vec![
         (
             "uur_toevoegen",
-            json!({"datum": "2026-11-11", "project_id": 10, "activiteit_id": 20, "uren": 1.5, "opmerkingen": "Ontwerp homepage"}),
+            json!({"datum": "2026-11-11", "project_id": 10, "activiteit_id": 20, "uren": 1.5, "opmerkingen": "Ontwerp homepage", "medewerker_id": 3}),
             (
                 "POST",
                 "uur",
-                json!({"aantalUren": 1.5, "datum": {"day": 11, "month": 11, "year": 2026}, "activiteitId": 20, "projectId": 10, "opmerkingen": "Ontwerp homepage"}),
+                json!({"gebruikerId": 3, "aantalUren": 1.5, "datum": {"day": 11, "month": 11, "year": 2026}, "activiteitId": 20, "projectId": 10, "opmerkingen": "Ontwerp homepage"}),
             ),
             false,
         ),
@@ -1413,6 +1413,12 @@ async fn bad_input_is_refused_before_anything_is_asked_or_sent() {
             json!({"datum": "2026-11-11", "project_id": 12, "activiteit_id": 20, "uren": 1}),
             "niet actief",
         ),
+        // Two users and none named: e-Boekhouden would refuse the line, so EB MCP asks which one.
+        (
+            "uur_toevoegen",
+            json!({"datum": "2026-11-11", "project_id": 10, "activiteit_id": 20, "uren": 1}),
+            "Geef medewerker_id mee",
+        ),
         ("uur_wijzigen", json!({"id": 6, "uren": 1}), "bestaat niet"),
         (
             "activiteit_toevoegen",
@@ -1461,6 +1467,7 @@ async fn bad_input_is_refused_before_anything_is_asked_or_sent() {
 #[tokio::test]
 async fn without_approval_an_ordinary_change_goes_through_but_a_delete_still_asks() {
     let h = Harness::new(WriteMode::Auto).await;
+    h.answer("user/selectlist", Some(json!([{"id": 3, "naam": "Lisa"}])));
     let (is_error, text) = h
         .call(
             "uur_toevoegen",
@@ -1470,6 +1477,9 @@ async fn without_approval_an_ordinary_change_goes_through_but_a_delete_still_ask
     assert!(!is_error && text.contains("\"id\":99"), "{text}");
     assert_eq!(h.sent().len(), 1);
     assert_eq!(h.sent()[0].2["aantalKilometers"], 12.0);
+    // No user was named, and the administration has one: the line goes out with that user, as the form
+    // would fill in who is signed in.
+    assert_eq!(h.sent()[0].2["gebruikerId"], 3);
     let (_, text) = h.call("uur_verwijderen", json!({"id": 7})).await;
     let id = waiting_id(&text);
     assert!(h.state.approvals.list()[0].danger);

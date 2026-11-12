@@ -1113,6 +1113,10 @@ impl EbMcp {
             .await;
         match (call.ok(), call.json) {
             (true, Some(json)) => Ok(json),
+            // An id e-Boekhouden does not know (any more) comes back as an empty answer (204), seen live.
+            (true, None) => Err(format!(
+                "e-Boekhouden gaf niets terug op {path}: dit bestaat niet (meer), of het id klopt niet"
+            )),
             _ => Err(call
                 .error
                 .unwrap_or_else(|| format!("e-Boekhouden gaf {} op {path}", call.status))),

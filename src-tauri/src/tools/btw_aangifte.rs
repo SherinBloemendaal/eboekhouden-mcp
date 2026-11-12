@@ -181,8 +181,30 @@ impl EbMcp {
     /// The list of returns sent ("Verstuurde aangiftes"), all of it, as named rows. It holds btw-aangiftes,
     /// suppleties and ICP-opgaven together; the screen tells them apart by `soort`.
     async fn btwaangifte_sent(&self, run: &Run) -> Result<Vec<Value>, String> {
-        self.btwaangifte_rows(run, "aangifte/gridtable", &[]).await
+        self.btwaangifte_rows(run, "aangifte/gridtable", &[])
+            .await
+            .map(|rows| rows.into_iter().map(without_pay_link).collect())
     }
+}
+
+/// A row of the list of sent returns without e-Boekhouden's link to pay it (`payUrl`): paying a return is
+/// the user's own act in e-Boekhouden, and a link in a tool's answer invites an AI client to offer it.
+pub(super) fn without_pay_link(mut row: Value) -> Value {
+    match &mut row {
+        Value::Object(fields) => {
+            fields.remove("payUrl");
+            for value in fields.values_mut() {
+                *value = without_pay_link(value.take());
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                *item = without_pay_link(item.take());
+            }
+        }
+        _ => {}
+    }
+    row
 }
 
 /// The kind of a row in the list of returns sent, as the screen opens it.

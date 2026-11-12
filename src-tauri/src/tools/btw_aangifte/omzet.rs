@@ -692,7 +692,8 @@ impl EbMcp {
         let result = self
             .btwaangifte_get(&run, PATH, query)
             .await
-            .map(named_rows);
+            .map(named_rows)
+            .map(without_pay_link);
         Ok(self.end(run, PATH, result))
     }
 

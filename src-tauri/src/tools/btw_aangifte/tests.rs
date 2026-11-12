@@ -85,6 +85,16 @@ fn members(code: &str) -> Vec<String> {
 }
 
 #[test]
+fn the_list_of_returns_carries_no_link_to_pay_one() {
+    let row = json!({"id": 7, "soort": "OB", "canPay": 1, "payUrl": "https://betalen.example/x", "lastPayStatus": null});
+    let cleaned = without_pay_link(json!({"data": [row], "rowCount": 1}));
+    assert!(cleaned["data"][0].get("payUrl").is_none(), "{cleaned}");
+    // What says whether it was paid stays.
+    assert_eq!(cleaned["data"][0]["canPay"], 1);
+    assert_eq!(cleaned["rowCount"], 1);
+}
+
+#[test]
 fn refuses_every_path_that_files_pays_or_confirms() {
     for path in [
         "btw-aangifte/createandsend",

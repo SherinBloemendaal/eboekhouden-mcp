@@ -1585,7 +1585,7 @@ pub(super) fn certainly_not_done(error: &str) -> bool {
         "Niet (meer) ingelogd",
         "Niet ingelogd",
         "Geen toegang",
-        "Dit pad bestaat niet",
+        "Dit bestaat niet (meer) bij e-Boekhouden",
         "e-Boekhouden vraagt om rustiger",
     ]
     .iter()

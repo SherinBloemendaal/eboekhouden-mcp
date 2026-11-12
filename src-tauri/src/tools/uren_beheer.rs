@@ -744,7 +744,7 @@ impl EbMcp {
             account.as_deref(),
             args,
             "Urenregel toegevoegd; data.id is het id",
-            move |this, run, args| async move {
+            move |this, run, mut args| async move {
                 // Bad input is refused before anything is read.
                 uur_nieuw(&args, &Namen::default())?;
                 let namen = this
@@ -753,9 +753,23 @@ impl EbMcp {
                         &[args.project_id],
                         &[args.activiteit_id],
                         (Some(args.project_id), Some(args.activiteit_id)),
-                        args.medewerker_id.is_some(),
+                        true,
                     )
                     .await?;
+                // e-Boekhouden refuses an hour line without a user ("Je hebt geen gebruiker geselecteerd",
+                // seen live, 0.5.1). Its form fills in who is signed in; EB MCP cannot see who that is, so
+                // it takes the one user an administration with a single user has, and asks otherwise.
+                if args.medewerker_id.is_none() {
+                    let mut ids = namen.medewerkers.keys();
+                    match (ids.next(), ids.next()) {
+                        (Some(only), None) => args.medewerker_id = Some(*only),
+                        _ => {
+                            return Err(Halt::Error(
+                                "Geef medewerker_id mee: deze administratie heeft meer dan één gebruiker, en een urenregel hoort bij één van hen (uren_medewerkers geeft ze)".into(),
+                            ));
+                        }
+                    }
+                }
                 if let Some(id) = args.medewerker_id
                     && !namen.medewerkers.contains_key(&id)
                 {

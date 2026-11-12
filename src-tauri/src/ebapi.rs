@@ -527,7 +527,11 @@ impl EbClient {
                             "Geen toegang tot dit onderdeel bij e-Boekhouden: dit account mag het niet inzien".into(),
                         )
                     }
-                    404 => call.error = Some("Dit pad bestaat niet (meer) bij e-Boekhouden".into()),
+                    404 => {
+                        call.error = Some(
+                            "Dit bestaat niet (meer) bij e-Boekhouden: het id of het pad is onbekend".into(),
+                        )
+                    }
                     429 => call.error = Some("e-Boekhouden vraagt om rustiger aan te doen".into()),
                     // What e-Boekhouden says about a request it refuses ("Onbekend grootboekrekening voor regel.")
                     // is the useful part; a server fault only carries its own error code.
