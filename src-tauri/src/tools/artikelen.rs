@@ -91,41 +91,6 @@ impl EbMcp {
             .error
             .unwrap_or_else(|| format!("e-Boekhouden gaf {} op {path}", call.status)))
     }
-
-    /// A change with a query string, after the approval; `false` from e-Boekhouden means it did not happen.
-    /// (`change` in tools.rs sends no query, and a path may not carry one.)
-    async fn artikelen_change_query(
-        &self,
-        run: &Run,
-        method: &'static str,
-        path: &str,
-        query: &[(String, String)],
-        body: Option<&Value>,
-    ) -> Result<Value, Halt> {
-        let call = self
-            .state
-            .api_send(
-                run.account.id,
-                method,
-                path,
-                query,
-                body,
-                Some(run.id),
-                &run.client,
-            )
-            .await;
-        if !call.ok() {
-            return Err(Halt::Error(call.error.unwrap_or_else(|| {
-                format!("e-Boekhouden gaf {} op {path}", call.status)
-            })));
-        }
-        match call.json.unwrap_or(Value::Null) {
-            Value::Bool(false) => Err(Halt::Error(
-                "e-Boekhouden meldt dat dit niet gelukt is".into(),
-            )),
-            done => Ok(done),
-        }
-    }
 }
 
 // ---------------------------------------------------------------- small helpers of this part

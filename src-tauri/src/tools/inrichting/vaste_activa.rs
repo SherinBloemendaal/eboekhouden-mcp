@@ -788,7 +788,7 @@ impl EbMcp {
                 let built = vastactief_gewijzigd(&args, &now, &ctx)?;
                 this.approve(&run, TOOL, &built, false).await?;
                 let recalc = args.schema_opnieuw.unwrap_or(false);
-                this.change_with_query(
+                this.change_query_done(
                     &run,
                     "PUT",
                     "vasteactiva",

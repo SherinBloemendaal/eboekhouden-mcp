@@ -678,37 +678,6 @@ fn saved(answer: Value) -> Result<Value, Halt> {
     }
 }
 
-impl EbMcp {
-    /// One change with a query on e-Boekhouden, after the approval (`change` sends none).
-    async fn change_with_query(
-        &self,
-        run: &Run,
-        method: &'static str,
-        path: &str,
-        query: &[(String, String)],
-        body: &Value,
-    ) -> Result<Value, Halt> {
-        let call = self
-            .state
-            .api_send(
-                run.account.id,
-                method,
-                path,
-                query,
-                Some(body),
-                Some(run.id),
-                &run.client,
-            )
-            .await;
-        if call.ok() {
-            return Ok(call.json.unwrap_or(Value::Null));
-        }
-        Err(Halt::Error(call.error.unwrap_or_else(|| {
-            format!("e-Boekhouden gaf {} op {path}", call.status)
-        })))
-    }
-}
-
 #[tool_router(router = mijn_gegevens_router, vis = "pub(super)")]
 impl EbMcp {
     #[tool(
@@ -825,7 +794,7 @@ impl EbMcp {
                 };
                 this.approve(&run, TOOL, &built, true).await?;
                 let answer = saved(
-                    this.change_with_query(&run, "PUT", MIJN_GEGEVENS, &adm(), &built.body)
+                    this.change_query(&run, "PUT", MIJN_GEGEVENS, &adm(), Some(&built.body))
                         .await?,
                 )?;
                 let now = this.fetch(&run, MIJN_GEGEVENS, adm()).await.ok();

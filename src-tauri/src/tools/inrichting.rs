@@ -91,40 +91,6 @@ impl EbMcp {
         )
         .await
     }
-
-    /// A change on e-Boekhouden with a query string (`tools.rs`'s `change` sends none), after the approval.
-    async fn change_with_query(
-        &self,
-        run: &Run,
-        method: &'static str,
-        path: &str,
-        query: &[(String, String)],
-        body: Option<&Value>,
-    ) -> Result<Value, Halt> {
-        let call = self
-            .state
-            .api_send(
-                run.account.id,
-                method,
-                path,
-                query,
-                body,
-                Some(run.id),
-                &run.client,
-            )
-            .await;
-        if call.ok() {
-            return match call.json.unwrap_or(Value::Null) {
-                Value::Bool(false) => Err(Halt::Error(
-                    "e-Boekhouden meldt dat dit niet gelukt is".into(),
-                )),
-                done => Ok(done),
-            };
-        }
-        Err(Halt::Error(call.error.unwrap_or_else(|| {
-            format!("e-Boekhouden gaf {} op {path}", call.status)
-        })))
-    }
 }
 
 // ---------------------------------------------------------------- grootboekrekeningen and btw codes

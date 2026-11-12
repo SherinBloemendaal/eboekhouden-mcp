@@ -887,7 +887,7 @@ impl EbMcp {
                 let wijziging = artikel_gewijzigd(&args, &now, kostenplaats, &keuzes)?;
                 this.approve(&run, TOOL, &wijziging.built, wijziging.danger)
                     .await?;
-                this.artikelen_change_query(
+                this.change_query_done(
                     &run,
                     "PUT",
                     "artikel",

@@ -1466,13 +1466,25 @@ impl EbMcp {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Value, Halt> {
+        self.change_query(run, method, path, &[], body).await
+    }
+
+    /// The same with a query string, which a path may not carry.
+    async fn change_query(
+        &self,
+        run: &Run,
+        method: &'static str,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<&Value>,
+    ) -> Result<Value, Halt> {
         let call = self
             .state
             .api_send(
                 run.account.id,
                 method,
                 path,
-                &[],
+                query,
                 body,
                 Some(run.id),
                 &run.client,
@@ -1484,6 +1496,23 @@ impl EbMcp {
         Err(Halt::Error(call.error.unwrap_or_else(|| {
             format!("e-Boekhouden gaf {} op {path}", call.status)
         })))
+    }
+
+    /// A change with a query string where e-Boekhouden answers `false` when it did not happen.
+    async fn change_query_done(
+        &self,
+        run: &Run,
+        method: &'static str,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<&Value>,
+    ) -> Result<Value, Halt> {
+        match self.change_query(run, method, path, query, body).await? {
+            Value::Bool(false) => Err(Halt::Error(
+                "e-Boekhouden meldt dat dit niet gelukt is".into(),
+            )),
+            done => Ok(done),
+        }
     }
 
     /// A change that e-Boekhouden answers with `true` when it did it.

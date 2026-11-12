@@ -161,6 +161,7 @@ fn regel_items(
         factuurtekst: None,
         kenmerk: None,
         direct_boeken: Some(false),
+        sjabloon_id: None,
         account: None,
     };
     let context = write::FactuurContext {
@@ -169,7 +170,7 @@ fn regel_items(
         verwerken: false,
         vandaag: today(),
     };
-    let built = write::factuur_nieuw(&invoice, &context, &k.books)?;
+    let built = write::factuur_nieuw(&invoice, &context, &k.books, None)?;
     let items = built
         .body
         .pointer("/factuurItems/insert")
