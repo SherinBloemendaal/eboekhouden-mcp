@@ -288,24 +288,11 @@ impl EbMcp {
     /// Whether the signed-in user is an accountant, from `POST auth`: the check e-Boekhouden's own app makes at
     /// startup (`isAccountant`). It changes nothing.
     async fn opa_is_accountant(&self, run: &Run) -> Result<bool, String> {
-        let call = self
+        let auth = self
             .state
-            .api_send(
-                run.account.id,
-                "POST",
-                "auth",
-                &[],
-                None,
-                Some(run.id),
-                &run.client,
-            )
-            .await;
-        match (call.ok(), call.json) {
-            (true, Some(auth)) => Ok(is_accountant(&auth)),
-            _ => Err(call
-                .error
-                .unwrap_or_else(|| format!("e-Boekhouden gaf {} op auth", call.status))),
-        }
+            .api_accountant_flag(run.account.id, Some(run.id), &run.client)
+            .await?;
+        Ok(is_accountant(&auth))
     }
 
     /// The accountant a message or a check request goes to, or a refusal when the administration has none.

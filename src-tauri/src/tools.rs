@@ -4636,12 +4636,14 @@ impl ServerHandler for EbMcp {
             .with_server_info(server_info())
             .with_instructions(
                 "Leest de boekhouding in e-Boekhouden van de accounts die in EB MCP zijn ingelogd. \
-                 Wijzigen (relaties, mutaties, bestanden, facturen, offertes, abonnementen, sjablonen) en facturen mailen kan alleen voor accounts waar de gebruiker schrijven heeft aangezet; \
+                 Wijzigen (relaties, mutaties, bestanden, facturen, offertes, abonnementen, sjablonen, uren en projecten, producten, grootboekrekeningen en kostenplaatsen, importregels, vaste activa, de beginbalans, bedrijfsgegevens) en alles wat e-Boekhouden verlaat (facturen, offertes en aanmaningen mailen, Peppol, het incassobestand) kan alleen voor accounts waar de gebruiker schrijven heeft aangezet; \
                  status zegt per account of dat uit staat, met akkoord of zonder akkoord. Met akkoord toont EB MCP elke wijziging eerst aan de gebruiker; \
-                 verwijderen, crediteren, facturen mailen en abonnementen factureren vragen altijd akkoord. Zo'n tool wacht niet op de gebruiker: \
+                 verwijderen, crediteren, alles wat mail of een bestand de deur uit doet, in bulk factureren of boeken, afboeken, bedrijfsgegevens en het verwerken van een btw-aangifte vragen altijd akkoord. Zo'n tool wacht niet op de gebruiker: \
                  hij antwoordt meteen met status wacht en een voorstel_id, en voert de wijziging zelf uit zodra de gebruiker goedkeurt. \
                  Vertel de gebruiker dat er in EB MCP een wijziging op akkoord wacht, ga gerust verder met ander werk, \
                  en vraag de uitkomst later op met akkoord_status (met voorstel_id voor één voorstel en zijn resultaat; zonder voor alles van de laatste 24 uur). \
+                 Een btw-aangifte, ICP-opgave of suppletie versturen, indienen of betalen kan EB MCP niet: dat doet de gebruiker zelf in e-Boekhouden. \
+                 Zegt een tool dat de uitkomst onbekend is (een mail of bestand dat mogelijk al weg is), probeer het dan niet opnieuw maar laat de gebruiker eerst kijken. \
                  Staat er meer dan één account in EB MCP, dan moet elke tool de account-parameter meekrijgen; status zegt welke accounts er zijn.",
             )
     }

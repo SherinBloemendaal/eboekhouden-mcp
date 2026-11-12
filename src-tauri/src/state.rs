@@ -422,6 +422,67 @@ impl AppState {
         call
     }
 
+    /// Whether the user signed in on this account is an accountant: `isAccountant` in the answer to
+    /// `POST auth`, the check e-Boekhouden's own app makes at startup. It changes nothing. Only that one
+    /// field is kept and returned (`{"isAccountant": …}`): the rest of the answer describes the user and
+    /// the session and has no business in the request log or a tool's answer.
+    pub async fn api_accountant_flag(
+        &self,
+        account_id: Uuid,
+        parent: Option<u64>,
+        client: &str,
+    ) -> Result<serde_json::Value, String> {
+        let session = self.sessions.read().unwrap().get(&account_id).cloned();
+        let label = session
+            .as_ref()
+            .map(|s| s.label.clone())
+            .unwrap_or_else(|| self.label_of(account_id));
+        let (mut call, had_session) = match session.filter(|s| !s.expired) {
+            None => (not_signed_in("auth", &[], &label), false),
+            Some(session) => match self.jar.cookies(&session.key) {
+                Err(e) => {
+                    let mut call = not_signed_in("auth", &[], &session.label);
+                    call.error = Some(format!(
+                        "De sessie van {} is niet te lezen: {e}",
+                        session.label
+                    ));
+                    (call, false)
+                }
+                Ok(cookies) => {
+                    self.note_use(account_id);
+                    let call = self.client.auth(&cookies).await;
+                    if matches!(call.status, 300..=399 | 401) {
+                        self.mark_expired(account_id);
+                    }
+                    (call, !cookies.is_empty())
+                }
+            },
+        };
+        let kept = call.json.as_ref().map(|auth| {
+            let flag = auth
+                .get("isAccountant")
+                .or_else(|| auth.get("IsAccountant"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            serde_json::json!({ "isAccountant": flag })
+        });
+        call.json = kept.clone();
+        self.log.add_eb(
+            &call,
+            parent,
+            client,
+            Some((account_id, label)),
+            had_session,
+        );
+        let _ = self.events.send(AppEvent::LogChanged);
+        match (call.ok(), kept) {
+            (true, Some(kept)) => Ok(kept),
+            _ => Err(call
+                .error
+                .unwrap_or_else(|| format!("e-Boekhouden gaf {} op auth", call.status))),
+        }
+    }
+
     /// A sign-in attempt or one of its checks in Verzoeken, so they show next to the AI calls. They stay out
     /// of the Dashboard's statistics (reqlog.rs, `add_signin`).
     pub fn log_signin_call(&self, call: &ApiCall, account_id: Uuid, label: &str) {

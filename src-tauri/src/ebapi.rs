@@ -463,8 +463,17 @@ impl EbClient {
             .http
             .request(verb, url)
             .header(reqwest::header::ACCEPT, "application/json");
-        if let Some(body) = body {
-            request = request.json(body);
+        match body {
+            Some(body) => request = request.json(body),
+            // A change without a body, as e-Boekhouden's own app posts it ("alle regels verwerken",
+            // "afschrijvingen boeken"): JSON content type and an explicit empty length. Without them the API
+            // answers 415 or 411, as it does for `auth` and the hub's negotiate.
+            None if method != "GET" => {
+                request = request
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .header(reqwest::header::CONTENT_LENGTH, "0");
+            }
+            None => {}
         }
         if !cookies.is_empty() {
             request = request.header(reqwest::header::COOKIE, cookie_header(cookies));
@@ -1189,7 +1198,11 @@ impl Limiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, http::HeaderMap, routing::get};
+    use axum::{
+        Router,
+        http::HeaderMap,
+        routing::{get, post},
+    };
     use serde_json::json;
 
     async fn mock() -> String {
@@ -1203,6 +1216,19 @@ mod tests {
                         return (axum::http::StatusCode::UNAUTHORIZED, String::new());
                     }
                     (axum::http::StatusCode::OK, json!({"items": [{"naam": "Bakkerij de Korf"}, {"naam": "Bakkerij Zuidwal"}], "totaal": 2}).to_string())
+                }),
+            )
+            .route(
+                "/v1/api/import/verwerk",
+                post(|headers: HeaderMap| async move {
+                    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+                    if header("content-length") != "0" {
+                        return (axum::http::StatusCode::LENGTH_REQUIRED, String::new());
+                    }
+                    if !header("content-type").starts_with("application/json") {
+                        return (axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE, String::new());
+                    }
+                    (axum::http::StatusCode::OK, json!({"countMutatie": 2}).to_string())
                 }),
             )
             .route("/v1/api/kapot", get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }))
@@ -1309,6 +1335,17 @@ mod tests {
         assert!(call.ok(), "{call:?}");
         assert_eq!(call.rows, Some(2));
         assert!(call.bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn a_change_without_a_body_goes_out_as_an_empty_json_post() {
+        let client = EbClient::new(&mock().await);
+        let cookies = vec![("auth-token".to_owned(), "jwt".to_owned())];
+        let call = client
+            .send(&cookies, "POST", "import/verwerk", &[], None)
+            .await;
+        assert_eq!(call.status, 200, "{:?}", call.error);
+        assert_eq!(call.json.unwrap()["countMutatie"], 2);
     }
 
     #[tokio::test]
