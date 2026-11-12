@@ -340,11 +340,17 @@ onBeforeUnmount(() => {
 .side-label { padding: 6px 8px 4px; }
 .nav {
   box-sizing: border-box; height: 32px; display: flex; align-items: center; gap: 8px; padding: 0 8px;
-  border-radius: 8px; color: var(--text); text-decoration: none; transition: background-color 150ms ease;
+  border-radius: 8px; color: var(--text); text-decoration: none; transition: background-color 150ms ease, color 150ms ease;
 }
 .nav:hover { background: var(--hover); }
 .nav.active { background: var(--selected); }
-.nav-icon { color: var(--accent); }
+.nav-icon { color: var(--accent); transition: color 150ms ease; }
+/* As a macOS list does it: the selected row takes the system accent with white text while the sidebar has the
+   focus, and the grey fill above when the content has it. --accent is the Mac's own accent (tokens.css). */
+.sidebar:focus-within .nav.active { background: var(--accent); color: #fff; }
+.sidebar:focus-within .nav.active .nav-icon,
+.sidebar:focus-within .nav.active .shortcut { color: #fff; }
+.sidebar:focus-within .nav.active .nav-badge { background: #fff; color: var(--accent); }
 /* A narrow sidebar shortens the label, never the badge or the shortcut beside it. */
 .nav-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .settings { margin: 0 -4px 4px; }

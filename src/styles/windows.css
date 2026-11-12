@@ -22,6 +22,11 @@
   box-shadow: inset 0 -2px 0 var(--accent), inset 0 0 0 1px var(--field) !important;
 }
 :root[data-platform='windows'] .nav { position: relative; border-radius: 4px; height: 36px; }
+/* Fluent marks the selected item with the bar below, whichever part of the window has the focus. */
+:root[data-platform='windows'] .sidebar:focus-within .nav.active { background: var(--selected); color: var(--text); }
+:root[data-platform='windows'] .sidebar:focus-within .nav.active .nav-icon { color: var(--accent); }
+:root[data-platform='windows'] .sidebar:focus-within .nav.active .shortcut { color: var(--muted); }
+:root[data-platform='windows'] .sidebar:focus-within .nav.active .nav-badge { background: var(--accent); color: #fff; }
 :root[data-platform='windows'] .nav.active::before {
   content: ''; position: absolute; left: 0; top: 10px; bottom: 10px; width: 3px; border-radius: 2px; background: var(--accent);
 }
