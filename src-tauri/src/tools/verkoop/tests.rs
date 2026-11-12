@@ -26,7 +26,8 @@ fn relatie() -> Value {
 }
 
 fn user() -> Value {
-    json!({"id": 5, "naam": "Lisa de Vries", "email": "lisa@atelierzuid.example"})
+    // As captured live: GET user has no id.
+    json!({"naam": "Lisa de Vries", "email": "lisa@atelierzuid.example", "gebruikersnaam": "lisa@atelierzuid.example"})
 }
 
 #[test]
@@ -106,6 +107,13 @@ fn a_quote_mail_takes_the_template_then_the_relatie_and_the_user() {
             .contains("cc-adres")
     );
     args.cc = None;
+    // Own text goes out as it is: a code in it would reach the customer unfilled.
+    args.onderwerp = Some("Offerte [OFFERTENUMMER]".into());
+    assert!(
+        offerte_mail(&args, None, &relatie(), &user())
+            .unwrap_err()
+            .contains("zoals hij is")
+    );
     args.onderwerp = Some("x".repeat(111));
     assert!(
         offerte_mail(&args, None, &relatie(), &user())
@@ -152,7 +160,8 @@ fn books() -> Books {
     Books::from_api(
         &json!({"colMetadata": [{"name": "id"}, {"name": "code"}, {"name": "omschrijving"}, {"name": "categorie"}],
                 "data": [[80, "8000", "Omzet ontwerp", "Winst en Verlies"], [81, "8010", "Omzet drukwerk", "Winst en Verlies"], [13, "1300", "Debiteuren", "Debiteuren"]]}),
-        &json!([{"code": "HOOG_VERK_21", "omschrijving": "Hoog", "percentage": 21, "soort": "VERK"}]),
+        &json!([{"code": "HOOG_VERK_21", "omschrijving": "Hoog", "percentage": 21, "soort": "VERK"},
+                {"code": "LAAG_VERK_9", "omschrijving": "Laag", "percentage": 9, "soort": "VERK"}]),
     )
     .unwrap()
 }
@@ -208,10 +217,91 @@ fn invoicing_a_quote_copies_its_lines_as_the_web_app_does() {
             .unwrap_or_default()
     };
     assert_eq!(shown(&built, "Relatie"), "Studio Noord");
-    assert_eq!(shown(&built, "Totaal incl. btw"), "177,50");
+    // Totals from the leading price (excl.) with btw on top: 100 + 21 and 50 + 4,50.
+    assert_eq!(shown(&built, "Totaal excl. btw"), "150,00");
+    assert_eq!(shown(&built, "Btw"), "25,50");
+    assert_eq!(shown(&built, "Totaal incl. btw"), "175,50");
     assert_eq!(
         shown(&built, "Regel 1"),
-        "2 x Ontwerp: 50,00 excl. / 60,50 incl. btw per stuk (HOOG_VERK_21), op 8000 Omzet ontwerp"
+        "2 x Ontwerp: 50,00 per stuk excl. btw (HOOG_VERK_21), op 8000 Omzet ontwerp"
+    );
+    assert!(shown(&built, "Meteen boeken").starts_with("ja, de factuur wordt meteen geboekt"));
+
+    // An amount on a quote excl. btw is excl.: 1000 becomes 1210 incl. 21% btw, and the summary says so.
+    let ex = json!({"id": 8, "nummer": "OF-00008", "relatieId": 3, "inEx": "EX", "totaalExcl": 1800.0, "totaalIncl": 2178.0});
+    let enkel = json!([{"id": 81, "aantal": 1, "omschrijving": "Ontwerp", "prijsExcl": 2000.0, "prijsIncl": 2420.0, "btwCode": "HOOG_VERK_21",
+                         "grootboekId": 80, "kostenplaatsId": 0, "kortingIsPerc": true, "korting": 10, "regelMetKortingExcl": 1800.0}]);
+    let bron_ex = OfferteBron {
+        offerte: &ex,
+        regels: &enkel,
+        berekend: None,
+        relatie: &relatie,
+    };
+    let mut bedrag = factureren(8);
+    bedrag.bedrag = Some(1000.0);
+    let built = offerte_factuur(
+        &bedrag,
+        &bedrag.deel().unwrap(),
+        &bron_ex,
+        &factuur_context(),
+        &books(),
+    )
+    .unwrap();
+    assert_eq!(shown(&built, "Totaal excl. btw"), "1000,00");
+    assert_eq!(shown(&built, "Totaal incl. btw"), "1210,00");
+    // A line's discount shows in its words, and the total follows the discounted amount.
+    let built = offerte_factuur(
+        &factureren(8),
+        &Deel::Regels(None),
+        &bron_ex,
+        &factuur_context(),
+        &books(),
+    )
+    .unwrap();
+    assert_eq!(
+        shown(&built, "Regel 1"),
+        "1 x Ontwerp: 2000,00 per stuk excl. btw, korting 10% (HOOG_VERK_21), op 8000 Omzet ontwerp"
+    );
+    assert_eq!(shown(&built, "Totaal incl. btw"), "2178,00");
+    // Incl. leads on a quote incl. btw: the btw is taken out.
+    let incl = json!({"id": 9, "nummer": "OF-00009", "relatieId": 3, "inEx": "IN"});
+    let regel = json!([{"id": 91, "aantal": 1, "omschrijving": "Boek", "prijsExcl": 3.21, "prijsIncl": 3.5, "btwCode": "LAAG_VERK_9", "grootboekId": 81}]);
+    let bron_in = OfferteBron {
+        offerte: &incl,
+        regels: &regel,
+        berekend: None,
+        relatie: &relatie,
+    };
+    let built = offerte_factuur(
+        &factureren(9),
+        &Deel::Regels(None),
+        &bron_in,
+        &factuur_context(),
+        &books(),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            shown(&built, "Totaal excl. btw").as_str(),
+            shown(&built, "Totaal incl. btw").as_str()
+        ),
+        ("3,21", "3,50")
+    );
+    // An unknown btw code is refused, not guessed.
+    let vreemd = json!([{"id": 92, "aantal": 1, "omschrijving": "X", "prijsExcl": 1, "prijsIncl": 1, "btwCode": "ONBEKEND", "grootboekId": 81}]);
+    let bron_v = OfferteBron {
+        regels: &vreemd,
+        ..bron_in
+    };
+    assert!(
+        offerte_factuur(
+            &factureren(9),
+            &Deel::Regels(None),
+            &bron_v,
+            &factuur_context(),
+            &books()
+        )
+        .is_err()
     );
 
     // A choice of lines, not booked.
@@ -456,7 +546,13 @@ fn agenda_moments_are_wall_clock_times_as_the_form_writes_them() {
         afgehandeld: None,
         account: None,
     };
-    let built = agenda_nieuw(&args, "OF-00007", &users(), 5).unwrap();
+    // Without a medewerker and without an id from `user`, the tool asks for one.
+    assert!(
+        agenda_nieuw(&args, "OF-00007", &users(), None)
+            .unwrap_err()
+            .contains("medewerker_id")
+    );
+    let built = agenda_nieuw(&args, "OF-00007", &users(), Some(5)).unwrap();
     assert_eq!(
         built.body,
         json!({"offerteId": 7, "onderwerp": "Nabellen", "datum": "2026-11-20T09:05:00.000Z", "gebruikerId": 5})
@@ -478,7 +574,9 @@ fn agenda_moments_are_wall_clock_times_as_the_form_writes_them() {
         medewerker_id: Some(6),
         ..args
     };
-    let body = agenda_nieuw(&klaar, "OF-00007", &users(), 5).unwrap().body;
+    let body = agenda_nieuw(&klaar, "OF-00007", &users(), None)
+        .unwrap()
+        .body;
     assert_eq!(
         (body["afgehandeld"].as_str(), body["gebruikerId"].as_u64()),
         (Some("2026-11-21T00:00:00.000Z"), Some(6))
@@ -488,7 +586,7 @@ fn agenda_moments_are_wall_clock_times_as_the_form_writes_them() {
         ..klaar
     };
     assert!(
-        agenda_nieuw(&fout, "OF-00007", &users(), 5)
+        agenda_nieuw(&fout, "OF-00007", &users(), Some(5))
             .unwrap_err()
             .contains("Lisa de Vries (5)")
     );
@@ -502,7 +600,7 @@ fn agenda_moments_are_wall_clock_times_as_the_form_writes_them() {
             },
             "OF-00007",
             &users(),
-            5
+            Some(5)
         )
         .is_err()
     );
@@ -557,7 +655,7 @@ fn incasso_grid() -> Value {
 #[test]
 fn an_incasso_file_lists_every_invoice_and_uses_the_settings_as_they_are() {
     let info = json!({"aantal": 2, "bedrag": 181.5});
-    let (built, query) = incasso_plan(
+    let (built, query, lijst) = incasso_plan(
         (2026, 11, 13),
         (2026, 11, 12),
         &incasso_admin(),
@@ -658,6 +756,32 @@ fn an_incasso_file_lists_every_invoice_and_uses_the_settings_as_they_are() {
         .unwrap_err()
         .contains("letters en cijfers")
     );
+    // Right before the file is made the list must be the one approved.
+    assert_eq!(
+        lijst.nummers,
+        vec!["F00010".to_owned(), "F00011".to_owned()]
+    );
+    assert_eq!(incasso_zelfde(&lijst, &info, &incasso_grid()), Ok(()));
+    let erbij = json!({"data": [{"nummer": "F00010", "bedrijf": "Studio Noord", "bedrag": 121.0, "machtigingMessage": ""},
+                                {"nummer": "F00012", "bedrijf": "Bakkerij Oost", "bedrag": 60.5, "machtigingMessage": ""}]});
+    let changed = incasso_zelfde(&lijst, &info, &erbij).unwrap_err();
+    assert!(
+        changed.starts_with("Er is geen incassobestand gemaakt")
+            && changed.contains("erbij: F00012")
+            && changed.contains("niet meer: F00011"),
+        "{changed}"
+    );
+    let meer = incasso_zelfde(&lijst, &json!({"aantal": 3, "bedrag": 250.0}), &json!({"data": [
+        {"nummer": "F00010", "bedrag": 121.0}, {"nummer": "F00011", "bedrag": 60.5}, {"nummer": "F00013", "bedrag": 68.5}]})).unwrap_err();
+    assert!(
+        meer.contains("goedgekeurd waren 2 facturen voor 181,50, nu staan er 3 voor 250,00"),
+        "{meer}"
+    );
+    assert!(
+        incasso_zelfde(&lijst, &json!({"aantal": 0}), &json!({"data": []}))
+            .unwrap_err()
+            .contains("geen facturen")
+    );
     assert_eq!(next_day((2026, 12, 31)), (2027, 1, 1));
     assert_eq!(safe_file_name(" EBOEK_DD_1.xml "), Some("EBOEK_DD_1.xml"));
     assert_eq!(safe_file_name("../x.xml"), None);
@@ -696,59 +820,275 @@ fn peppol_goes_once_and_only_to_a_relatie_with_a_peppol_id() {
     );
 }
 
-fn bulk_args(ids: Vec<u64>) -> FacturenMailenArgs {
-    FacturenMailenArgs {
-        ids,
-        sjabloon_id: None,
-        onderwerp: Some("Factuur [FACTNUMMER]".into()),
-        bericht: Some("<p>Hierbij uw factuur.</p>".into()),
-        cc: None,
-        bcc: None,
-        ubl: None,
-        account: None,
-    }
+fn eigen(
+    onderwerp: Option<&str>,
+    bericht: Option<&str>,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    (
+        onderwerp.map(str::to_owned),
+        bericht.map(str::to_owned),
+        None,
+        None,
+    )
 }
 
-#[test]
-fn a_bulk_mail_names_every_recipient_and_sends_the_single_mail_request_per_invoice() {
-    let gemeen = facturen_mail_gemeen(
-        &bulk_args(vec![12, 13]),
-        None,
+fn ontvanger(id: u64, nummer: &str, relatie: &str, aan: &str, filled: &Value) -> Ontvanger {
+    let none = None;
+    let mail = factuur_mail(
+        &EigenMail {
+            onderwerp: &none,
+            bericht: &none,
+            cc: &none,
+            bcc: &none,
+        },
+        Some(filled),
+        aan,
         &user(),
         Some("Atelier Zuid"),
     )
     .unwrap();
-    assert_eq!(gemeen.van_naam, "Atelier Zuid");
+    Ontvanger {
+        factuur_id: id,
+        nummer: nummer.into(),
+        relatie: relatie.into(),
+        mail,
+    }
+}
+
+#[test]
+fn an_invoice_mail_sends_the_filled_template_text_and_refuses_codes_in_own_text() {
+    // factuur/maildata as e-Boekhouden answers it: the template's text filled for this invoice.
+    let filled = json!({"subject": "Factuur F00012", "body": "<p>Beste Studio Noord, hierbij factuur F00012.</p>", "ccEmail": "",
+                        "bccEmail": "archief@atelierzuid.example", "vanNaam": "Atelier Zuid", "vanEmail": "facturen@atelierzuid.example"});
+    let none = None;
+    let mail = factuur_mail(
+        &EigenMail {
+            onderwerp: &none,
+            bericht: &none,
+            cc: &none,
+            bcc: &none,
+        },
+        Some(&filled),
+        "jan@studionoord.example",
+        &user(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        mail,
+        FactuurMail {
+            aan: "jan@studionoord.example".into(),
+            cc: None,
+            bcc: Some("archief@atelierzuid.example".into()),
+            van_naam: "Atelier Zuid".into(),
+            van_email: "facturen@atelierzuid.example".into(),
+            onderwerp: "Factuur F00012".into(),
+            bericht: "<p>Beste Studio Noord, hierbij factuur F00012.</p>".into(),
+        }
+    );
+    assert_eq!(
+        factuur_mail_body(&mail, false, 12)["subject"],
+        "Factuur F00012"
+    );
+    // Own text goes out as it is: a code in it is refused, written-out text is fine.
+    let (o, b, c, d) = eigen(Some("Factuur [FACTNUMMER]"), Some("Hierbij"));
+    let refused = factuur_mail(
+        &EigenMail {
+            onderwerp: &o,
+            bericht: &b,
+            cc: &c,
+            bcc: &d,
+        },
+        None,
+        "jan@studionoord.example",
+        &user(),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("[FACTNUMMER]") && refused.contains("zoals hij is"),
+        "{refused}"
+    );
+    let (o, b, c, d) = eigen(Some("Uw factuur"), Some("<p>Beste [RELAANHEF]</p>"));
+    assert!(
+        factuur_mail(
+            &EigenMail {
+                onderwerp: &o,
+                bericht: &b,
+                cc: &c,
+                bcc: &d
+            },
+            None,
+            "jan@studionoord.example",
+            &user(),
+            None
+        )
+        .unwrap_err()
+        .contains("Het bericht")
+    );
+    let (o, b, c, d) = eigen(Some("Factuur F00012 [concept]"), Some("Hierbij"));
+    assert!(
+        factuur_mail(
+            &EigenMail {
+                onderwerp: &o,
+                bericht: &b,
+                cc: &c,
+                bcc: &d
+            },
+            None,
+            "jan@studionoord.example",
+            &user(),
+            None
+        )
+        .is_ok(),
+        "lower case in brackets is no code"
+    );
+    // Caps of the mail form.
+    let (o, b, c, d) = eigen(Some(&"x".repeat(111)), Some("Hierbij"));
+    assert!(
+        factuur_mail(
+            &EigenMail {
+                onderwerp: &o,
+                bericht: &b,
+                cc: &c,
+                bcc: &d
+            },
+            None,
+            "a@b.example",
+            &user(),
+            None
+        )
+        .unwrap_err()
+        .contains("110")
+    );
+    let lang = json!({"subject": "Factuur", "body": "x", "vanNaam": "n".repeat(51)});
+    assert!(
+        factuur_mail(
+            &EigenMail {
+                onderwerp: &none,
+                bericht: &none,
+                cc: &none,
+                bcc: &none
+            },
+            Some(&lang),
+            "a@b.example",
+            &user(),
+            None
+        )
+        .unwrap_err()
+        .contains("50")
+    );
+    assert!(for_invoices(&json!([{"id": 4}]), 4).is_ok());
+    assert!(
+        for_invoices(&json!([{"id": 4}]), 5)
+            .unwrap_err()
+            .contains("niet voor facturen")
+    );
+    assert_eq!(
+        own_text_code("a [B] [FACT_NR] c"),
+        Some("[FACT_NR]".to_owned())
+    );
+}
+
+#[test]
+fn a_bulk_mail_shows_every_recipient_and_text_as_it_is_sent() {
     let ontvangers = vec![
-        Ontvanger {
-            factuur_id: 12,
-            nummer: "F00012".into(),
-            relatie: "Studio Noord".into(),
-            aan: "facturen@studionoord.example".into(),
-        },
-        Ontvanger {
-            factuur_id: 13,
-            nummer: "F00013".into(),
-            relatie: "Bakkerij Oost".into(),
-            aan: "info@bakkerijoost.example".into(),
-        },
+        ontvanger(
+            12,
+            "F00012",
+            "Studio Noord",
+            "facturen@studionoord.example",
+            &json!({"subject": "Factuur F00012", "body": "<p>Hierbij F00012</p>", "vanNaam": "Atelier Zuid", "vanEmail": "f@atelierzuid.example"}),
+        ),
+        ontvanger(
+            13,
+            "F00013",
+            "Bakkerij Oost",
+            "info@bakkerijoost.example",
+            &json!({"subject": "Factuur F00013", "body": "<p>Hierbij F00013</p>", "vanNaam": "Atelier Zuid", "vanEmail": "f@atelierzuid.example"}),
+        ),
     ];
-    let built = facturen_mail_built(&gemeen, &ontvangers);
+    let built = facturen_mail_built(&ontvangers, false);
     assert_eq!(built.title, "2 facturen mailen");
     assert_eq!(
         built.body["mails"][1],
-        json!({"vanNaam": "Atelier Zuid", "vanEmail": "lisa@atelierzuid.example", "aanEmail": "info@bakkerijoost.example", "ccEmail": null,
-               "bccEmail": null, "subject": "Factuur [FACTNUMMER]", "body": "<p>Hierbij uw factuur.</p>", "factuurUbl": false,
+        json!({"vanNaam": "Atelier Zuid", "vanEmail": "f@atelierzuid.example", "aanEmail": "info@bakkerijoost.example", "ccEmail": null,
+               "bccEmail": null, "subject": "Factuur F00013", "body": "<p>Hierbij F00013</p>", "factuurUbl": false,
                "rememberMessage": false, "useEmailSjabloon": false, "bijlagen": [], "factuurId": 13})
     );
-    assert!(built.lines.iter().any(|l| l.label == "Factuur F00012"
-        && l.value == "aan facturen@studionoord.example (Studio Noord)"));
-    assert!(
+    let shown = |label: &str| {
         built
             .lines
             .iter()
-            .any(|l| l.label == "Let op" && l.value.contains("2 echte e-mails"))
+            .find(|l| l.label == label)
+            .map(|l| l.value.clone())
+    };
+    assert_eq!(
+        shown("Factuur F00012").as_deref(),
+        Some("aan facturen@studionoord.example (Studio Noord)")
     );
+    assert_eq!(
+        shown("Factuur F00013, onderwerp").as_deref(),
+        Some("Factuur F00013")
+    );
+    assert_eq!(
+        shown("Factuur F00013, bericht").as_deref(),
+        Some("Hierbij F00013")
+    );
+    assert_eq!(
+        shown("Van bij elke mail").as_deref(),
+        Some("Atelier Zuid <f@atelierzuid.example>")
+    );
+    assert!(shown("Let op").unwrap().contains("2 echte e-mails"));
+    assert!(
+        !built.lines.iter().any(|l| l.value.contains("vult")),
+        "no claim that codes get filled"
+    );
+    // Stopping halfway says what went out, what happened, and what was not tried.
+    let three = vec![
+        ontvanger(
+            12,
+            "F00012",
+            "A",
+            "a@a.example",
+            &json!({"subject": "s", "body": "b", "vanEmail": "f@x.example"}),
+        ),
+        ontvanger(
+            13,
+            "F00013",
+            "B",
+            "b@b.example",
+            &json!({"subject": "s", "body": "b", "vanEmail": "f@x.example"}),
+        ),
+        ontvanger(
+            14,
+            "F00014",
+            "C",
+            "c@c.example",
+            &json!({"subject": "s", "body": "b", "vanEmail": "f@x.example"}),
+        ),
+    ];
+    let certain = bulk_mail_stopped(&three, 1, "Mailbox vol", true);
+    assert_eq!(
+        certain,
+        "Factuur F00013 is niet verstuurd: Mailbox vol. Verstuurd: F00012. Niet geprobeerd: F00014."
+    );
+    let unknown = bulk_mail_stopped(&three, 0, "e-Boekhouden antwoordde niet binnen 30 s", false);
+    assert!(
+        unknown.starts_with("Factuur F00012: onbekend, mogelijk verstuurd")
+            && unknown.ends_with("Verstuurd: geen. Niet geprobeerd: F00013, F00014."),
+        "{unknown}"
+    );
+    assert!(
+        certainly_not_done("e-Boekhouden weigert dit: x")
+            && !certainly_not_done("e-Boekhouden antwoordde niet binnen 30 s")
+    );
+    assert!(!certainly_not_done("Geen verbinding met e-Boekhouden"));
     assert_eq!(
         factuur_adres(&relatie()).as_deref(),
         Some("facturen@studionoord.example")
@@ -761,13 +1101,6 @@ fn a_bulk_mail_names_every_recipient_and_sends_the_single_mail_request_per_invoi
     assert!(check_ids(&[]).is_err());
     assert!(check_ids(&[1, 2, 1]).unwrap_err().contains("twee keer"));
     assert!(check_ids(&(1..=51).collect::<Vec<_>>()).is_err());
-    let mut zonder = bulk_args(vec![1]);
-    zonder.onderwerp = None;
-    assert!(
-        facturen_mail_gemeen(&zonder, None, &user(), None)
-            .unwrap_err()
-            .contains("onderwerp")
-    );
 }
 
 fn links() -> Value {
@@ -778,7 +1111,8 @@ fn links() -> Value {
 
 #[test]
 fn unlinking_names_each_link_and_keeps_the_file() {
-    let (built, ids) = ontkoppel_plan("bon.pdf", &links(), Some(16), false).unwrap();
+    let (built, ids, danger) = ontkoppel_plan("bon.pdf", &links(), Some(16), false).unwrap();
+    assert!(!danger, "a mutatie link comes back with archief_koppelen");
     assert_eq!(ids, vec![901]);
     assert_eq!(built.title, "Bestand ontkoppelen: bon.pdf");
     assert!(
@@ -793,7 +1127,17 @@ fn unlinking_names_each_link_and_keeps_the_file() {
             .iter()
             .any(|l| l.label == "Gevolg" && l.value.contains("blijft"))
     );
-    let (built, ids) = ontkoppel_plan("bon.pdf", &links(), None, true).unwrap();
+    let (built, ids, danger) = ontkoppel_plan("bon.pdf", &links(), None, true).unwrap();
+    assert!(
+        danger,
+        "links to a bank line or quote cannot be restored: always asked"
+    );
+    assert!(
+        built
+            .lines
+            .iter()
+            .any(|l| l.label == "Let op" && l.value.contains("niet terugzetten"))
+    );
     assert_eq!(ids, vec![901, 902, 903]);
     assert!(
         built
@@ -830,26 +1174,60 @@ fn the_e_mail_codes_are_unique_and_bracketed() {
 
 /// What the stand-in for e-Boekhouden was asked to change, in order: method, path with query, body.
 type Seen = Arc<Mutex<Vec<(String, String, Value)>>>;
+/// Switches a test flips to change what the stand-in answers (an invoice set ready for incasso meanwhile, ...).
+type Flags = Arc<Mutex<std::collections::BTreeSet<&'static str>>>;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// The answer of the stand-in to one request, or `None` for a path it does not know (404).
-fn answer(method: &str, path: &str) -> Option<axum::response::Response> {
+/// The answer of the stand-in to one request, or `None` for a path it does not know (404). Only fields the live
+/// captures or the web app's code show are used.
+fn answer(
+    method: &str,
+    path: &str,
+    body: &Value,
+    flags: &std::collections::BTreeSet<&'static str>,
+) -> Option<axum::response::Response> {
     use axum::response::IntoResponse;
     let grid = |names: &[&str], data: Value| json!({"colMetadata": names.iter().map(|n| json!({"name": n})).collect::<Vec<_>>(), "data": data});
     let json = |value: Value| Some(axum::Json(value).into_response());
+    let pdf = |name: &str| {
+        Some(
+            (
+                [(
+                    axum::http::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename={name}"),
+                )],
+                "%PDF-1.4 proef",
+            )
+                .into_response(),
+        )
+    };
+    let incasso_extra = flags.contains("incasso_extra");
     match (method, path) {
         ("GET", "offerte/7") => json(offerte()),
         ("GET", "offerteregel/getbyofferteid/7") => json(offerteregels()),
         ("GET", "relatie/3") => json(relatie()),
         ("GET", "relatie/4") => json(json!({"id": 4, "bedrijf": "Bakkerij Oost"})),
+        ("GET", "relatie/5") => json(
+            json!({"id": 5, "bedrijf": "Drukkerij West", "email": "info@drukkerijwest.example"}),
+        ),
         ("GET", "user") => json(user()),
         ("GET", "user/selectlist") => json(users()),
         ("GET", "emailsjabloonab/forofferte") => json(json!([{"id": 4, "naam": "Offerte"}])),
+        ("GET", "emailsjabloonab/forfactuur") => json(json!([{"id": 6, "naam": "Factuur"}])),
         ("GET", "offerte/getmaildata/7/4") => json(
-            json!({"subject": "Offerte [OFFERTENUMMER]", "body": "<p>Beste klant</p>", "vanNaam": "Atelier Zuid", "vanEmail": "offertes@atelierzuid.example"}),
+            json!({"subject": "Offerte OF-00007", "body": "<p>Beste klant</p>", "vanNaam": "Atelier Zuid", "vanEmail": "offertes@atelierzuid.example"}),
         ),
-        ("POST", "offerte/verstuur/7/true") => json(json!({"sendCount": 1, "errorCount": 0})),
+        ("GET", p) if p.starts_with("factuur/maildata/6/") => {
+            let id = p.rsplit('/').next().unwrap_or_default();
+            json(
+                json!({"subject": format!("Factuur nummer {id}"), "body": format!("<p>Hierbij factuur {id}</p>"), "ccEmail": "", "bccEmail": "",
+                        "vanNaam": "Atelier Zuid", "vanEmail": "facturen@atelierzuid.example"}),
+            )
+        }
+        ("POST", "offerte/verstuur/7/true") | ("POST", "offerte/verstuur/7/false") => {
+            json(json!({"sendCount": 1, "errorCount": 0}))
+        }
         ("GET", "voortgangsoort/selectlist") => json(soorten()),
         ("GET", "offertevoortgang/gridtable/7") => json(grid(
             &["id", "datum", "medewerker", "soort", "onderwerp"],
@@ -860,36 +1238,75 @@ fn answer(method: &str, path: &str) -> Option<axum::response::Response> {
         }
         ("POST", "offertevoortgang") => json(json!({"id": 22})),
         ("PUT", "offertevoortgang") | ("DELETE", "offertevoortgang/21") => json(json!(true)),
-        ("GET", "grootboekrekening/gridtable") => json(grid(
-            &["id", "code", "omschrijving", "categorie"],
-            json!([
-                [80, "8000", "Omzet ontwerp", "Winst en Verlies"],
-                [13, "1300", "Debiteuren", "Debiteuren"]
-            ]),
+        ("GET", "offerteagenda/gridtable/7") => json(grid(
+            &[
+                "id",
+                "dag",
+                "datum",
+                "onderwerp",
+                "medewerker",
+                "afgehandeld",
+            ],
+            json!([[
+                31,
+                "vr",
+                "2026-11-20T09:05:00",
+                "Nabellen",
+                "Lisa de Vries",
+                null
+            ]]),
         )),
-        ("GET", "btwinfo/all") => json(
-            json!([{"code": "HOOG_VERK_21", "omschrijving": "Hoog", "percentage": 21, "soort": "VERK"}]),
+        ("GET", "offerteagenda/getordefault/31") => json(
+            json!({"datum": "2026-11-20T09:05:00", "gebruikerId": 5, "onderwerp": "Nabellen", "body": null, "afgehandeld": null}),
         ),
-        ("GET", "factuur/nextfactuurnummer") => json(json!("F00009")),
-        ("GET", "factuursetting") => json(json!({"factuurSjabloonId": 878203, "verwerken": false})),
+        ("GET", "offerteagenda/volgendeactie/7") => json(json!({"datum": "2026-11-20T09:05:00"})),
+        ("POST", "offerteagenda") => json(json!({"id": 32})),
+        ("PUT", "offerteagenda") | ("DELETE", "offerteagenda/31") => json(json!(true)),
         ("GET", "offertestatus/gridtable") => json(grid(
             &["id", "status"],
             json!([[11, "Ingevoerd"], [12, "Geaccepteerd"]]),
         )),
-        ("GET", "folder/5") => json(
-            json!({"id": 5, "naam": "bon.pdf", "soort": "F", "isDeleted": false, "koppelCount": 2}),
-        ),
-        ("GET", "folder/5/koppel") => json(links()),
-        ("DELETE", "folderkoppel/901") => json(json!(true)),
-        ("GET", "administratie/incassoinfo") => json(incasso_admin()),
-        ("GET", "factuur/incassoinfo") => json(json!({"aantal": 2, "bedrag": 181.5})),
-        ("GET", "factuur/machtiginggrid") => json(grid(
-            &["nummer", "bedrijf", "bedrag", "machtigingMessage"],
+        ("GET", "grootboekrekening/gridtable") => json(grid(
+            &["id", "code", "omschrijving", "categorie"],
             json!([
-                ["F00010", "Studio Noord", 121.0, ""],
-                ["F00011", "Bakkerij Oost", 60.5, ""]
+                [80, "8000", "Omzet ontwerp", "Winst en Verlies"],
+                [81, "8010", "Omzet drukwerk", "Winst en Verlies"],
+                [13, "1300", "Debiteuren", "Debiteuren"]
             ]),
         )),
+        ("GET", "btwinfo/all") => json(
+            json!([{"code": "HOOG_VERK_21", "omschrijving": "Hoog", "percentage": 21, "soort": "VERK"},
+                                               {"code": "LAAG_VERK_9", "omschrijving": "Laag", "percentage": 9, "soort": "VERK"}]),
+        ),
+        ("GET", "factuur/nextfactuurnummer") => json(json!("F00009")),
+        ("GET", "factuursetting") => json(json!({"factuurSjabloonId": 878203, "verwerken": false})),
+        ("POST", "factuur/model") => json(json!({"id": 900, "nummer": "F00009", "totaal": 121.0})),
+        ("GET", "folder/5") => json(
+            json!({"id": 5, "naam": "bon.pdf", "soort": "F", "isDeleted": false, "koppelCount": 3}),
+        ),
+        ("GET", "folder/5/koppel") => json(links()),
+        ("DELETE", p) if p.starts_with("folderkoppel/") => json(json!(true)),
+        ("GET", "administratie/incassoinfo") => json(incasso_admin()),
+        ("GET", "factuur/incassoinfo") if incasso_extra => {
+            json(json!({"aantal": 3, "bedrag": 250.0}))
+        }
+        ("GET", "factuur/incassoinfo") => json(json!({"aantal": 2, "bedrag": 181.5})),
+        ("GET", "factuur/machtiginggrid") => {
+            let mut data = vec![
+                json!(["F00010", "Studio Noord", 121.0, ""]),
+                json!(["F00011", "Bakkerij Oost", 60.5, ""]),
+            ];
+            if incasso_extra {
+                data.push(json!(["F00013", "Drukkerij West", 68.5, ""]));
+            }
+            json(grid(
+                &["nummer", "bedrijf", "bedrag", "machtigingMessage"],
+                json!(data),
+            ))
+        }
+        ("GET", "incassobestand/create") if flags.contains("incasso_timeout") => {
+            Some(axum::http::StatusCode::BAD_GATEWAY.into_response())
+        }
         ("GET", "incassobestand/create") => json(json!("EBOEK_DD_proef.xml")),
         ("GET", "incassobestand/download/EBOEK_DD_proef.xml") => Some(
             (
@@ -907,30 +1324,53 @@ fn answer(method: &str, path: &str) -> Option<axum::response::Response> {
         ("GET", "factuur/13") => {
             json(json!({"id": 13, "nummer": "F00013", "relatieId": 4, "totaal": 60.5}))
         }
-        ("GET", "factuur/haspeppolverzending/12") => json(json!(false)),
+        ("GET", "factuur/14") => {
+            json(json!({"id": 14, "nummer": "F00014", "relatieId": 5, "totaal": 68.5}))
+        }
+        ("GET", "factuur/15") => {
+            json(json!({"id": 15, "nummer": "F00015", "relatieId": 5, "totaal": 10.0}))
+        }
+        ("GET", "factuur/16") => {
+            json(json!({"id": 16, "nummer": "F00016", "relatieId": 3, "totaal": 10.0}))
+        }
+        ("GET", "factuur/12/print") => pdf("F00012.pdf"),
+        ("GET", "factuur/14/print") => pdf("F00014.pdf"),
+        ("GET", "peppol/getpeppolaccount") if flags.contains("geen_peppol") => json(Value::Null),
+        ("GET", "peppol/getpeppolaccount") => json(json!({"peppolId": "0106:87654321"})),
+        ("GET", "factuur/haspeppolverzending/12") => {
+            json(json!(flags.contains("peppol_al_verstuurd")))
+        }
         ("POST", "peppol/send") => Some(axum::http::StatusCode::OK.into_response()),
-        ("POST", "factuur/mail") => json(json!({"errorCount": 0, "errorMessage": ""})),
+        ("POST", "factuur/mail") => match body["factuurId"].as_u64() {
+            // Invoice 15: e-Boekhouden answers that it did not send. Invoice 16: the request times out at the gateway.
+            Some(15) => json(json!({"errorCount": 1, "errorMessage": "Mailbox vol"})),
+            Some(16) => Some(axum::http::StatusCode::GATEWAY_TIMEOUT.into_response()),
+            _ => json(json!({"errorCount": 0, "errorMessage": ""})),
+        },
         _ => None,
     }
 }
 
-async fn eboekhouden(seen: Seen) -> String {
+async fn eboekhouden(seen: Seen, flags: Flags) -> String {
     use axum::response::IntoResponse;
     let app = axum::Router::new().fallback(
         move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
-            let seen = seen.clone();
+            let (seen, flags) = (seen.clone(), flags.clone());
             async move {
                 let path = uri.path().trim_start_matches("/v1/api/").to_owned();
+                let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 // A GET that makes something (the incasso file) counts as a change, as do all other methods.
                 if method != axum::http::Method::GET || path == "incassobestand/create" {
                     let shown = match uri.query() {
                         Some(query) => format!("{path}?{query}"),
                         None => path.clone(),
                     };
-                    let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                    seen.lock().unwrap().push((method.to_string(), shown, body));
+                    seen.lock()
+                        .unwrap()
+                        .push((method.to_string(), shown, body.clone()));
                 }
-                answer(method.as_str(), &path)
+                let flags = flags.lock().unwrap().clone();
+                answer(method.as_str(), &path, &body, &flags)
                     .unwrap_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response())
             }
         },
@@ -949,15 +1389,17 @@ struct Harness {
     url: String,
     session: Option<String>,
     seen: Seen,
+    flags: Flags,
 }
 
 impl Harness {
     async fn start(mode: WriteMode) -> Self {
         let seen: Seen = Arc::default();
+        let flags: Flags = Arc::default();
         let jar = Arc::new(crate::state::testing::FakeJar::default());
         let state = Arc::new(crate::state::testing::state_with(
             jar,
-            &eboekhouden(seen.clone()).await,
+            &eboekhouden(seen.clone(), flags.clone()).await,
         ));
         let account = state.accounts.add(Self::input(mode)).unwrap();
         state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
@@ -973,6 +1415,7 @@ impl Harness {
             url: format!("http://127.0.0.1:{port}{}", crate::mcp::PATH),
             session: None,
             seen,
+            flags,
         };
         let init = harness
             .post(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "title": "Claude", "version": "1"}}}))
@@ -1004,6 +1447,15 @@ impl Harness {
             .accounts
             .update(self.account, Self::input(mode))
             .unwrap();
+    }
+
+    fn flag(&self, name: &'static str, on: bool) {
+        let mut flags = self.flags.lock().unwrap();
+        if on {
+            flags.insert(name);
+        } else {
+            flags.remove(name);
+        }
     }
 
     async fn post(&self, body: Value) -> reqwest::Response {
@@ -1088,6 +1540,15 @@ impl Harness {
     }
 }
 
+fn shown(proposal: &crate::approvals::Proposal, label: &str) -> String {
+    proposal
+        .lines
+        .iter()
+        .find(|l| l.label == label)
+        .map(|l| l.value.clone())
+        .unwrap_or_default()
+}
+
 #[tokio::test]
 async fn following_up_a_quote_goes_out_only_after_approval() {
     use crate::approvals::Status;
@@ -1102,9 +1563,16 @@ async fn following_up_a_quote_goes_out_only_after_approval() {
         .call("offerte_mailen", json!({"id": 7, "sjabloon_id": 99}))
         .await;
     assert!(is_error && text.contains("niet voor offertes"), "{text}");
+    let (is_error, text) = h
+        .call(
+            "offerte_mailen",
+            json!({"id": 7, "onderwerp": "Offerte [OFFERTENUMMER]", "bericht": "x"}),
+        )
+        .await;
+    assert!(is_error && text.contains("zoals hij is"), "{text}");
     assert_eq!(h.state.approvals.count(), 0);
 
-    // Mail: the user sees recipient, subject and message; refused, nothing goes out.
+    // Mail: the user sees the filled text; refused, nothing goes out.
     let proposal = h
         .waits("offerte_mailen", json!({"id": 7, "sjabloon_id": 4}))
         .await;
@@ -1113,15 +1581,10 @@ async fn following_up_a_quote_goes_out_only_after_approval() {
         proposal.title,
         "Offerte OF-00007 mailen naar jan@studionoord.example"
     );
-    assert!(
-        proposal
-            .lines
-            .iter()
-            .any(|l| l.label == "Onderwerp" && l.value == "Offerte [OFFERTENUMMER]")
-    );
+    assert_eq!(shown(&proposal, "Onderwerp"), "Offerte OF-00007");
     assert_eq!(h.decide(proposal.id, false).await.status, Status::Refused);
     assert!(h.changes().is_empty());
-    // Approved: exactly the form's request.
+    // Approved: exactly the form's request, with the text that was shown.
     let proposal = h
         .waits("offerte_mailen", json!({"id": 7, "sjabloon_id": 4}))
         .await;
@@ -1134,6 +1597,7 @@ async fn following_up_a_quote_goes_out_only_after_approval() {
         ("POST", "offerte/verstuur/7/true")
     );
     assert_eq!(changes[0].2["aanEmail"], "jan@studionoord.example");
+    assert_eq!(changes[0].2["subject"], "Offerte OF-00007");
     assert_eq!(changes[0].2["vanEmail"], "offertes@atelierzuid.example");
 
     // Mail always asks, also for an account that needs no approval; progress does not.
@@ -1184,15 +1648,38 @@ async fn following_up_a_quote_goes_out_only_after_approval() {
     h.decide(proposal.id, true).await;
     assert_eq!(h.changes()[3].1, "offertevoortgang/21");
 
-    // An invoice from the quote, read and built before the question.
+    // An invoice from the quote: refused sends nothing, approved sends exactly the body that was shown.
     let proposal = h
         .waits("offerte_factureren", json!({"id": 7, "regel_ids": [71]}))
         .await;
     assert!(!proposal.danger);
     assert_eq!(proposal.title, "Factuur F00009 maken van offerte OF-00007");
-    assert_eq!(h.changes().len(), 4);
+    assert!(shown(&proposal, "Meteen boeken").starts_with("ja"));
+    assert_eq!(shown(&proposal, "Totaal incl. btw"), "121,00");
     assert_eq!(h.decide(proposal.id, false).await.status, Status::Refused);
     assert_eq!(h.changes().len(), 4);
+    let proposal = h
+        .waits(
+            "offerte_factureren",
+            json!({"id": 7, "regel_ids": [71], "direct_boeken": false}),
+        )
+        .await;
+    assert!(shown(&proposal, "Meteen boeken").starts_with("nee"));
+    assert_eq!(h.decide(proposal.id, true).await.status, Status::Done);
+    let (method, path, body) = h.changes()[4].clone();
+    assert_eq!((method.as_str(), path.as_str()), ("POST", "factuur/model"));
+    assert_eq!(
+        body,
+        json!({
+            "factuur": {"relatieId": 3, "nummer": "F00009", "inEx": "EX", "datum": body["factuur"]["datum"], "termijn": 0,
+                        "sjabloonId": 878203, "emailSjabloonId": 4, "type": "N", "btwLaag": 0, "btwHoog": 0, "totaal": 0,
+                        "kenmerk": "OF-00007", "offerteId": 7},
+            "factuurItems": {"insert": [{"id": -1, "factuurId": 0, "prijs": null, "volgorde": 0, "aantal": 2, "omschrijving": "Ontwerp",
+                                         "prijsExcl": 50.0, "prijsIncl": 60.5, "btw": "HOOG_VERK_21", "grootboekId": 80, "kostenplaatsId": 0,
+                                         "kortingIsPerc": true}],
+                             "update": [], "delete": []}
+        })
+    );
 
     // The read tool shows status and progress.
     let (is_error, text) = h.call("offerte_voortgang", json!({"offerte_id": 7})).await;
@@ -1207,73 +1694,316 @@ async fn following_up_a_quote_goes_out_only_after_approval() {
 }
 
 #[tokio::test]
-async fn invoice_extras_ask_always_and_send_what_was_shown() {
+async fn the_agenda_of_a_quote_end_to_end() {
     use crate::approvals::Status;
-    let h = Harness::start(WriteMode::Auto).await;
-
-    // Peppol: always asked, the invoice's id is the body.
-    let proposal = h.waits("peppol_versturen", json!({"id": 12})).await;
-    assert!(
-        proposal.danger
-            && proposal
-                .lines
-                .iter()
-                .any(|l| l.value.contains("0106:12345678"))
+    let h = Harness::start(WriteMode::Ask).await;
+    let (is_error, text) = h.call("offerte_agenda", json!({"offerte_id": 7})).await;
+    assert!(!is_error, "{text}");
+    let value: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["data"]["agenda"][0]["onderwerp"], "Nabellen");
+    assert_eq!(
+        value["data"]["medewerkers"][0],
+        json!({"id": 5, "naam": "Lisa de Vries"})
     );
+
+    // `user` has no id: without a medewerker the tool asks for one, and nothing is asked of the user.
+    let (is_error, text) = h
+        .call("offerte_agenda_toevoegen", json!({"offerte_id": 7, "datum": "2026-11-27", "tijd": "10:00", "onderwerp": "Terugbellen"}))
+        .await;
+    assert!(is_error && text.contains("medewerker_id"), "{text}");
+    assert_eq!(h.state.approvals.count(), 0);
+    let proposal = h
+        .waits("offerte_agenda_toevoegen", json!({"offerte_id": 7, "datum": "2026-11-27", "tijd": "10:00", "onderwerp": "Terugbellen", "medewerker_id": 6}))
+        .await;
+    assert_eq!(shown(&proposal, "Medewerker"), "Jan Bakker");
     assert!(h.changes().is_empty());
     assert_eq!(h.decide(proposal.id, true).await.status, Status::Done);
     assert_eq!(
         h.changes()[0],
-        ("POST".to_owned(), "peppol/send".to_owned(), json!(12))
+        (
+            "POST".to_owned(),
+            "offerteagenda".to_owned(),
+            json!({"offerteId": 7, "onderwerp": "Terugbellen", "datum": "2026-11-27T10:00:00.000Z", "gebruikerId": 6})
+        )
     );
 
-    // Bulk mail: one line per invoice and recipient, one request per invoice.
+    let proposal = h
+        .waits(
+            "offerte_agenda_wijzigen",
+            json!({"offerte_id": 7, "id": 31, "afgehandeld": "2026-11-21"}),
+        )
+        .await;
+    h.decide(proposal.id, true).await;
+    assert_eq!(
+        h.changes()[1],
+        (
+            "PUT".to_owned(),
+            "offerteagenda".to_owned(),
+            json!({"id": 31, "offerteId": 7, "onderwerp": "Nabellen", "datum": "2026-11-20T09:05:00.000Z", "gebruikerId": 5, "afgehandeld": "2026-11-21T00:00:00.000Z"})
+        )
+    );
+    let (is_error, text) = h
+        .call(
+            "offerte_agenda_verwijderen",
+            json!({"offerte_id": 7, "id": 99}),
+        )
+        .await;
+    assert!(
+        is_error && text.contains("hoort niet bij offerte 7"),
+        "{text}"
+    );
+    let proposal = h
+        .waits(
+            "offerte_agenda_verwijderen",
+            json!({"offerte_id": 7, "id": 31}),
+        )
+        .await;
+    assert!(proposal.danger);
+    assert_eq!(h.decide(proposal.id, false).await.status, Status::Refused);
+    assert_eq!(h.changes().len(), 2);
+    h.decide(
+        h.waits(
+            "offerte_agenda_verwijderen",
+            json!({"offerte_id": 7, "id": 31}),
+        )
+        .await
+        .id,
+        true,
+    )
+    .await;
+    assert_eq!(
+        h.changes()[2],
+        (
+            "DELETE".to_owned(),
+            "offerteagenda/31".to_owned(),
+            Value::Null
+        )
+    );
+}
+
+#[tokio::test]
+async fn invoice_mail_sends_the_filled_text_that_was_shown() {
+    use crate::approvals::Status;
+    let h = Harness::start(WriteMode::Ask).await;
+
+    // factuur_mailen: own text with a code is refused; a template for quotes only is refused.
+    let (is_error, text) = h
+        .call(
+            "factuur_mailen",
+            json!({"id": 12, "onderwerp": "Factuur [FACTNUMMER]", "bericht": "x"}),
+        )
+        .await;
+    assert!(is_error && text.contains("[FACTNUMMER]"), "{text}");
+    let (is_error, text) = h
+        .call("factuur_mailen", json!({"id": 12, "sjabloon_id": 4}))
+        .await;
+    assert!(is_error && text.contains("niet voor facturen"), "{text}");
+    // With a template: the text e-Boekhouden filled for this invoice is shown, and exactly that is sent.
+    let proposal = h
+        .waits("factuur_mailen", json!({"id": 12, "sjabloon_id": 6}))
+        .await;
+    assert_eq!(shown(&proposal, "Onderwerp"), "Factuur nummer 12");
+    assert_eq!(shown(&proposal, "Bericht"), "Hierbij factuur 12");
+    assert_eq!(shown(&proposal, "Aan"), "facturen@studionoord.example");
+    assert!(h.changes().is_empty());
+    assert_eq!(h.decide(proposal.id, true).await.status, Status::Done);
+    let (_, path, body) = h.changes()[0].clone();
+    assert_eq!(path, "factuur/mail");
+    assert_eq!(
+        (body["subject"].as_str(), body["body"].as_str()),
+        (Some("Factuur nummer 12"), Some("<p>Hierbij factuur 12</p>"))
+    );
+    assert_eq!(
+        (body["vanEmail"].as_str(), body["factuurId"].as_u64()),
+        (Some("facturen@atelierzuid.example"), Some(12))
+    );
+
+    // facturen_mailen: the filled text per invoice; refused sends nothing.
     let (is_error, text) = h
         .call(
             "facturen_mailen",
-            json!({"ids": [12, 13], "onderwerp": "Factuur [FACTNUMMER]", "bericht": "Hierbij"}),
+            json!({"ids": [12, 13], "onderwerp": "Uw factuur", "bericht": "Hierbij"}),
         )
         .await;
     assert!(
         is_error && text.contains("F00013 (Bakkerij Oost)"),
         "a relatie without address: {text}"
     );
+    let (is_error, text) = h
+        .call(
+            "facturen_mailen",
+            json!({"ids": [12], "onderwerp": "Factuur [FACTNUMMER]", "bericht": "x"}),
+        )
+        .await;
+    assert!(is_error && text.contains("zoals hij is"), "{text}");
+    let (is_error, text) = h
+        .call("facturen_mailen", json!({"ids": [12], "sjabloon_id": 4}))
+        .await;
+    assert!(is_error && text.contains("niet voor facturen"), "{text}");
     let proposal = h
         .waits(
             "facturen_mailen",
-            json!({"ids": [12], "onderwerp": "Factuur [FACTNUMMER]", "bericht": "Hierbij"}),
+            json!({"ids": [12, 14], "sjabloon_id": 6}),
         )
         .await;
-    assert!(proposal.lines.iter().any(|l| l.label == "Factuur F00012"
-        && l.value == "aan facturen@studionoord.example (Studio Noord)"));
-    h.decide(proposal.id, true).await;
-    let mail = &h.changes()[1];
+    assert!(proposal.danger);
     assert_eq!(
-        (mail.1.as_str(), mail.2["factuurId"].as_u64()),
-        ("factuur/mail", Some(12))
+        shown(&proposal, "Factuur F00014"),
+        "aan info@drukkerijwest.example (Drukkerij West)"
+    );
+    assert_eq!(
+        shown(&proposal, "Factuur F00014, onderwerp"),
+        "Factuur nummer 14"
+    );
+    assert_eq!(h.decide(proposal.id, false).await.status, Status::Refused);
+    assert_eq!(h.changes().len(), 1);
+    let proposal = h
+        .waits(
+            "facturen_mailen",
+            json!({"ids": [12, 14], "sjabloon_id": 6}),
+        )
+        .await;
+    assert_eq!(h.decide(proposal.id, true).await.status, Status::Done);
+    let changes = h.changes();
+    assert_eq!(
+        (
+            changes[1].2["factuurId"].as_u64(),
+            changes[1].2["subject"].as_str()
+        ),
+        (Some(12), Some("Factuur nummer 12"))
+    );
+    assert_eq!(
+        (
+            changes[2].2["factuurId"].as_u64(),
+            changes[2].2["subject"].as_str()
+        ),
+        (Some(14), Some("Factuur nummer 14"))
     );
 
-    // Incasso: the file is made only after approval and lands in the folder named.
+    // Halfway: e-Boekhouden says no for invoice 15; the rest is not tried, and the message says so.
+    let proposal = h
+        .waits(
+            "facturen_mailen",
+            json!({"ids": [12, 15, 14], "onderwerp": "Uw factuur", "bericht": "Hierbij"}),
+        )
+        .await;
+    let record = h.decide(proposal.id, true).await;
+    assert_eq!(record.status, Status::Failed);
+    let error = record.error.unwrap_or_default();
+    assert!(error.contains("Factuur F00015 is niet verstuurd: Mailbox vol. Verstuurd: F00012. Niet geprobeerd: F00014."), "{error}");
+    assert_eq!(h.changes().len(), 5, "12 and 15 went out, 14 was not tried");
+    // A gateway timeout for invoice 16: unknown, maybe sent.
+    let proposal = h
+        .waits(
+            "facturen_mailen",
+            json!({"ids": [16, 14], "onderwerp": "Uw factuur", "bericht": "Hierbij"}),
+        )
+        .await;
+    let error = h.decide(proposal.id, true).await.error.unwrap_or_default();
+    assert!(
+        error.contains("Factuur F00016: onbekend, mogelijk verstuurd")
+            && error.contains("Niet geprobeerd: F00014."),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn peppol_and_incasso_ask_always_and_check_again_after_approval() {
+    use crate::approvals::Status;
+    let h = Harness::start(WriteMode::Auto).await;
+
+    // Peppol: always asked, refused sends nothing, the invoice's id is the body.
+    let proposal = h.waits("peppol_versturen", json!({"id": 12})).await;
+    assert!(proposal.danger && shown(&proposal, "Aan").contains("0106:12345678"));
+    assert_eq!(h.decide(proposal.id, false).await.status, Status::Refused);
+    assert!(h.changes().is_empty());
+    let proposal = h.waits("peppol_versturen", json!({"id": 12})).await;
+    assert_eq!(h.decide(proposal.id, true).await.status, Status::Done);
+    assert_eq!(
+        h.changes()[0],
+        ("POST".to_owned(), "peppol/send".to_owned(), json!(12))
+    );
+    // Sent meanwhile: nothing goes out after the approval.
+    let proposal = h.waits("peppol_versturen", json!({"id": 12})).await;
+    h.flag("peppol_al_verstuurd", true);
+    let record = h.decide(proposal.id, true).await;
+    assert_eq!(record.status, Status::Failed);
+    assert!(
+        record
+            .error
+            .unwrap_or_default()
+            .contains("intussen al via Peppol verstuurd")
+    );
+    assert_eq!(h.changes().len(), 1);
+    // An administration without Peppol is refused plainly, before anything else is read.
+    h.flag("peppol_al_verstuurd", false);
+    h.flag("geen_peppol", true);
+    let (is_error, text) = h.call("peppol_versturen", json!({"id": 12})).await;
+    assert!(
+        is_error && text.contains("niet op Peppol aangesloten"),
+        "{text}"
+    );
+
+    // Incasso: refused makes nothing; approved makes the file in the folder named.
     let dir = std::env::temp_dir().join(format!("ebmcp-incasso-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
+    let map = dir.to_str().unwrap();
     let (is_error, text) = h
         .call(
             "incassobestand_maken",
-            json!({"uitvoerdatum": "2020-01-01", "map": dir.to_str().unwrap()}),
+            json!({"uitvoerdatum": "2020-01-01", "map": map}),
         )
         .await;
     assert!(is_error && text.contains("verleden"), "{text}");
     let proposal = h
         .waits(
             "incassobestand_maken",
-            json!({"uitvoerdatum": "2099-01-02", "map": dir.to_str().unwrap()}),
+            json!({"uitvoerdatum": "2099-01-02", "map": map}),
         )
         .await;
     assert!(proposal.danger && proposal.title.contains("2 facturen, 181,50"));
-    assert_eq!(h.changes().len(), 2, "not made before the answer");
+    assert_eq!(h.decide(proposal.id, false).await.status, Status::Refused);
+    assert_eq!(h.changes().len(), 1, "no file made");
+    // An invoice set ready while the approval waited: no file is made.
+    let proposal = h
+        .waits(
+            "incassobestand_maken",
+            json!({"uitvoerdatum": "2099-01-02", "map": map}),
+        )
+        .await;
+    h.flag("incasso_extra", true);
+    let record = h.decide(proposal.id, true).await;
+    assert_eq!(record.status, Status::Failed);
+    let error = record.error.unwrap_or_default();
+    assert!(
+        error.contains("Er is geen incassobestand gemaakt") && error.contains("erbij: F00013"),
+        "{error}"
+    );
+    assert_eq!(h.changes().len(), 1);
+    h.flag("incasso_extra", false);
+    // A failure after the request went out: the outcome is unknown, and the user is told where to look.
+    let proposal = h
+        .waits(
+            "incassobestand_maken",
+            json!({"uitvoerdatum": "2099-01-02", "map": map}),
+        )
+        .await;
+    h.flag("incasso_timeout", true);
+    let error = h.decide(proposal.id, true).await.error.unwrap_or_default();
+    assert!(
+        error.contains("niet zeker") && error.contains("Oude incassobestanden"),
+        "{error}"
+    );
+    h.flag("incasso_timeout", false);
+    let proposal = h
+        .waits(
+            "incassobestand_maken",
+            json!({"uitvoerdatum": "2099-01-02", "map": map}),
+        )
+        .await;
     assert_eq!(h.decide(proposal.id, true).await.status, Status::Done);
     assert_eq!(
-        h.changes()[2].1,
+        h.changes().last().unwrap().1,
         "incassobestand/create?iban=NL91ABNA0417164300&incassoidrekhouder=NL00ZZZ123456780000&uitvoerdatum=02-01-2099"
     );
     assert_eq!(
@@ -1281,8 +2011,13 @@ async fn invoice_extras_ask_always_and_send_what_was_shown() {
         "<Document>pain.008</Document>"
     );
     std::fs::remove_dir_all(&dir).unwrap();
+}
 
-    // Unlinking a file needs no question on an account without approval, and removes only that link.
+#[tokio::test]
+async fn unlinking_printing_and_the_codes() {
+    use crate::approvals::Status;
+    let h = Harness::start(WriteMode::Auto).await;
+    // Unlinking from a mutatie needs no question on an account without approval, and removes only that link.
     let (is_error, text) = h
         .call(
             "archief_ontkoppelen",
@@ -1291,18 +2026,50 @@ async fn invoice_extras_ask_always_and_send_what_was_shown() {
         .await;
     assert!(!is_error && text.contains("\"losgemaakt\":1"), "{text}");
     assert_eq!(
-        h.changes()[3],
+        h.changes()[0],
         (
             "DELETE".to_owned(),
             "folderkoppel/901".to_owned(),
             Value::Null
         )
     );
+    // All links, a bank line and a quote among them, always ask.
+    let proposal = h
+        .waits(
+            "archief_ontkoppelen",
+            json!({"bestand_id": 5, "alles": true}),
+        )
+        .await;
+    assert!(proposal.danger);
+    assert!(proposal.lines.iter().any(|l| l.value == "offerte OF-00007"));
+    assert_eq!(h.decide(proposal.id, true).await.status, Status::Done);
+    let paths: Vec<String> = h.changes().iter().skip(1).map(|c| c.1.clone()).collect();
+    assert_eq!(
+        paths,
+        ["folderkoppel/901", "folderkoppel/902", "folderkoppel/903"]
+    );
 
-    // Reading writes nothing; the codes come without a call to e-Boekhouden.
+    // Printing reads the pdfs and saves them; it changes nothing and asks nothing.
+    let dir = std::env::temp_dir().join(format!("ebmcp-print-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (is_error, text) = h
+        .call(
+            "facturen_afdrukken",
+            json!({"ids": [12, 14, 13], "map": dir.to_str().unwrap()}),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    let value: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["data"]["opgeslagen"].as_array().unwrap().len(), 2);
+    assert_eq!(value["data"]["fouten"][0]["id"], 13);
+    assert!(dir.join("F00012.pdf").exists() && dir.join("F00014.pdf").exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+    let (is_error, text) = h.call("facturen_afdrukken", json!({"ids": [12, 12]})).await;
+    assert!(is_error && text.contains("twee keer"), "{text}");
+
     let (is_error, text) = h.call("emailsjabloon_codes", json!({})).await;
     assert!(!is_error && text.contains("[FACTNUMMER]"), "{text}");
-    assert_eq!(h.changes().len(), 4);
+    assert_eq!(h.changes().len(), 4, "reading changes nothing");
     h.set_write(WriteMode::Off);
     let (is_error, text) = h.call("peppol_versturen", json!({"id": 12})).await;
     assert!(is_error && text.contains("alleen-lezen"), "{text}");

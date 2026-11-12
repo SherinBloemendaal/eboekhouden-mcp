@@ -662,11 +662,11 @@ pub struct FactuurMailenArgs {
     pub id: u64,
     /// E-mailadres van de ontvanger (standaard het factuur- of e-mailadres van de relatie).
     pub aan: Option<String>,
-    /// Id van een e-mailsjabloon (uit emailsjablonen) voor onderwerp, bericht en afzender. e-Boekhouden vult de codes zoals [FACTNUMMER] in.
+    /// Id van een e-mailsjabloon voor facturen (uit emailsjablonen) voor onderwerp, bericht en afzender. EB MCP haalt de tekst op zoals e-Boekhouden hem voor deze factuur invult, en toont precies die.
     pub sjabloon_id: Option<u64>,
-    /// Onderwerp (gaat voor het sjabloon).
+    /// Eigen onderwerp (gaat voor het sjabloon), hoogstens 110 tekens. Gaat zoals het is: zonder codes zoals [FACTNUMMER], schrijf die uit.
     pub onderwerp: Option<String>,
-    /// Bericht als HTML (gaat voor het sjabloon).
+    /// Eigen bericht als HTML (gaat voor het sjabloon). Gaat zoals het is: zonder codes, schrijf die uit.
     pub bericht: Option<String>,
     /// Cc-adres.
     pub cc: Option<String>,
@@ -1799,6 +1799,158 @@ fn known(value: String) -> String {
         "onbekend".to_owned()
     } else {
         value
+    }
+}
+
+/// The first code in square brackets ("[FACTNUMMER]") in a text the caller wrote. Own text goes out as it is: only a
+/// template's text is filled in, by `factuur/maildata` or `offerte/getmaildata`, before it is shown and sent.
+fn own_text_code(text: &str) -> Option<String> {
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        if let Some(close) = after.find(']') {
+            let inner = &after[..close];
+            if inner.len() >= 2
+                && inner
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            {
+                return Some(format!("[{inner}]"));
+            }
+        }
+        rest = after;
+    }
+    None
+}
+
+/// Refuses own subject or message text that holds a code: nobody would fill it in.
+fn own_text_without_codes(onderwerp: Option<&str>, bericht: Option<&str>) -> Result<(), String> {
+    for (label, text) in [("Het onderwerp", onderwerp), ("Het bericht", bericht)] {
+        if let Some(code) = text.and_then(own_text_code) {
+            return Err(format!(
+                "{label} bevat de code {code}. Eigen tekst gaat zoals hij is de deur uit; e-Boekhouden vult daar geen codes in. Schrijf het uit (bijvoorbeeld het factuurnummer zelf), of laat de eigen tekst weg en kies een e-mailsjabloon met sjabloon_id."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One invoice's e-mail, settled before the user is asked and sent exactly so.
+#[derive(Debug, Clone, PartialEq)]
+struct FactuurMail {
+    aan: String,
+    cc: Option<String>,
+    bcc: Option<String>,
+    van_naam: String,
+    van_email: String,
+    onderwerp: String,
+    bericht: String,
+}
+
+/// What the caller gave for an invoice e-mail.
+struct EigenMail<'a> {
+    onderwerp: &'a Option<String>,
+    bericht: &'a Option<String>,
+    cc: &'a Option<String>,
+    bcc: &'a Option<String>,
+}
+
+/// An invoice e-mail as the factuur mail form fills it: the caller's own text first (without codes), else the
+/// template's text as e-Boekhouden fills it for this invoice (`GET factuur/maildata/{sjabloon}/{factuur}`:
+/// subject, body, ccEmail, bccEmail, vanNaam, vanEmail; the form's `getMailData(+i, this.factuurId)` and
+/// `updateFormFromMail`), then the administration's name and the signed-in user.
+fn factuur_mail(
+    eigen: &EigenMail,
+    filled: Option<&Value>,
+    aan: &str,
+    user: &Value,
+    administratie: Option<&str>,
+) -> Result<FactuurMail, String> {
+    let given = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    let field = |value: Option<&Value>, name: &str| {
+        value
+            .and_then(|v| v.get(name))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    own_text_without_codes(
+        given(eigen.onderwerp).as_deref(),
+        given(eigen.bericht).as_deref(),
+    )?;
+    let aan = email(aan, "De ontvanger")?;
+    let cc = given(eigen.cc)
+        .or_else(|| field(filled, "ccEmail"))
+        .map(|v| email(&v, "Het cc-adres"))
+        .transpose()?;
+    let bcc = given(eigen.bcc)
+        .or_else(|| field(filled, "bccEmail"))
+        .map(|v| email(&v, "Het bcc-adres"))
+        .transpose()?;
+    let onderwerp = given(eigen.onderwerp)
+        .or_else(|| field(filled, "subject"))
+        .ok_or("Geef een onderwerp, of een e-mailsjabloon met sjabloon_id")?;
+    if onderwerp.chars().count() > 110 {
+        return Err("Het onderwerp mag hoogstens 110 tekens zijn".into());
+    }
+    let bericht = given(eigen.bericht)
+        .or_else(|| field(filled, "body"))
+        .ok_or("Geef een bericht, of een e-mailsjabloon met sjabloon_id")?;
+    let van_naam = field(filled, "vanNaam")
+        .or_else(|| {
+            administratie
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| field(Some(user), "naam"))
+        .ok_or("De naam van de afzender is niet bekend")?;
+    if van_naam.chars().count() > 50 {
+        return Err("De naam van de afzender mag hoogstens 50 tekens zijn".into());
+    }
+    let van_email = field(filled, "vanEmail")
+        .or_else(|| field(Some(user), "email"))
+        .ok_or("Het e-mailadres van de afzender is niet bekend")?;
+    let van_email = email(&van_email, "Het adres van de afzender")?;
+    Ok(FactuurMail {
+        aan,
+        cc,
+        bcc,
+        van_naam,
+        van_email,
+        onderwerp,
+        bericht,
+    })
+}
+
+/// The body `POST factuur/mail` takes for one invoice (captured from the web form's code).
+fn factuur_mail_body(mail: &FactuurMail, ubl: bool, factuur_id: u64) -> Value {
+    json!({
+        "vanNaam": mail.van_naam, "vanEmail": mail.van_email, "aanEmail": mail.aan, "ccEmail": mail.cc,
+        "bccEmail": mail.bcc, "subject": mail.onderwerp, "body": mail.bericht, "factuurUbl": ubl,
+        "rememberMessage": false, "useEmailSjabloon": false, "bijlagen": [], "factuurId": factuur_id
+    })
+}
+
+/// Whether an invoice e-mail template may be chosen for invoices (`GET emailsjabloonab/forfactuur`).
+fn for_invoices(templates: &Value, id: u64) -> Result<(), String> {
+    let found = templates.as_array().is_some_and(|all| {
+        all.iter()
+            .any(|t| t.get("id").and_then(Value::as_u64) == Some(id))
+    });
+    if found {
+        Ok(())
+    } else {
+        Err(format!(
+            "E-mailsjabloon {id} is niet voor facturen te kiezen; zet het aan voor facturen met emailsjabloon_wijzigen of kies een ander"
+        ))
     }
 }
 
@@ -3397,7 +3549,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een verkoopfactuur per e-mail versturen vanuit e-Boekhouden, met de factuur als pdf in de bijlage. Onderwerp en bericht komen uit een e-mailsjabloon (sjabloon_id) of geef je zelf mee; zonder ontvanger gaat de mail naar het factuur- of e-mailadres van de relatie. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de ontvanger, het onderwerp en het bericht. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een verkoopfactuur per e-mail versturen vanuit e-Boekhouden, met de factuur als pdf in de bijlage. Onderwerp en bericht komen uit een e-mailsjabloon voor facturen (sjabloon_id), zoals e-Boekhouden het voor deze factuur invult, of geef je zelf mee; eigen tekst gaat zoals hij is, dus zonder codes zoals [FACTNUMMER]. Zonder ontvanger gaat de mail naar het factuur- of e-mailadres van de relatie. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de ontvanger, het onderwerp en het bericht. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Factuur mailen",
             read_only_hint = false,
@@ -3417,20 +3569,16 @@ impl EbMcp {
             let factuur = this.fetch(&run, &format!("factuur/{}", args.id), Vec::new()).await?;
             let nummer = factuur.get("nummer").and_then(Value::as_str).unwrap_or_default().to_owned();
             let relatie_id = factuur.get("relatieId").and_then(Value::as_u64).unwrap_or(0);
-            let sjabloon = match args.sjabloon_id {
-                Some(id) => Some(this.fetch(&run, &format!("EmailSjabloonAb/{id}"), Vec::new()).await?),
+            let given = |value: &Option<String>| value.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+            own_text_without_codes(given(&args.onderwerp).as_deref(), given(&args.bericht).as_deref())?;
+            // A template's text as e-Boekhouden fills it for this invoice: that is what is shown and sent.
+            let filled = match args.sjabloon_id {
+                Some(id) => {
+                    for_invoices(&this.fetch(&run, "emailsjabloonab/forfactuur", Vec::new()).await?, id)?;
+                    Some(this.fetch(&run, &format!("factuur/maildata/{id}/{}", args.id), Vec::new()).await?)
+                }
                 None => None,
             };
-            let from_sjabloon = |name: &str| {
-                sjabloon
-                    .as_ref()
-                    .and_then(|s| s.get(name))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_owned)
-            };
-            let given = |value: &Option<String>| value.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
             let aan = match given(&args.aan) {
                 Some(aan) => aan,
                 None => {
@@ -3441,32 +3589,13 @@ impl EbMcp {
                         .ok_or_else(|| Halt::Error("De relatie van deze factuur heeft geen e-mailadres; geef de ontvanger op met aan".into()))?
                 }
             };
-            let aan = email(&aan, "De ontvanger")?;
-            let cc = given(&args.cc).or_else(|| from_sjabloon("cc")).map(|v| email(&v, "Het cc-adres")).transpose()?;
-            let bcc = given(&args.bcc).or_else(|| from_sjabloon("bcc")).map(|v| email(&v, "Het bcc-adres")).transpose()?;
-            let subject = given(&args.onderwerp)
-                .or_else(|| from_sjabloon("subject"))
-                .ok_or_else(|| Halt::Error("Geef een onderwerp, of een e-mailsjabloon met sjabloon_id".into()))?;
-            let body = given(&args.bericht)
-                .or_else(|| from_sjabloon("body"))
-                .ok_or_else(|| Halt::Error("Geef een bericht, of een e-mailsjabloon met sjabloon_id".into()))?;
             let user = this.fetch(&run, "user", Vec::new()).await?;
-            let user_field = |name: &str| user.get(name).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
-            let van_naam = from_sjabloon("vanNaam")
-                .or_else(|| run.account.administration.clone())
-                .or_else(|| user_field("naam"))
-                .ok_or_else(|| Halt::Error("De naam van de afzender is niet bekend".into()))?;
-            let van_email = from_sjabloon("vanEmail")
-                .or_else(|| user_field("email"))
-                .ok_or_else(|| Halt::Error("Het e-mailadres van de afzender is niet bekend".into()))?;
-            let van_email = email(&van_email, "Het adres van de afzender")?;
+            let eigen = EigenMail { onderwerp: &args.onderwerp, bericht: &args.bericht, cc: &args.cc, bcc: &args.bcc };
+            let mail = factuur_mail(&eigen, filled.as_ref(), &aan, &user, run.account.administration.as_deref())?;
+            let FactuurMail { aan, cc, bcc, van_naam, van_email, onderwerp: subject, bericht: body } = mail.clone();
             let ubl = args.ubl.unwrap_or(false);
             let built = Built {
-                body: json!({
-                    "vanNaam": van_naam, "vanEmail": van_email, "aanEmail": aan, "ccEmail": cc, "bccEmail": bcc,
-                    "subject": subject, "body": body, "factuurUbl": ubl, "rememberMessage": false,
-                    "useEmailSjabloon": false, "bijlagen": [], "factuurId": args.id
-                }),
+                body: factuur_mail_body(&mail, ubl, args.id),
                 title: format!("Factuur {nummer} mailen naar {aan}"),
                 lines: [
                     Some(line("Aan", &aan)),
