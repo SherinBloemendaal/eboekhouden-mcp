@@ -244,8 +244,37 @@ impl EbMcp {
             )
             .await?;
         let btw = self.fetch(run, "btwinfo/info/VERK", Vec::new()).await?;
-        let btwplichtig = self.fetch(run, "btwinfo/btwplichtig", Vec::new()).await?;
-        Ok(Verkoop::from_api(&rekeningen, &btw, &btwplichtig, today()))
+        let niet_btw_plichtig = self
+            .uren_setting(run, "administratie.niet-btw-plichtig")
+            .await?;
+        Verkoop::from_api(&rekeningen, &btw, &niet_btw_plichtig, today())
+    }
+
+    /// A setting of the administration, read as the forms read it (`getSetting(key)`: `GET setting/{key}?acc=false`).
+    async fn uren_setting(&self, run: &Run, key: &str) -> Result<Value, String> {
+        self.fetch(
+            run,
+            &format!("setting/{key}"),
+            vec![("acc".into(), "false".into())],
+        )
+        .await
+    }
+
+    /// The hour invoice settings: whether they exist (`factuursetting/exists`) and, only when they do, the
+    /// settings themselves (`factuursetting`); `Null` when there are none yet.
+    async fn uren_instellingen(&self, run: &Run) -> Result<(bool, Value), String> {
+        let bestaat = match self.fetch(run, "factuursetting/exists", Vec::new()).await? {
+            Value::Bool(bestaat) => bestaat,
+            _ => {
+                return Err(
+                    "e-Boekhouden zei in een onbekende vorm of er factuurinstellingen zijn".into(),
+                );
+            }
+        };
+        if !bestaat {
+            return Ok((false, Value::Null));
+        }
+        Ok((true, self.fetch(run, "factuursetting", Vec::new()).await?))
     }
 
     /// Every row of the invoicing list for these filters, up to `MAX_PAGINAS` pages.
@@ -273,6 +302,9 @@ impl EbMcp {
 
     /// The relatie of every project the rows name: from `project/rel` (the list the invoicing screen reads), and
     /// for a project that list leaves out (an inactive one) from the project and its relatie themselves.
+    /// `byUser=false`: the screen sends `byUser` true only for a user who is neither accountant nor main user,
+    /// which it knows from its login (`isAccountant`, `user.isSuper`), not from an API EB MCP reads. A project
+    /// the list would not give for that user is still looked up on its own, so nothing depends on it.
     async fn uren_project_relaties(
         &self,
         run: &Run,
@@ -369,7 +401,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Overzicht van de uren per project over een periode (standaard dit jaar tot vandaag), in aantal uren of in euro's, eventueel uitgesplitst naar één activiteit. Het overzicht Uren per project van e-Boekhouden.",
+        description = "Overzicht van de uren per project over een periode (standaard dit jaar tot vandaag), in aantal uren of in euro's, eventueel alleen voor één activiteit. Het overzicht Uren per project van e-Boekhouden.",
         annotations(title = "Uren per project", read_only_hint = true)
     )]
     async fn uren_per_project(
@@ -402,7 +434,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Overzicht van de uren per activiteit over een periode (standaard dit jaar tot vandaag), in aantal uren of in euro's, eventueel uitgesplitst naar één project. Het overzicht Uren per activiteit van e-Boekhouden.",
+        description = "Overzicht van de uren per activiteit over een periode (standaard dit jaar tot vandaag), in aantal uren of in euro's, eventueel alleen voor één project. Het overzicht Uren per activiteit van e-Boekhouden.",
         annotations(title = "Uren per activiteit", read_only_hint = true)
     )]
     async fn uren_per_activiteit(
@@ -435,7 +467,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Overzicht van de uren van één kalenderjaar per gebruiker en per maand (jan tot en met dec), in aantal uren of in euro's, eventueel voor één project of activiteit. Het overzicht Uren per jaar van e-Boekhouden.",
+        description = "Overzicht van de uren van één kalenderjaar per gebruiker en per maand (jan tot en met dec), in aantal uren of in euro's, eventueel alleen voor één project of één activiteit. Het overzicht Uren per jaar van e-Boekhouden.",
         annotations(title = "Uren per jaar", read_only_hint = true)
     )]
     async fn uren_per_jaar(
@@ -600,7 +632,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "De lijst van Uren > Factureren: urenregels met datum, facturabel, medewerker, project, activiteit, uren, uurtarief, kilometers, km-tarief, factuur en opmerkingen. Standaard de nog niet gefactureerde uren van deze maand. per_relatie zegt per relatie welke factuur uren_factureren voor deze regels zou maken: de ids, het aantal factuurregels (één per project en activiteit), de uren, de kilometers en het bedrag volgens tarief (zonder btw). Er verandert niets.",
+        description = "De lijst van Uren > Factureren: urenregels met datum, facturabel, medewerker, project, activiteit, uren, uurtarief, kilometers, km-tarief, factuur en opmerkingen. Standaard de nog niet gefactureerde uren van deze maand. per_relatie zegt per relatie welke factuur er van de gelezen regels (deze pagina, volgens limit en offset) zou komen: de ids, het aantal factuurregels (één per project en activiteit), de uren, de kilometers en het bedrag volgens tarief (zonder btw). Let op: uren_factureren zonder uur_ids factureert alle regels die aan de filters voldoen, ook die op andere pagina's. Er verandert niets.",
         annotations(title = "Uren te factureren", read_only_hint = true)
     )]
     async fn uren_te_factureren(
@@ -672,10 +704,7 @@ impl EbMcp {
             Err(answer) => return Ok(answer),
         };
         let result = async {
-            let bestaat = self
-                .fetch(&run, "factuursetting/exists", Vec::new())
-                .await?;
-            let instellingen = self.fetch(&run, "factuursetting", Vec::new()).await?;
+            let (bestaat, instellingen) = self.uren_instellingen(&run).await?;
             let eenheden = self.fetch(&run, "eenheid", Vec::new()).await?;
             let sjablonen = self
                 .fetch(&run, "factuursjabloon/active", Vec::new())
@@ -1096,17 +1125,40 @@ impl EbMcp {
                         &format!("Activiteit {}", args.id),
                     )
                     .await?;
-                // The form reads the kostenplaats apart and sends it back with the change; so does this.
-                let kostenplaats = this
-                    .fetch(
-                        &run,
-                        &format!("kostenplaats/GetByActiviteitId/{}", args.id),
-                        Vec::new(),
-                    )
-                    .await?
-                    .get("id")
-                    .and_then(Value::as_u64)
-                    .filter(|id| *id != 0);
+                // The form reads the kostenplaats apart and sends it back with the change, but only when the
+                // administration works with kostenplaatsen (`this.showKostenplaatsen && (t.kostenplaatsId = ...)`).
+                let met_kostenplaatsen = setting_waarde(
+                    &this
+                        .uren_setting(&run, "administratie.use-kostenplaatsen")
+                        .await?,
+                    "kostenplaatsen gebruiken",
+                )?
+                .is_some_and(|v| v == "true");
+                let kostenplaats = if met_kostenplaatsen {
+                    let gevonden = this
+                        .fetch(
+                            &run,
+                            &format!("kostenplaats/GetByActiviteitId/{}", args.id),
+                            Vec::new(),
+                        )
+                        .await
+                        .map_err(|_| {
+                            Halt::Error(
+                                "De kostenplaats van deze activiteit is niet te lezen, dus EB MCP kan hem niet bewaren; er is niets gewijzigd.".into(),
+                            )
+                        })?;
+                    if !gevonden.is_null() && !gevonden.is_object() {
+                        return Err(Halt::Error(
+                            "e-Boekhouden gaf de kostenplaats van deze activiteit in een onbekende vorm terug; er is niets gewijzigd.".into(),
+                        ));
+                    }
+                    gevonden
+                        .get("id")
+                        .and_then(Value::as_u64)
+                        .filter(|id| *id != 0)
+                } else {
+                    None
+                };
                 let verkoop = this.uren_verkoop(&run).await?;
                 let built = activiteit_gewijzigd(&args, &now, kostenplaats, &verkoop)?;
                 this.approve(&run, TOOL, &built, false).await?;
@@ -1185,7 +1237,7 @@ impl EbMcp {
     // ------------------------------------------------------------ invoicing hours
 
     #[tool(
-        description = "Facturen maken van uren, zoals Uren > Factureren in e-Boekhouden: voor de nog niet gefactureerde uren van de periode en filters (standaard deze maand), of alleen de urenregels in uur_ids, maakt e-Boekhouden per relatie één factuur, met een factuurregel per project en activiteit. Bekijk eerst met uren_te_factureren wat er gefactureerd wordt. De factuurinstellingen (uren_factuurinstellingen) bepalen het sjabloon en of de facturen meteen verwerkt, voor post of e-mail klaargezet of geïncasseerd worden. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet per relatie wat er gefactureerd wordt. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Facturen maken van uren, zoals Uren > Factureren in e-Boekhouden: voor de nog niet gefactureerde uren van de periode en filters (standaard deze maand), of alleen de urenregels in uur_ids, maakt e-Boekhouden per relatie één factuur, met een factuurregel per project en activiteit. Bekijk eerst met uren_te_factureren wat er gefactureerd wordt. De factuurinstellingen (uren_factuurinstellingen) bepalen het sjabloon en of de facturen meteen verwerkt, voor post of e-mail klaargezet of geïncasseerd worden. Na het akkoord leest EB MCP de uren opnieuw; zijn ze intussen gewijzigd of gefactureerd, dan gebeurt er niets. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet per relatie wat er gefactureerd wordt. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Uren factureren",
             read_only_hint = false,
@@ -1216,8 +1268,8 @@ impl EbMcp {
                     ZoekenIn::NogNietGefactureerd,
                     args.ook_niet_facturabel.unwrap_or(false),
                 )?;
-                let bestaat = this.fetch(&run, "factuursetting/exists", Vec::new()).await?;
-                if bestaat != Value::Bool(true) {
+                let (bestaat, instellingen) = this.uren_instellingen(&run).await?;
+                if !bestaat {
                     return Err(Halt::Error(
                         "Je hebt nog geen factuurinstellingen voor uren ingesteld. Stel ze eerst in met uren_factuurinstellingen_wijzigen.".into(),
                     ));
@@ -1225,7 +1277,6 @@ impl EbMcp {
                 let rows = this.uren_alle_rijen(&run, &filters).await?;
                 let rows = kies_rijen(rows, args.uur_ids.as_deref())?;
                 let projecten = this.uren_project_relaties(&run, &rows).await?;
-                let instellingen = this.fetch(&run, "factuursetting", Vec::new()).await?;
                 let sjabloon = match instellingen.get("factuurSjabloonId").and_then(Value::as_u64) {
                     Some(id) => this
                         .fetch(&run, &format!("factuursjabloon/{id}"), Vec::new())
@@ -1237,6 +1288,9 @@ impl EbMcp {
                 };
                 let built = factureren::uren_factureren(&rows, &projecten, &instellingen, &sjabloon)?;
                 this.approve(&run, TOOL, &built, true).await?;
+                // The approval can wait for hours: the hours go out only as the user saw them.
+                let nu = this.uren_alle_rijen(&run, &filters).await?;
+                nog_zoals_goedgekeurd(&rows, &nu)?;
                 this.change(&run, "POST", "uur/factureren", Some(&built.body))
                     .await
             },
@@ -1245,7 +1299,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Urenregels op een bestaande factuur zetten, zoals Factureren > Toevoegen aan bestaande factuur in e-Boekhouden: de uren komen als regels op die factuur. Geef het factuurnummer en de ids van de urenregels (uit uren_te_factureren). Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Urenregels op een bestaande factuur zetten, zoals Factureren > Toevoegen aan bestaande factuur in e-Boekhouden: de uren komen als regels op die factuur. Geef het factuurnummer en de ids van de urenregels (uit uren_te_factureren). De uren moeten nog niet gefactureerd zijn en bij een project van de relatie van die factuur horen. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Uren bij factuur",
             read_only_hint = false,
@@ -1320,7 +1374,56 @@ impl EbMcp {
                     )
                     .await
                     .unwrap_or_default();
-                let built = factureren::uren_bij_factuur(&factuur, &uren, &namen)?;
+                // The invoice's relatie, and the hours that are not invoiced yet over the days of these hours
+                // (facturabel or not), read as uren_factureren reads them.
+                let factuur_id = factuur
+                    .get("factuurId")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let factuur_relatie = this
+                    .uren_record(
+                        &run,
+                        &format!("factuur/{factuur_id}"),
+                        &format!("Factuur {nummer}"),
+                    )
+                    .await?
+                    .get("relatieId")
+                    .and_then(Value::as_u64)
+                    .filter(|r| *r != 0)
+                    .ok_or_else(|| Halt::Error(format!("Factuur {nummer} heeft geen relatie")))?;
+                let mut dagen = Vec::new();
+                for (id, uur) in &uren {
+                    let dag = uur.get("datum").and_then(datum_of).ok_or_else(|| {
+                        Halt::Error(format!(
+                            "e-Boekhouden gaf urenregel {id} zonder datum terug"
+                        ))
+                    })?;
+                    dagen.push(dag);
+                }
+                let (van, tot) = (
+                    dagen.iter().min().copied().unwrap_or_else(today),
+                    dagen.iter().max().copied().unwrap_or_else(today),
+                );
+                let filters = factureren_filters(
+                    Some(&dashed(van)),
+                    Some(&dashed(tot)),
+                    None,
+                    None,
+                    None,
+                    ZoekenIn::NogNietGefactureerd,
+                    true,
+                )?;
+                let lijst = this.uren_alle_rijen(&run, &filters).await?;
+                let records: Vec<Value> = uren.iter().map(|(_, u)| u.clone()).collect();
+                let projecten = this.uren_project_relaties(&run, &records).await?;
+                let built = factureren::uren_bij_factuur(
+                    &factuur,
+                    factuur_relatie,
+                    &uren,
+                    &lijst,
+                    &projecten,
+                    &namen,
+                )?;
                 this.approve(&run, TOOL, &built, true).await?;
                 this.change_done(&run, "POST", "uur/bestaand/factureren", Some(&built.body))
                     .await
@@ -1352,7 +1455,7 @@ impl EbMcp {
             args,
             "Factuurinstellingen gewijzigd",
             move |this, run, args| async move {
-                let now = this.fetch(&run, "factuursetting", Vec::new()).await?;
+                let (_, now) = this.uren_instellingen(&run).await?;
                 let (eenheden, sjablonen) = this.uren_instelling_keuzes(&run).await?;
                 let built = instellingen_gewijzigd(&args, &now, &eenheden, &sjablonen)?;
                 this.approve(&run, TOOL, &built, true).await?;

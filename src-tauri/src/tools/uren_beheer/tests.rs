@@ -246,6 +246,21 @@ fn refuses_a_change_of_an_hour_line_that_changes_nothing_or_empties_it() {
             .unwrap_err()
             .contains("niets gewijzigd")
     );
+    // 0 empties the field: it is left out of what is sent, as an empty field in the form.
+    let mut km_leeg = wijzig_uur(7);
+    km_leeg.kilometers = Some(0.0);
+    km_leeg.opmerkingen = Some("Anders".into());
+    let built = uur_gewijzigd(&km_leeg, &uur_nu(), &namen()).unwrap();
+    assert!(
+        built.body.get("aantalKilometers").is_none(),
+        "{}",
+        built.body
+    );
+    let mut alleen_km = uur_args();
+    alleen_km.uren = Some(0.0);
+    alleen_km.kilometers = Some(5.0);
+    let built = uur_nieuw(&alleen_km, &namen()).unwrap();
+    assert!(built.body.get("aantalUren").is_none(), "{}", built.body);
     let mut empty = wijzig_uur(7);
     empty.uren = Some(0.0);
     assert!(
@@ -398,7 +413,26 @@ fn a_changed_project_keeps_its_users_and_shows_old_and_new() {
         .unwrap_err()
         .contains("onbekende vorm")
     );
-    assert_eq!(gebruiker_ids(Some(&json!([{"id": 3}, 4, "x"]))), vec![3, 4]);
+    assert_eq!(
+        gebruiker_ids(Some(&json!([{"id": 3}, 4]))).unwrap(),
+        vec![3, 4]
+    );
+    // An entry that is no id, or no list at all, is refused: it must never take users off the project.
+    assert!(
+        gebruiker_ids(Some(&json!([{"id": 3}, 4, "x"])))
+            .unwrap_err()
+            .contains("onbekende vorm")
+    );
+    assert!(gebruiker_ids(None).is_err());
+    let mut vreemd = project_nu();
+    vreemd["users"] = json!([{"naam": "Lisa"}]);
+    let mut args = wijzig_project();
+    args.naam = Some("Nieuw".into());
+    assert!(
+        project_gewijzigd(&args, &vreemd, &relaties, &gebruikers())
+            .unwrap_err()
+            .contains("onbekende vorm")
+    );
 }
 
 // ---------------------------------------------------------------- activiteiten
@@ -413,9 +447,10 @@ fn verkoop() -> Verkoop {
             {"code": "NIEUW_VERK", "omschrijving": "Nog niet", "begindatum": {"day": 1, "month": 1, "year": 2099}},
             {"code": "AFW_VERK", "omschrijving": "Afwijkend"}
         ]),
-        &json!(true),
+        &json!({"key": "administratie.niet-btw-plichtig", "value": "false"}),
         (2026, 11, 12),
     )
+    .unwrap()
 }
 
 fn activiteit_args() -> ActiviteitToevoegenArgs {
@@ -440,8 +475,29 @@ fn offers_only_the_sales_codes_valid_today_as_the_form_does() {
     assert_eq!(codes, ["HOOG_VERK_21", "LAAG_VERK_9"]);
     assert!(v.btwplichtig);
     assert_eq!(v.rekeningen.len(), 2);
-    let geen = Verkoop::from_api(&json!(null), &json!(null), &json!(false), (2026, 1, 1));
+    let geen = Verkoop::from_api(
+        &json!(null),
+        &json!(null),
+        &json!({"value": "True"}),
+        (2026, 1, 1),
+    )
+    .unwrap();
     assert!(!geen.btwplichtig && geen.btw.is_empty() && geen.rekeningen.is_empty());
+    // Never set: btw-plichtig, as the form reads it. An answer of another shape is refused, not guessed.
+    let nooit = Verkoop::from_api(&json!([]), &json!([]), &json!(null), (2026, 1, 1)).unwrap();
+    assert!(nooit.btwplichtig);
+    for vreemd in [json!(true), json!({"value": null}), json!("false")] {
+        assert!(
+            Verkoop::from_api(&json!([]), &json!([]), &vreemd, (2026, 1, 1))
+                .unwrap_err()
+                .contains("onbekende vorm"),
+            "{vreemd}"
+        );
+    }
+    assert_eq!(
+        setting_waarde(&json!({"value": "true"}), "x").unwrap(),
+        Some("true".to_owned())
+    );
 }
 
 #[test]
@@ -797,16 +853,107 @@ fn puts_hours_on_the_invoice_its_number_names() {
             .unwrap_err()
             .contains("Geen bestaande factuur")
     );
-    let built = uren_bij_factuur(&factuur, &[(7, uur_nu())], &namen()).unwrap();
+    let lijst = vec![rij(7, Some(10), "Website", "Ontwerp", 2.0)];
+    let built = uren_bij_factuur(
+        &factuur,
+        5,
+        &[(7, uur_nu())],
+        &lijst,
+        &projecten_rel(),
+        &namen(),
+    )
+    .unwrap();
     assert_eq!(built.body, json!({"uren": [7], "factuurId": 555}));
     assert_eq!(built.title, "Uren op factuur F00012 zetten");
     assert_eq!(find(&built, "Relatie"), "Bakkerij Jansen");
+    assert_eq!(find(&built, "Relatie van de uren"), "Bakkerij Jansen");
     assert_eq!(find(&built, "Factuurdatum"), "01-11-2026");
     assert_eq!(
         find(&built, "Urenregel 7"),
         "10-11-2026, Website, Ontwerp: 2 uur, 0 km"
     );
-    assert!(uren_bij_factuur(&factuur, &[], &namen()).is_err());
+    assert!(uren_bij_factuur(&factuur, 5, &[], &lijst, &projecten_rel(), &namen()).is_err());
+    // An hour that is not on the list of hours not invoiced yet: already invoiced, or unknown.
+    let err = uren_bij_factuur(
+        &factuur,
+        5,
+        &[(7, uur_nu())],
+        &[],
+        &projecten_rel(),
+        &namen(),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("al gefactureerd of onbekend") && err.ends_with(": 7"),
+        "{err}"
+    );
+    // An hour of another relatie than the invoice's.
+    let err = uren_bij_factuur(
+        &factuur,
+        6,
+        &[(7, uur_nu())],
+        &lijst,
+        &projecten_rel(),
+        &namen(),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("Bakkerij Jansen") && err.contains("F00012"),
+        "{err}"
+    );
+    // An hour without a project with a relatie.
+    let mut zonder = uur_nu();
+    zonder["projectId"] = json!(13);
+    assert!(
+        uren_bij_factuur(
+            &factuur,
+            5,
+            &[(7, zonder)],
+            &lijst,
+            &projecten_rel(),
+            &namen()
+        )
+        .unwrap_err()
+        .contains("geen project met een relatie")
+    );
+}
+
+#[test]
+fn invoicing_refuses_rows_without_an_id_and_rows_changed_after_the_approval() {
+    let mut zonder_id = rij(1, Some(10), "Website", "Ontwerp", 2.0);
+    zonder_id.as_object_mut().unwrap().remove("id");
+    let err = uren_factureren(
+        &[rij(2, Some(10), "Website", "Ontwerp", 1.0), zonder_id],
+        &projecten_rel(),
+        &instellingen_nu(),
+        "Standaard",
+    )
+    .unwrap_err();
+    assert!(err.contains("zonder id"), "{err}");
+
+    let goedgekeurd = vec![
+        rij(1, Some(10), "Website", "Ontwerp", 2.0),
+        rij(2, Some(12), "Logo", "Advies", 1.0),
+    ];
+    let mut nu = goedgekeurd.clone();
+    nu.push(rij(3, Some(10), "Website", "Ontwerp", 5.0));
+    assert!(
+        nog_zoals_goedgekeurd(&goedgekeurd, &nu).is_ok(),
+        "a new row does not matter"
+    );
+    let mut ander_tarief = goedgekeurd.clone();
+    ander_tarief[1]["uurtarief"] = json!(90);
+    let mut weg = goedgekeurd.clone();
+    weg.remove(0);
+    let mut meer_uren = goedgekeurd.clone();
+    meer_uren[0]["aantalUren"] = json!(3);
+    for nu in [ander_tarief, weg, meer_uren] {
+        assert!(
+            nog_zoals_goedgekeurd(&goedgekeurd, &nu)
+                .unwrap_err()
+                .contains("intussen gewijzigd")
+        );
+    }
 }
 
 // ---------------------------------------------------------------- end to end
@@ -830,7 +977,21 @@ fn read_answer(path: &str) -> Option<Value> {
         "user/selectlist" => json!([{"id": 3, "naam": "Lisa"}, {"id": 4, "naam": "Piet"}]),
         "grootboekrekening/search" => json!([{"id": 800, "code": "8000", "omschrijving": "Omzet"}]),
         "btwinfo/info/VERK" => json!([{"code": "HOOG_VERK_21", "omschrijving": "Btw hoog 21%"}]),
-        "btwinfo/btwplichtig" => json!(true),
+        "setting/administratie.niet-btw-plichtig" => {
+            json!({"key": "administratie.niet-btw-plichtig", "value": "false"})
+        }
+        "setting/administratie.use-kostenplaatsen" => {
+            json!({"key": "administratie.use-kostenplaatsen", "value": "false"})
+        }
+        "uur/8" => {
+            json!({"id": 8, "gebruikerId": 3, "datum": "2026-11-10T00:00:00", "projectId": 10, "activiteitId": 20, "aantalUren": 1})
+        }
+        "project/13" => {
+            json!({"project": {"id": 13, "naam": "Logo", "relatieId": 6, "actief": false}, "users": [3]})
+        }
+        "relatie/6" => json!({"id": 6, "bedrijf": "Slagerij Smit"}),
+        "factuur/555" => json!({"id": 555, "nummer": "F00012", "relatieId": 5}),
+        "factuur/556" => json!({"id": 556, "nummer": "F00013", "relatieId": 6}),
         "kostenplaats/GetByActiviteitId/20" => json!(null),
         "factuursetting/exists" => json!(true),
         "factuursetting" => instellingen_nu(),
@@ -847,19 +1008,36 @@ fn read_answer(path: &str) -> Option<Value> {
             json!([{"id": 10, "naam": "Website", "relatieId": 5, "relatieBedrijf": "Bakkerij Jansen"}])
         }
         "factuur/searchexisting" => json!([
-            {"factuurId": 555, "factuurNummer": "F00012", "relatieBedrijf": "Bakkerij Jansen", "factuurDatum": "2026-11-01T00:00:00"}
+            {"factuurId": 555, "factuurNummer": "F00012", "relatieBedrijf": "Bakkerij Jansen", "factuurDatum": "2026-11-01T00:00:00"},
+            {"factuurId": 556, "factuurNummer": "F00013", "relatieBedrijf": "Slagerij Smit", "factuurDatum": "2026-11-02T00:00:00"}
         ]),
         _ => return None,
     })
 }
 
-/// A stand-in for e-Boekhouden's API: it answers the reads above, and keeps every change it gets.
-async fn eboekhouden(seen: Seen, reads: Arc<Mutex<Vec<String>>>) -> String {
+/// Answers a scenario puts in place of `read_answer`'s, by path: `None` makes the stand-in fail (500).
+type Overrides = Arc<Mutex<HashMap<String, Option<Value>>>>;
+
+/// The invoicing list with these rows: (id, project id, project, aantalUren, uurtarief).
+fn factureren_lijst(rows: &[(u64, u64, &str, f64, f64)]) -> Value {
+    json!({
+        "colMetadata": [{"name": "id"}, {"name": "datum"}, {"name": "facturabel"}, {"name": "medewerker"}, {"name": "project"},
+                        {"name": "projectId"}, {"name": "activiteit"}, {"name": "aantalUren"}, {"name": "uurtarief"},
+                        {"name": "aantalKilometers"}, {"name": "kilometertarief"}, {"name": "factuur"}, {"name": "opmerkingen"}],
+        "data": rows.iter().map(|(id, project_id, project, uren, tarief)| json!(
+            [id, "2026-11-10T00:00:00", true, "Lisa", project, project_id, "Ontwerp", uren, tarief, null, null, null, ""]
+        )).collect::<Vec<_>>()
+    })
+}
+
+/// A stand-in for e-Boekhouden's API: it answers the reads above (or a scenario's own), and keeps every change it
+/// gets.
+async fn eboekhouden(seen: Seen, reads: Arc<Mutex<Vec<String>>>, overrides: Overrides) -> String {
     use axum::http::{Method, StatusCode, Uri};
     use axum::response::IntoResponse;
     let app =
         axum::Router::new().fallback(move |method: Method, uri: Uri, body: axum::body::Bytes| {
-            let (seen, reads) = (seen.clone(), reads.clone());
+            let (seen, reads, overrides) = (seen.clone(), reads.clone(), overrides.clone());
             async move {
                 let path = uri.path().trim_start_matches("/v1/api/").to_owned();
                 if method == Method::GET {
@@ -867,6 +1045,13 @@ async fn eboekhouden(seen: Seen, reads: Arc<Mutex<Vec<String>>>) -> String {
                         .lock()
                         .unwrap()
                         .push(format!("{path}?{}", uri.query().unwrap_or_default()));
+                    let own = overrides.lock().unwrap().get(&path).cloned();
+                    if let Some(own) = own {
+                        return match own {
+                            Some(answer) => axum::Json(answer).into_response(),
+                            None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                        };
+                    }
                     return match read_answer(&path) {
                         Some(answer) => axum::Json(answer).into_response(),
                         None => StatusCode::NOT_FOUND.into_response(),
@@ -940,6 +1125,7 @@ struct Harness {
     state: Arc<AppState>,
     seen: Seen,
     reads: Arc<Mutex<Vec<String>>>,
+    overrides: Overrides,
     account: uuid::Uuid,
     http: reqwest::Client,
     url: String,
@@ -962,10 +1148,11 @@ impl Harness {
     async fn new(mode: WriteMode) -> Self {
         let seen: Seen = Arc::default();
         let reads: Arc<Mutex<Vec<String>>> = Arc::default();
+        let overrides: Overrides = Arc::default();
         let jar = Arc::new(crate::state::testing::FakeJar::default());
         let state = Arc::new(crate::state::testing::state_with(
             jar,
-            &eboekhouden(seen.clone(), reads.clone()).await,
+            &eboekhouden(seen.clone(), reads.clone(), overrides.clone()).await,
         ));
         let account = state.accounts.add(account_input(mode)).unwrap();
         state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
@@ -981,6 +1168,7 @@ impl Harness {
             state,
             seen,
             reads,
+            overrides,
             account: account.id,
             http: reqwest::Client::new(),
             url: format!("http://127.0.0.1:{port}{}", crate::mcp::PATH),
@@ -1019,6 +1207,22 @@ impl Harness {
             .post(json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": name, "arguments": arguments}}))
             .await;
         answer_of(&response.text().await.unwrap())
+    }
+
+    /// Answers `path` with `answer` from now on; `None` makes it fail.
+    fn answer(&self, path: &str, answer: Option<Value>) {
+        self.overrides
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), answer);
+    }
+
+    fn read(&self, path: &str) -> bool {
+        self.reads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.starts_with(&format!("{path}?")))
     }
 
     fn sent(&self) -> Vec<(String, String, Value)> {
@@ -1209,7 +1413,7 @@ async fn bad_input_is_refused_before_anything_is_asked_or_sent() {
             json!({"datum": "2026-11-11", "project_id": 12, "activiteit_id": 20, "uren": 1}),
             "niet actief",
         ),
-        ("uur_wijzigen", json!({"id": 8, "uren": 1}), "bestaat niet"),
+        ("uur_wijzigen", json!({"id": 6, "uren": 1}), "bestaat niet"),
         (
             "activiteit_toevoegen",
             json!({"naam": "Advies", "uurtarief": 95, "facturabel": true}),
@@ -1224,6 +1428,16 @@ async fn bad_input_is_refused_before_anything_is_asked_or_sent() {
             "uren_bij_factuur",
             json!({"factuurnummer": "F99999", "uur_ids": [7]}),
             "Geen bestaande factuur",
+        ),
+        (
+            "uren_bij_factuur",
+            json!({"factuurnummer": "F00012", "uur_ids": [8]}),
+            "al gefactureerd of onbekend",
+        ),
+        (
+            "uren_bij_factuur",
+            json!({"factuurnummer": "F00013", "uur_ids": [7]}),
+            "niet bij de relatie van factuur F00013",
         ),
         (
             "uren_factuurinstellingen_wijzigen",
@@ -1292,4 +1506,219 @@ async fn the_invoicing_list_shows_per_relatie_what_would_be_invoiced() {
     let (is_error, text) = h.call("uur", json!({"id": 7})).await;
     assert!(!is_error && text.contains("Overleg"), "{text}");
     assert!(h.sent().is_empty());
+}
+
+#[tokio::test]
+async fn invoicing_several_relaties_makes_one_invoice_each_and_finds_inactive_projects() {
+    use crate::approvals::Status;
+    let h = Harness::new(WriteMode::Ask).await;
+    // Project 13 is inactive, so project/rel leaves it out: its relatie comes from the project itself.
+    h.answer(
+        "uur/factureren/gridtable",
+        Some(factureren_lijst(&[
+            (7, 10, "Website", 2.0, 80.0),
+            (9, 13, "Logo", 1.0, 100.0),
+        ])),
+    );
+    let (is_error, text) = h
+        .call(
+            "uren_te_factureren",
+            json!({"van": "2026-11-01", "tot": "2026-11-30"}),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    let groepen = answer["data"]["per_relatie"].as_array().unwrap();
+    assert_eq!(groepen.len(), 2, "{groepen:?}");
+    assert_eq!(groepen[1]["relatie"], "Slagerij Smit");
+    assert_eq!(groepen[1]["bedragVolgensTarief"], 100.0);
+    assert!(h.read("project/13") && h.read("relatie/6"));
+
+    let (_, text) = h
+        .call(
+            "uren_factureren",
+            json!({"van": "2026-11-01", "tot": "2026-11-30"}),
+        )
+        .await;
+    let id = waiting_id(&text);
+    let proposal = h.state.approvals.list().remove(0);
+    assert_eq!(proposal.title, "Uren factureren: 2 facturen");
+    let line = |label: &str| {
+        proposal
+            .lines
+            .iter()
+            .find(|l| l.label == label)
+            .map(|l| l.value.clone())
+            .unwrap_or_else(|| panic!("no {label} in {:?}", proposal.lines))
+    };
+    assert!(line("Aan Bakkerij Jansen").contains("160,00"));
+    assert!(line("Aan Slagerij Smit").contains("100,00"));
+    assert_eq!(line("Totaal volgens tarief"), "260,00");
+    assert!(h.state.approvals.decide(id, true, 1));
+    assert_eq!(settled(&h.state, id).await.status, Status::Done);
+    assert_eq!(
+        h.sent(),
+        vec![(
+            "POST".to_owned(),
+            "uur/factureren".to_owned(),
+            json!([7, 9])
+        )]
+    );
+}
+
+#[tokio::test]
+async fn hours_changed_while_the_approval_waits_are_not_invoiced() {
+    use crate::approvals::Status;
+    let h = Harness::new(WriteMode::Ask).await;
+    let (_, text) = h
+        .call(
+            "uren_factureren",
+            json!({"van": "2026-11-01", "tot": "2026-11-30"}),
+        )
+        .await;
+    let id = waiting_id(&text);
+    // Someone changes the tariff in e-Boekhouden before the user approves.
+    h.answer(
+        "uur/factureren/gridtable",
+        Some(factureren_lijst(&[(7, 10, "Website", 2.0, 95.0)])),
+    );
+    assert!(h.state.approvals.decide(id, true, 1));
+    let record = settled(&h.state, id).await;
+    assert_ne!(record.status, Status::Done);
+    assert!(
+        record
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("intussen gewijzigd"),
+        "{record:?}"
+    );
+    assert!(h.sent().is_empty(), "nothing was invoiced");
+
+    // Already invoiced in the meantime: the line is gone from the list.
+    let h = Harness::new(WriteMode::Ask).await;
+    let (_, text) = h
+        .call(
+            "uren_factureren",
+            json!({"van": "2026-11-01", "tot": "2026-11-30"}),
+        )
+        .await;
+    let id = waiting_id(&text);
+    h.answer("uur/factureren/gridtable", Some(factureren_lijst(&[])));
+    assert!(h.state.approvals.decide(id, true, 1));
+    assert_ne!(settled(&h.state, id).await.status, Status::Done);
+    assert!(h.sent().is_empty());
+}
+
+#[tokio::test]
+async fn an_activity_keeps_its_kostenplaats_only_where_the_administration_uses_them() {
+    let wijzig = json!({"id": 20, "uurtarief": 85});
+    // Cost centres on: the kostenplaats the activity has goes back with the change.
+    let h = Harness::new(WriteMode::Auto).await;
+    h.answer(
+        "setting/administratie.use-kostenplaatsen",
+        Some(json!({"key": "administratie.use-kostenplaatsen", "value": "true"})),
+    );
+    h.answer(
+        "kostenplaats/GetByActiviteitId/20",
+        Some(json!({"id": 31, "omschrijving": "Studio"})),
+    );
+    let (is_error, text) = h.call("activiteit_wijzigen", wijzig.clone()).await;
+    assert!(!is_error, "{text}");
+    assert_eq!(h.sent()[0].2["kostenplaatsId"], 31);
+    assert!(
+        h.reads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r == "setting/administratie.use-kostenplaatsen?acc=false")
+    );
+
+    // Cost centres on but the kostenplaats cannot be read: a plain refusal, nothing sent.
+    let h = Harness::new(WriteMode::Auto).await;
+    h.answer(
+        "setting/administratie.use-kostenplaatsen",
+        Some(json!({"value": "true"})),
+    );
+    h.answer("kostenplaats/GetByActiviteitId/20", None);
+    let (is_error, text) = h.call("activiteit_wijzigen", wijzig.clone()).await;
+    assert!(
+        is_error && text.contains("kostenplaats van deze activiteit is niet te lezen"),
+        "{text}"
+    );
+    assert!(h.sent().is_empty());
+
+    // Cost centres off: the kostenplaats is not read, and a failing lookup cannot block the change.
+    let h = Harness::new(WriteMode::Auto).await;
+    h.answer("kostenplaats/GetByActiviteitId/20", None);
+    let (is_error, text) = h.call("activiteit_wijzigen", wijzig.clone()).await;
+    assert!(!is_error, "{text}");
+    assert!(h.sent()[0].2.get("kostenplaatsId").is_none());
+    assert!(!h.read("kostenplaats/GetByActiviteitId/20"));
+
+    // An unreadable btw setting is an error, not "btw-plichtig".
+    let h = Harness::new(WriteMode::Auto).await;
+    h.answer("setting/administratie.niet-btw-plichtig", Some(json!(42)));
+    let (is_error, text) = h.call("activiteit_wijzigen", wijzig).await;
+    assert!(is_error && text.contains("onbekende vorm"), "{text}");
+    assert!(h.sent().is_empty());
+    // Not btw-plichtig: a facturabele activity needs no btw code.
+    let h = Harness::new(WriteMode::Auto).await;
+    h.answer(
+        "setting/administratie.niet-btw-plichtig",
+        Some(json!({"value": "true"})),
+    );
+    let (is_error, text) = h
+        .call(
+            "activiteit_toevoegen",
+            json!({"naam": "Advies", "uurtarief": 95, "facturabel": true}),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    assert!(h.sent()[0].2.get("btwCode").is_none());
+}
+
+#[tokio::test]
+async fn without_invoice_settings_the_tools_say_so_and_can_make_them() {
+    use crate::approvals::Status;
+    let h = Harness::new(WriteMode::Ask).await;
+    h.answer("factuursetting/exists", Some(json!(false)));
+    h.answer("factuursetting", None);
+    let (is_error, text) = h.call("uren_factuurinstellingen", json!({})).await;
+    assert!(!is_error, "{text}");
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(answer["data"]["bestaat"], false);
+    assert_eq!(answer["data"]["instellingen"], Value::Null);
+    assert!(
+        !h.read("factuursetting"),
+        "the settings are not read when there are none"
+    );
+
+    let (is_error, text) = h
+        .call(
+            "uren_factuurinstellingen_wijzigen",
+            json!({"per_post": true}),
+        )
+        .await;
+    assert!(is_error && text.contains("niet ingevuld"), "{text}");
+    let (_, text) = h
+        .call(
+            "uren_factuurinstellingen_wijzigen",
+            json!({"uur_eenheid_id": 61, "km_eenheid_id": 62, "regeltekst": "[PROJECT]", "factuursjabloon_id": 9}),
+        )
+        .await;
+    let id = waiting_id(&text);
+    assert!(h.state.approvals.decide(id, true, 1));
+    assert_eq!(settled(&h.state, id).await.status, Status::Done);
+    let (method, path, body) = h.sent().remove(0);
+    assert_eq!((method.as_str(), path.as_str()), ("PUT", "factuurSetting"));
+    assert!(body.get("id").is_none(), "{body}");
+    assert_eq!(body["regelTekst"], "[PROJECT]");
+
+    let (is_error, text) = h.call("uren_factureren", json!({})).await;
+    assert!(
+        is_error && text.contains("nog geen factuurinstellingen"),
+        "{text}"
+    );
+    assert!(!h.read("factuursetting"));
 }
