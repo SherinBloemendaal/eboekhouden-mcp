@@ -42,11 +42,73 @@ pub struct Btw {
     pub soort: String,
 }
 
+/// A kostenplaats as `GET kostenplaats` lists it: a node in a tree, named by its path ("Projecten>Noord").
+#[derive(Clone, Debug, PartialEq)]
+pub struct Kostenplaats {
+    pub id: u64,
+    pub omschrijving: String,
+    /// 0 for one at the top of the tree.
+    pub parent: u64,
+    pub actief: bool,
+    pub pad: String,
+}
+
+/// The kostenplaatsen of `GET kostenplaats` (e-Boekhouden's own list, `getAll` of its kostenplaats service).
+pub fn kostenplaatsen_from_api(list: &Value) -> Result<Vec<Kostenplaats>, String> {
+    let rows = list
+        .as_array()
+        .ok_or("De kostenplaatsen van e-Boekhouden hebben een onbekende vorm")?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let omschrijving = row
+                .get("omschrijving")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            Some(Kostenplaats {
+                id: row.get("id")?.as_u64()?,
+                pad: row
+                    .get("volledigPad")
+                    .and_then(Value::as_str)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| omschrijving.clone()),
+                omschrijving,
+                parent: row
+                    .get("parentKostenplaatsId")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                actief: row.get("actief").and_then(Value::as_bool).unwrap_or(true),
+            })
+        })
+        .collect())
+}
+
+/// Whether one of the lines a mutatie tool was given names a kostenplaats: only then are the kostenplaatsen
+/// read and checked.
+pub fn names_kostenplaats(regels: Option<&[RegelArg]>) -> bool {
+    regels.is_some_and(|r| r.iter().any(|r| r.kostenplaats_id.is_some()))
+}
+
+/// Whether a mutatie as `GET mutatie/nr/{nr}/model` gives it has a kostenplaats on one of its lines.
+pub fn model_has_kostenplaats(model: &Value) -> bool {
+    model
+        .get("mutatieRegels")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| {
+            rows.iter()
+                .any(|r| r.get("kostenplaats").and_then(Value::as_u64).unwrap_or(0) > 0)
+        })
+}
+
 /// The rekeningschema and the btw codes of one administration, read before a change is built.
 #[derive(Clone, Debug, Default)]
 pub struct Books {
     pub rekeningen: Vec<Rekening>,
     pub btw: Vec<Btw>,
+    /// Read only for a mutatie that has a kostenplaats on a line (tools.rs); empty otherwise.
+    pub kostenplaatsen: Vec<Kostenplaats>,
 }
 
 impl Books {
@@ -110,7 +172,37 @@ impl Books {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(Self { rekeningen, btw })
+        Ok(Self {
+            rekeningen,
+            btw,
+            kostenplaatsen: Vec::new(),
+        })
+    }
+
+    /// A kostenplaats a line may carry: one of the administration, and active (e-Boekhouden's own picker
+    /// refuses an inactive one).
+    fn kostenplaats(&self, id: u64) -> Result<&Kostenplaats, String> {
+        if self.kostenplaatsen.is_empty() {
+            return Err("Deze administratie heeft geen kostenplaatsen".into());
+        }
+        let found = self
+            .kostenplaatsen
+            .iter()
+            .find(|k| k.id == id)
+            .ok_or_else(|| {
+                format!("Geen kostenplaats met id {id} in deze administratie (zie kostenplaatsen)")
+            })?;
+        if !found.actief {
+            return Err(format!("Kostenplaats {} is inactief", found.pad));
+        }
+        Ok(found)
+    }
+
+    fn kostenplaats_label(&self, id: u64) -> String {
+        match self.kostenplaatsen.iter().find(|k| k.id == id) {
+            Some(k) => k.pad.clone(),
+            None => format!("id {id}"),
+        }
     }
 
     pub fn rekening(&self, code: &str) -> Result<&Rekening, String> {
@@ -342,6 +434,9 @@ pub struct RegelArg {
     pub btw_code: Option<String>,
     /// Eigen omschrijving van deze regel (standaard die van de mutatie).
     pub omschrijving: Option<String>,
+    /// Id van een actieve kostenplaats voor deze regel (uit kostenplaatsen). Alleen als de administratie kostenplaatsen gebruikt.
+    #[serde(default)]
+    pub kostenplaats_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -469,7 +564,10 @@ fn regels_from(args: &[RegelArg], books: &Books) -> Result<Vec<Regel>, String> {
                     .code
                     .clone(),
                 omschrijving: text(&regel.omschrijving),
-                kostenplaats: None,
+                kostenplaats: regel
+                    .kostenplaats_id
+                    .map(|id| books.kostenplaats(id).map(|k| k.id))
+                    .transpose()?,
             })
         })
         .collect()
@@ -642,10 +740,14 @@ impl Mutatie {
                     .btw(&r.btw)
                     .map(|b| b.naam.clone())
                     .unwrap_or_else(|_| r.btw.clone());
+                let kostenplaats = r
+                    .kostenplaats
+                    .map(|id| format!(", kostenplaats {}", books.kostenplaats_label(id)))
+                    .unwrap_or_default();
                 lines.push(line(
                     &format!("Regel {}", i + 1),
                     format!(
-                        "{}: {} ({btw})",
+                        "{}: {} ({btw}){kostenplaats}",
                         books.label(r.tegenrekening),
                         euro(r.bedrag)
                     ),
@@ -2281,7 +2383,111 @@ mod tests {
             bedrag,
             btw_code: btw.map(str::to_owned),
             omschrijving: None,
+            kostenplaats_id: None,
         }
+    }
+
+    /// The test administration's kostenplaatsen, as `GET kostenplaats` gives them.
+    fn met_kostenplaatsen() -> Books {
+        let mut books = books();
+        books.kostenplaatsen = kostenplaatsen_from_api(&json!([
+            {"id": 501, "omschrijving": "Projecten", "parentKostenplaatsId": 0, "actief": true, "volledigPad": "Projecten"},
+            {"id": 502, "omschrijving": "Noord", "parentKostenplaatsId": 501, "actief": true, "volledigPad": "Projecten>Noord"},
+            {"id": 503, "omschrijving": "Oud", "parentKostenplaatsId": 0, "actief": false, "volledigPad": "Oud"}
+        ]))
+        .unwrap();
+        books
+    }
+
+    #[test]
+    fn a_line_carries_its_kostenplaats_as_the_mutatie_form_sends_it() {
+        let mut args = toevoegen(Soort::GeldUitgegeven);
+        args.rekening = Some("1010".into());
+        let mut line = regel("4550", 2.0, None);
+        line.kostenplaats_id = Some(502);
+        args.regels = Some(vec![line, regel("4700", 1.0, None)]);
+        assert!(names_kostenplaats(args.regels.as_deref()));
+        let built = mutatie_nieuw(&args, &met_kostenplaatsen()).unwrap();
+        assert_eq!(
+            built.body["mutatieRegels"],
+            json!([
+                {"index": 0, "tegenRekening": 26852167, "btwCode": "GEEN", "bedrag": 2.0, "kostenplaats": 502},
+                {"index": 1, "tegenRekening": 26852160, "btwCode": "GEEN", "bedrag": 1.0}
+            ])
+        );
+        let shown: Vec<String> = built
+            .lines
+            .iter()
+            .map(|l| format!("{}: {}", l.label, l.value))
+            .collect();
+        assert!(
+            shown.contains(
+                &"Regel 1: 4550 Bankkosten: 2,00 (Geen btw), kostenplaats Projecten>Noord"
+                    .to_owned()
+            ),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(&"Regel 2: 4700 Kantoorbenodigdheden: 1,00 (Geen btw)".to_owned()),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_kostenplaats_the_administration_does_not_offer() {
+        let mut args = toevoegen(Soort::GeldUitgegeven);
+        args.rekening = Some("1010".into());
+        let mut line = regel("4550", 2.0, None);
+        line.kostenplaats_id = Some(503);
+        args.regels = Some(vec![line.clone()]);
+        let inactive = mutatie_nieuw(&args, &met_kostenplaatsen()).unwrap_err();
+        assert!(inactive.contains("Oud is inactief"), "{inactive}");
+        line.kostenplaats_id = Some(999);
+        args.regels = Some(vec![line.clone()]);
+        let unknown = mutatie_nieuw(&args, &met_kostenplaatsen()).unwrap_err();
+        assert!(unknown.contains("999"), "{unknown}");
+        let none = mutatie_nieuw(&args, &books()).unwrap_err();
+        assert!(none.contains("geen kostenplaatsen"), "{none}");
+        assert!(!names_kostenplaats(Some(&[regel("4550", 1.0, None)])));
+        assert!(!names_kostenplaats(None));
+    }
+
+    #[test]
+    fn an_edit_keeps_the_kostenplaats_of_a_line_it_keeps() {
+        assert!(!model_has_kostenplaats(&model()));
+        let mut model = model();
+        model["mutatieRegels"][0]["kostenplaats"] = json!(502);
+        assert!(model_has_kostenplaats(&model));
+        let mut args = wijzigen(3908);
+        args.datum = Some("2026-11-07".into());
+        let built = mutatie_gewijzigd(&args, &model, &met_kostenplaatsen()).unwrap();
+        assert_eq!(built.body["mutatieRegels"][0]["kostenplaats"], 502);
+        assert!(
+            built
+                .lines
+                .iter()
+                .any(|l| l.label == "Regel 1" && l.value.ends_with("kostenplaats Projecten>Noord")),
+            "{:?}",
+            built.lines
+        );
+        // Without the list (it could not be read) the line still names the kostenplaats, by id.
+        let built = mutatie_gewijzigd(&args, &model, &books()).unwrap();
+        assert!(
+            built
+                .lines
+                .iter()
+                .any(|l| l.label == "Regel 1" && l.value.ends_with("kostenplaats id 502")),
+            "{:?}",
+            built.lines
+        );
+        // New lines replace the old ones, each with the kostenplaats it names.
+        let mut line = regel("4550", 2.0, None);
+        line.kostenplaats_id = Some(501);
+        args.regels = Some(vec![line]);
+        let body = mutatie_gewijzigd(&args, &model, &met_kostenplaatsen())
+            .unwrap()
+            .body;
+        assert_eq!(body["mutatieRegels"][0]["kostenplaats"], 501);
     }
 
     #[test]

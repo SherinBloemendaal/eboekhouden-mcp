@@ -2552,7 +2552,14 @@ impl EbMcp {
             args,
             "Mutatie toegevoegd; data.mutNr is het mutatienummer",
             move |this, run, args| async move {
-                let books = this.books(&run).await?;
+                let mut books = this.books(&run).await?;
+                books.kostenplaatsen = this
+                    .mutatie_kostenplaatsen(
+                        &run,
+                        write::names_kostenplaats(args.regels.as_deref()),
+                        false,
+                    )
+                    .await?;
                 let built = write::mutatie_nieuw(&args, &books)?;
                 this.approve(&run, TOOL, &built, false).await?;
                 this.change(&run, "POST", "mutatie", Some(&built.body))
@@ -2588,7 +2595,14 @@ impl EbMcp {
                 let model = this
                     .fetch(&run, &format!("mutatie/nr/{}/model", args.nr), Vec::new())
                     .await?;
-                let books = this.books(&run).await?;
+                let mut books = this.books(&run).await?;
+                books.kostenplaatsen = this
+                    .mutatie_kostenplaatsen(
+                        &run,
+                        write::names_kostenplaats(args.regels.as_deref()),
+                        write::model_has_kostenplaats(&model),
+                    )
+                    .await?;
                 let built = write::mutatie_gewijzigd(&args, &model, &books)?;
                 this.approve(&run, TOOL, &built, false).await?;
                 this.change(&run, "PUT", "mutatie", Some(&built.body)).await
