@@ -4,7 +4,7 @@ import App from '../App.vue'
 import AccountForm from '../components/AccountForm.vue'
 import { store, type AccountView } from '../lib/accounts'
 import {
-  ago, approvalState, filterHistory, followSelection, nameList, proposalKind, quitWarning, refreshApprovals, splitTitle, type ApprovalDetail, type ApprovalRecord, type DecideAllResult, type Proposal,
+  ago, approvalState, decisionLabel, filterHistory, followSelection, nameList, proposalKind, quitWarning, refreshApprovals, splitTitle, statusOf, type ApprovalDetail, type ApprovalRecord, type DecideAllResult, type Proposal,
 } from '../lib/approvals'
 import { statusLabel, type McpEntry } from '../lib/log'
 import { router } from '../router'
@@ -497,7 +497,7 @@ describe('the history', () => {
   it('filters by status and searches the title and account', async () => {
     await openHistory()
     const select = document.querySelector<HTMLSelectElement>('select[aria-label="Status"]')!
-    expect([...select.options].map((o) => o.textContent)).toEqual(['Alle statussen', 'Wacht', 'Bezig', 'Uitgevoerd', 'Mislukt', 'Geweigerd', 'Vervallen'])
+    expect([...select.options].map((o) => o.textContent)).toEqual(['Alle statussen', 'Wacht', 'Bezig', 'Uitgevoerd', 'Mislukt', 'Geweigerd', 'Vervallen', 'Ingetrokken'])
     select.value = 'refused'
     select.dispatchEvent(new Event('change'))
     await flushPromises()
@@ -566,6 +566,9 @@ describe('the history', () => {
       record({ id: 15, status: 'lapsed', decision: 'approved', decidedAt: 3_000, error: 'EB MCP is gestopt terwijl deze wijziging liep. Kijk in e-Boekhouden wat er al is doorgevoerd.' }),
       record({ id: 14, status: 'lapsed', decision: 'lapsed', decidedAt: 2_000, error: 'EB MCP is opnieuw gestart voordat de gebruiker antwoordde; het voorstel is vervallen. Er is niets gewijzigd.' }),
       record({ id: 13, status: 'refused', decision: 'refused', decidedAt: 1_000 }),
+      // Taken back by the AI client, with and without the reason the app keeps.
+      record({ id: 12, status: 'withdrawn', decision: 'withdrawn', decidedAt: 900, error: 'Ingetrokken door Claude: verkeerd bedrag. Er is niets gewijzigd.' }),
+      record({ id: 11, status: 'withdrawn', decision: 'withdrawn', decidedAt: 800 }),
     ]
     await openHistory()
     const outcomeOf = async (index: number) => {
@@ -577,6 +580,11 @@ describe('the history', () => {
     expect(await outcomeOf(0)).toEqual([true, 'EB MCP is gestopt terwijl deze wijziging liep. Kijk in e-Boekhouden wat er al is doorgevoerd.'])
     expect(await outcomeOf(1)).toEqual([false, 'EB MCP is opnieuw gestart voordat de gebruiker antwoordde; het voorstel is vervallen. Er is niets gewijzigd.'])
     expect(await outcomeOf(2)).toEqual([false, 'Geweigerd. Er is niets gewijzigd in e-Boekhouden.'])
+    expect(await outcomeOf(3)).toEqual([false, 'Ingetrokken door Claude: verkeerd bedrag. Er is niets gewijzigd.'])
+    expect(await outcomeOf(4)).toEqual([false, 'Ingetrokken door de AI-client. Er is niets gewijzigd in e-Boekhouden.'])
+    // The list names it too, and it can be filtered on.
+    expect(statusOf('withdrawn')).toMatchObject({ label: 'Ingetrokken', tone: 'off' })
+    expect(decisionLabel('withdrawn')).toBe('Ingetrokken door de AI-client')
   })
 
   it('names an answer given to all waiting changes at once', async () => {

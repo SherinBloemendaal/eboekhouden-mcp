@@ -286,6 +286,7 @@ mod tests {
             "kvk_zoeken",
             "kvk_adres",
             "akkoord_status",
+            "akkoord_intrekken",
         ] {
             assert!(names.contains(&want), "{want} missing from {names:?}");
         }
@@ -302,6 +303,8 @@ mod tests {
         }
         // The tools that change the books say so; the three that cannot be undone say that too.
         let writes = [
+            // Changes nothing in the books, but takes a proposal out of EB MCP's queue: not a read.
+            "akkoord_intrekken",
             "mutatie_toevoegen",
             "mutatie_wijzigen",
             "archief_uploaden",
@@ -621,6 +624,56 @@ mod tests {
         );
         assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
 
+        // The AI client takes its own waiting request back: it leaves the queue, nothing goes out, the history
+        // says who and why, and the tool that asked ends as not carried out.
+        let withdraw = |call: u32, id: u64| {
+            let sent = post(
+                serde_json::json!({"jsonrpc": "2.0", "id": call, "method": "tools/call", "params": {"name": "akkoord_intrekken", "arguments": {
+                    "voorstel_id": id, "reden": "  Verkeerde\n tegenrekening.  "
+                }}}),
+                session.clone(),
+            );
+            async move { answer_of(sent.await.unwrap().text().await.unwrap()) }
+        };
+        let (is_error, text) = book(31).await;
+        assert!(!is_error, "{text}");
+        let taken_back = waiting_id(&text);
+        assert_eq!(proposal_up().id, taken_back);
+        let (is_error, text) = withdraw(32, taken_back).await;
+        assert!(
+            !is_error && text.contains("\"status\":\"ingetrokken\""),
+            "{text}"
+        );
+        assert_eq!(state.approvals.count(), 0);
+        let record = settled(&state, taken_back).await;
+        assert_eq!(record.status, crate::approvals::Status::Withdrawn);
+        assert_eq!(
+            record.error.as_deref(),
+            Some("Ingetrokken door Claude: Verkeerde tegenrekening. Er is niets gewijzigd.")
+        );
+        assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+        assert_eq!(
+            mcp_entry(&state, taken_back).outcome,
+            crate::reqlog::Outcome::Refused
+        );
+        let (_, status) = ask_status(taken_back).await;
+        assert!(
+            status.contains("\"status\":\"ingetrokken\"")
+                && status.contains("\"besluit\":\"ingetrokken\""),
+            "{status}"
+        );
+        // Not a second time, and not a proposal that does not exist.
+        let (is_error, text) = withdraw(33, taken_back).await;
+        assert!(
+            is_error && text.contains("wacht niet meer op akkoord (status: ingetrokken)"),
+            "{text}"
+        );
+        let (is_error, text) = withdraw(34, 999_999).await;
+        assert!(
+            is_error && text.contains("Er is geen voorstel met id 999999"),
+            "{text}"
+        );
+
         let (is_error, text) = book(3).await;
         assert!(!is_error, "waiting is not an error: {text}");
         let id = waiting_id(&text);
@@ -790,7 +843,8 @@ mod tests {
                 "mislukt",
                 "uitgevoerd",
                 "uitgevoerd",
-                "geweigerd"
+                "geweigerd",
+                "ingetrokken",
             ]
         );
     }

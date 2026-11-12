@@ -329,6 +329,8 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
     case 'failed': return { tone: 'bad', text: `Mislukt: ${record.error ?? 'e-Boekhouden gaf geen reden.'}` }
     // The reason says whether anything went out: a change that was cut off while it ran may be half done.
     case 'refused': return { tone: 'off', text: record.error ?? 'Geweigerd. Er is niets gewijzigd in e-Boekhouden.' }
+    // The reason names the client and what it gave as its reason.
+    case 'withdrawn': return { tone: 'off', text: record.error ?? 'Ingetrokken door de AI-client. Er is niets gewijzigd in e-Boekhouden.' }
     case 'lapsed':
       return record.decision === 'lapsed' || record.decision === null
         ? { tone: 'off', text: record.error ?? 'Vervallen zonder antwoord. Er is niets gewijzigd in e-Boekhouden.' }

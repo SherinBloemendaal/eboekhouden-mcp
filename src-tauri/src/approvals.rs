@@ -111,6 +111,8 @@ pub enum Decision {
     Auto,
     /// Nobody answered: the app stopped, or the account's sign-in details changed.
     Lapsed,
+    /// The AI client took its own request back before the user answered (`akkoord_intrekken`).
+    Withdrawn,
 }
 
 /// Where a proposal is now.
@@ -123,6 +125,8 @@ pub enum Status {
     Failed,
     Refused,
     Lapsed,
+    /// Taken back by an AI client while it waited. Nothing went to e-Boekhouden.
+    Withdrawn,
 }
 
 impl Status {
@@ -140,6 +144,7 @@ impl Status {
             Status::Failed => "mislukt",
             Status::Refused => "geweigerd",
             Status::Lapsed => "vervallen",
+            Status::Withdrawn => "ingetrokken",
         }
     }
 }
@@ -152,6 +157,7 @@ impl Decision {
             Decision::Refused => "geweigerd",
             Decision::Auto => "zonder akkoord",
             Decision::Lapsed => "vervallen",
+            Decision::Withdrawn => "ingetrokken",
         }
     }
 }
@@ -208,6 +214,17 @@ pub enum Answer {
     Approved,
     Refused(String),
     Lapsed(String),
+    /// An AI client took the request back; the text says who and why.
+    Withdrawn(String),
+}
+
+/// Why `withdraw` did nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotWithdrawn {
+    /// There is no proposal with this id.
+    Unknown,
+    /// It does not wait any more; this is where it is now.
+    NotWaiting(Status),
 }
 
 /// What `decide_all` did with the ids it was given.
@@ -444,6 +461,11 @@ impl Approvals {
                     record.status = Status::Lapsed;
                     record.error = Some(message.clone());
                 }
+                (Answer::Withdrawn(message), true) => {
+                    record.decision = Some(Decision::Withdrawn);
+                    record.status = Status::Withdrawn;
+                    record.error = Some(message.clone());
+                }
                 (_, false) => {
                     record.decision = Some(Decision::Lapsed);
                     record.status = Status::Lapsed;
@@ -487,6 +509,24 @@ impl Approvals {
             }
         }
         done
+    }
+
+    /// An AI client takes a waiting proposal back, with `reason` as the history shows it. Only a proposal that
+    /// still waits can go: once the user approved, the change runs and is no longer the client's to stop.
+    pub fn withdraw(&self, id: u64, reason: String, now: u64) -> Result<(), NotWithdrawn> {
+        let mut inner = self.lock();
+        if !inner.pending.contains_key(&id) {
+            return Err(match inner.record_mut(id) {
+                Some(detail) => NotWithdrawn::NotWaiting(detail.record.status),
+                None => NotWithdrawn::Unknown,
+            });
+        }
+        if self.close(&mut inner, id, Answer::Withdrawn(reason), now, false) {
+            Ok(())
+        } else {
+            // Nobody waited for the answer any more: `close` wrote it down as lapsed.
+            Err(NotWithdrawn::NotWaiting(Status::Lapsed))
+        }
     }
 
     /// Ends one waiting proposal without the user's answer: refused (`Answer::Refused`) or lapsed.
@@ -650,7 +690,11 @@ impl Approvals {
                     detail.finished_at = Some(now);
                     lapsed += 1;
                 }
-                Status::Done | Status::Failed | Status::Refused | Status::Lapsed => {}
+                Status::Done
+                | Status::Failed
+                | Status::Refused
+                | Status::Lapsed
+                | Status::Withdrawn => {}
             }
             inner.push(detail);
         }
@@ -1047,6 +1091,75 @@ mod tests {
         assert_eq!(again.history(Some(1)).len(), 1);
         // New ids follow the old ones.
         assert!(again.record_auto(ask(Uuid::new_v4(), "Nieuw"), technical(), 5) > refused.id);
+    }
+
+    #[test]
+    fn an_ai_client_can_take_back_only_what_still_waits() {
+        let approvals = Approvals::default();
+        let account = Uuid::new_v4();
+        let (waiting, mut answer) =
+            approvals.ask(ask(account, "Mutatie toevoegen"), technical(), 10);
+        let (approved, _approved_answer) =
+            approvals.ask(ask(account, "Factuur toevoegen"), technical(), 11);
+        assert!(approvals.decide(approved.id, true, 12));
+
+        // Taken back: out of the queue, the waiting tool hears why, and the history says so.
+        let why = "Ingetrokken door Claude: verkeerd bedrag. Er is niets gewijzigd.";
+        assert_eq!(approvals.withdraw(waiting.id, why.into(), 13), Ok(()));
+        assert_eq!(answer.try_recv().unwrap(), Answer::Withdrawn(why.into()));
+        assert_eq!(approvals.count(), 0);
+        let record = approvals.get(waiting.id).unwrap().record;
+        assert_eq!(
+            (record.status, record.decision),
+            (Status::Withdrawn, Some(Decision::Withdrawn))
+        );
+        assert_eq!(record.decided_at, Some(13));
+        assert_eq!(record.error.as_deref(), Some(why));
+        assert!(!record.bulk);
+        assert_eq!(
+            (Status::Withdrawn.dutch(), Decision::Withdrawn.dutch()),
+            ("ingetrokken", "ingetrokken")
+        );
+
+        // Not twice, not what the user approved (it runs), and not what was never asked.
+        assert_eq!(
+            approvals.withdraw(waiting.id, why.into(), 14),
+            Err(NotWithdrawn::NotWaiting(Status::Withdrawn))
+        );
+        assert_eq!(
+            approvals.withdraw(approved.id, why.into(), 14),
+            Err(NotWithdrawn::NotWaiting(Status::Running))
+        );
+        assert_eq!(
+            approvals.get(approved.id).unwrap().record.status,
+            Status::Running
+        );
+        assert_eq!(
+            approvals.withdraw(9999, why.into(), 14),
+            Err(NotWithdrawn::Unknown)
+        );
+
+        // A tool that stopped waiting leaves nothing to take back: the proposal lapses, as for any answer.
+        let (orphan, gone) = approvals.ask(ask(account, "Relatie toevoegen"), technical(), 15);
+        drop(gone);
+        assert_eq!(
+            approvals.withdraw(orphan.id, why.into(), 16),
+            Err(NotWithdrawn::NotWaiting(Status::Lapsed))
+        );
+        assert_eq!(
+            approvals.get(orphan.id).unwrap().record.status,
+            Status::Lapsed
+        );
+
+        // The outcome survives a restart as it is, and reads back from a file.
+        let text = serde_json::to_string(&approvals.get(waiting.id).unwrap().record).unwrap();
+        assert!(
+            text.contains("\"status\":\"withdrawn\"")
+                && text.contains("\"decision\":\"withdrawn\""),
+            "{text}"
+        );
+        let back: Record = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.status, Status::Withdrawn);
     }
 
     #[test]

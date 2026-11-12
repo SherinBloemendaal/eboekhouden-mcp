@@ -344,6 +344,14 @@ pub struct AkkoordStatusArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct AkkoordIntrekkenArgs {
+    /// Het voorstel_id van een wijziging die nog op akkoord wacht.
+    pub voorstel_id: u64,
+    /// Waarom het voorstel wordt ingetrokken, in een korte zin. De gebruiker ziet dit in de geschiedenis.
+    pub reden: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct IdArgs {
     /// Het id uit een lijst van e-Boekhouden.
     pub id: u64,
@@ -1489,7 +1497,9 @@ impl EbMcp {
                 let _ = self.state.events.send(AppEvent::LogChanged);
                 Ok(())
             }
-            Ok(Answer::Refused(message) | Answer::Lapsed(message)) => Err(Halt::Refused(message)),
+            Ok(Answer::Refused(message) | Answer::Lapsed(message) | Answer::Withdrawn(message)) => {
+                Err(Halt::Refused(message))
+            }
             Err(_) => Err(Halt::Refused(approvals::LAPSED_NOBODY_WAITS.into())),
         }
     }
@@ -2171,8 +2181,28 @@ fn proposal_status(detail: &approvals::Detail, full: bool) -> Value {
     value
 }
 
+/// What the history shows for a proposal an AI client took back: who did, and why if it said so.
+fn withdrawal_reason(client: &str, reason: Option<&str>) -> String {
+    const MAX: usize = 300;
+    let reason: String = reason
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let reason: String = if reason.chars().count() > MAX {
+        reason.chars().take(MAX).chain(['…']).collect()
+    } else {
+        reason
+    };
+    if reason.is_empty() {
+        format!("Ingetrokken door {client}, zonder reden. Er is niets gewijzigd.")
+    } else {
+        format!("Ingetrokken door {client}: {reason} Er is niets gewijzigd.")
+    }
+}
+
 /// What the states of `akkoord_status` mean, for the AI client.
-const STATUS_WORDS: &str = "wacht: de gebruiker heeft nog niet geantwoord; bezig: goedgekeurd en de wijziging loopt; uitgevoerd: gedaan, resultaat geeft het antwoord van de tool; mislukt: goedgekeurd maar e-Boekhouden of EB MCP gaf een fout, zie fout; geweigerd: de gebruiker weigerde, of het account ging uit of werd alleen-lezen, er is niets gewijzigd; vervallen: EB MCP startte opnieuw of de inloggegevens van het account veranderden voor er een antwoord was, er is niets gewijzigd.";
+const STATUS_WORDS: &str = "wacht: de gebruiker heeft nog niet geantwoord; bezig: goedgekeurd en de wijziging loopt; uitgevoerd: gedaan, resultaat geeft het antwoord van de tool; mislukt: goedgekeurd maar e-Boekhouden of EB MCP gaf een fout, zie fout; geweigerd: de gebruiker weigerde, of het account ging uit of werd alleen-lezen, er is niets gewijzigd; vervallen: EB MCP startte opnieuw of de inloggegevens van het account veranderden voor er een antwoord was, er is niets gewijzigd. ingetrokken: een AI-client trok het voorstel zelf in met akkoord_intrekken voordat de gebruiker antwoordde, er is niets gewijzigd.";
 
 /// How many tools the server offers, counted on its tool router.
 pub fn tool_count() -> usize {
@@ -2349,6 +2379,55 @@ impl EbMcp {
         Ok(CallToolResult::success(vec![ContentBlock::text(
             value.to_string(),
         )]))
+    }
+
+    #[tool(
+        description = "Een wijziging intrekken die nog op het akkoord van de gebruiker wacht: het voorstel verdwijnt uit de wachtrij in EB MCP en er gaat niets naar e-Boekhouden. Gebruik dit als een voorstel niet klopt (verkeerd bedrag, verkeerde rekening, dubbel gevraagd) of niet meer nodig is, in plaats van de gebruiker te vragen het te weigeren; dien daarna zo nodig een verbeterd voorstel in. Kan alleen zolang de status wacht is: een goedgekeurd voorstel loopt al of is al uitgevoerd en is niet meer in te trekken. Geef een korte reden mee; de gebruiker ziet in de geschiedenis dat het is ingetrokken, door wie en waarom.",
+        annotations(
+            title = "Akkoord intrekken",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn akkoord_intrekken(
+        &self,
+        Parameters(args): Parameters<AkkoordIntrekkenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = args.voorstel_id;
+        let reason = withdrawal_reason(&client_name(&context), args.reden.as_deref());
+        let refused = |text: String| Ok(CallToolResult::error(vec![ContentBlock::text(text)]));
+        match self
+            .state
+            .approvals
+            .withdraw(id, reason, crate::state::now_ms())
+        {
+            Ok(()) => {
+                let _ = self.state.events.send(AppEvent::ApprovalsChanged);
+                let value = json!({
+                    "voorstel_id": id,
+                    "status": approvals::Status::Withdrawn.dutch(),
+                    "let_op": "Het voorstel is ingetrokken en uit de wachtrij; er is niets gewijzigd in e-Boekhouden. De tool die het vroeg, eindigt als niet uitgevoerd.",
+                });
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    value.to_string(),
+                )]))
+            }
+            Err(approvals::NotWithdrawn::Unknown) => refused(format!(
+                "Er is geen voorstel met id {id} in EB MCP. akkoord_status zonder voorstel_id geeft de voorstellen van de laatste 24 uur."
+            )),
+            Err(approvals::NotWithdrawn::NotWaiting(status)) => refused(format!(
+                "Voorstel {id} wacht niet meer op akkoord (status: {}), dus het is niet in te trekken. {}",
+                status.dutch(),
+                match status {
+                    approvals::Status::Running | approvals::Status::Done =>
+                        "De gebruiker heeft het goedgekeurd; is de wijziging fout, herstel haar dan met een nieuwe wijziging.",
+                    _ => "Er is niets gewijzigd in e-Boekhouden.",
+                }
+            )),
+        }
     }
 
     #[tool(
@@ -4707,6 +4786,7 @@ impl ServerHandler for EbMcp {
                  hij antwoordt meteen met status wacht en een voorstel_id, en voert de wijziging zelf uit zodra de gebruiker goedkeurt. \
                  Vertel de gebruiker dat er in EB MCP een wijziging op akkoord wacht, ga gerust verder met ander werk, \
                  en vraag de uitkomst later op met akkoord_status (met voorstel_id voor één voorstel en zijn resultaat; zonder voor alles van de laatste 24 uur). \
+                 Klopt een voorstel dat nog wacht niet, of is het niet meer nodig, trek het dan zelf in met akkoord_intrekken (met een korte reden) in plaats van de gebruiker te vragen het te weigeren; na goedkeuring kan dat niet meer. \
                  Een geïmporteerde bankregel verwerken kan: bankregels geeft de onverwerkte regels met hun id, en mutatie_toevoegen met bankregel_id boekt de mutatie en verwerkt de regel in één keer, bij elke soort, ook een factuurbetaling. \
                  Boek geld van een bankregel nooit zonder bankregel_id: dan blijft de regel open staan en dreigt een dubbele boeking. \
                  Een btw-aangifte, ICP-opgave of suppletie versturen, indienen of betalen kan EB MCP niet: dat doet de gebruiker zelf. \
@@ -4946,7 +5026,7 @@ mod tests {
     fn counts_its_tools_on_the_router() {
         // The tools of this file, plus what each part names in its own module.
         let [reads, writes, _] = part_tools();
-        assert_eq!(tool_count(), 55 + reads.len() + writes.len());
+        assert_eq!(tool_count(), 56 + reads.len() + writes.len());
     }
 
     #[test]

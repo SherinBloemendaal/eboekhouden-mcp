@@ -298,13 +298,13 @@ export const PHASE_LABELS: Record<Phase, string> = {
 
 /** How the wait of a call ended, as the timeline names it. */
 export interface WaitAnswer {
-  decision: 'approved' | 'refused' | 'lapsed'
+  decision: 'approved' | 'refused' | 'lapsed' | 'withdrawn'
   /** Answered with Alles goedkeuren or Alles weigeren. */
   bulk: boolean
 }
 
 export interface Step {
-  key: 'received' | 'prep' | 'answered' | 'wait' | 'approved' | 'refused' | 'lapsed' | 'exec' | 'done' | 'failed'
+  key: 'received' | 'prep' | 'answered' | 'wait' | 'approved' | 'refused' | 'lapsed' | 'withdrawn' | 'exec' | 'done' | 'failed'
   /** The dot's colour: a phase, or how it ended. */
   tone: Phase | 'ok' | 'bad' | 'off'
   title: string
@@ -337,14 +337,16 @@ export function waitSteps(entry: McpEntry, calls: EbEntry[], answer: WaitAnswer 
   const ended = entry.waitEndedAt ?? null
   if (p.waiting || ended === null) return steps
   // Without the record: a call that ended refused right at the end of its wait was never approved. The log's own
-  // text for a proposal that lapsed at a restart says "vervallen".
+  // text says "vervallen" for a proposal that lapsed at a restart, and starts with "Ingetrokken door" for one the
+  // AI client took back.
   const unanswered = entry.outcome === 'refused' && p.execMs === 0
-  const decision = answer?.decision ?? (unanswered ? (/vervallen/i.test(entry.error ?? '') ? 'lapsed' : 'refused') : 'approved')
+  const fromLog = /^Ingetrokken door /.test(entry.error ?? '') ? 'withdrawn' : /vervallen/i.test(entry.error ?? '') ? 'lapsed' : 'refused'
+  const decision = answer?.decision ?? (unanswered ? fromLog : 'approved')
   if (decision !== 'approved') {
-    const lapsed = decision === 'lapsed'
+    const title = { refused: 'Geweigerd', lapsed: 'Vervallen', withdrawn: 'Ingetrokken' }[decision]
     steps.push({
-      key: lapsed ? 'lapsed' : 'refused', tone: 'off', title: lapsed ? 'Vervallen' : 'Geweigerd',
-      value: time(ended) + (!lapsed && answer?.bulk ? ' · Alles weigeren' : ''), note: entry.error ?? undefined,
+      key: decision, tone: 'off', title,
+      value: time(ended) + (decision === 'refused' && answer?.bulk ? ' · Alles weigeren' : ''), note: entry.error ?? undefined,
     })
     return steps
   }

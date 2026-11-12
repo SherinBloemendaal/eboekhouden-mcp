@@ -136,7 +136,7 @@ watch(
     try {
       const record = await approvalDetail(key.proposal)
       if (seq !== answerSeq || answerFor !== key.id) return
-      const decision = record.decision === 'approved' || record.decision === 'refused' || record.decision === 'lapsed' ? record.decision : null
+      const decision = record.decision === 'approved' || record.decision === 'refused' || record.decision === 'lapsed' || record.decision === 'withdrawn' ? record.decision : null
       answer.value = decision ? { decision, bulk: !!record.bulk } : null
     } catch {
       // The record left the history (it keeps the last 2000): the log's own outcome names the answer.

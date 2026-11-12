@@ -21,9 +21,9 @@ export interface Proposal {
   askedAt: number
 }
 
-export type ApprovalStatus = 'waiting' | 'running' | 'done' | 'failed' | 'refused' | 'lapsed'
+export type ApprovalStatus = 'waiting' | 'running' | 'done' | 'failed' | 'refused' | 'lapsed' | 'withdrawn'
 /** How the proposal was answered: by the user, without approval (the account books freely), or not in time. */
-export type ApprovalDecision = 'approved' | 'refused' | 'auto' | 'lapsed'
+export type ApprovalDecision = 'approved' | 'refused' | 'auto' | 'lapsed' | 'withdrawn'
 
 /** A proposal in the history, waiting or answered, with what came of it. */
 export interface ApprovalRecord extends Proposal {
@@ -150,6 +150,8 @@ export const STATUSES: { value: ApprovalStatus; label: string; tone: StatusTone 
   { value: 'failed', label: 'Mislukt', tone: 'bad' },
   { value: 'refused', label: 'Geweigerd', tone: 'off' },
   { value: 'lapsed', label: 'Vervallen', tone: 'off' },
+  // Taken back by the AI client itself (akkoord_intrekken) before the user answered.
+  { value: 'withdrawn', label: 'Ingetrokken', tone: 'off' },
 ]
 
 export function statusOf(status: ApprovalStatus): { label: string; tone: StatusTone } {
@@ -163,6 +165,7 @@ export function decisionLabel(decision: ApprovalDecision | null, bulk = false): 
     case 'refused': return bulk ? 'Geweigerd · Alles weigeren' : 'Geweigerd'
     case 'auto': return 'Zonder akkoord: dit account boekt direct'
     case 'lapsed': return 'Niet beantwoord'
+    case 'withdrawn': return 'Ingetrokken door de AI-client'
     default: return 'Nog niet beantwoord'
   }
 }

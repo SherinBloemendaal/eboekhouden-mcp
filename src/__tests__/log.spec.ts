@@ -137,6 +137,13 @@ describe('the wait for approval', () => {
     const lapsed = { ...refused, error: 'EB MCP is opnieuw gestart voordat de gebruiker antwoordde; het voorstel is vervallen en er is niets gewijzigd.' }
     expect(waitSteps(lapsed, [], null).at(-1)).toMatchObject({ key: 'lapsed', title: 'Vervallen' })
     expect(waitSteps(refused, [], { decision: 'lapsed', bulk: false }).at(-1)!.title).toBe('Vervallen')
+    // Taken back by the AI client: named as such from the record, and from the log's own text without it.
+    const withdrawn = { ...refused, error: 'Ingetrokken door Claude: verkeerd bedrag. Er is niets gewijzigd.' }
+    expect(waitSteps(withdrawn, [], null).at(-1)).toMatchObject({ key: 'withdrawn', title: 'Ingetrokken', tone: 'off', note: withdrawn.error })
+    const named = waitSteps(refused, [], { decision: 'withdrawn', bulk: true }).at(-1)!
+    expect(named.title).toBe('Ingetrokken')
+    // "Alles weigeren" is the user's answer; a withdrawal never carries it.
+    expect(named.value).not.toMatch(/Alles weigeren/)
   })
 
   it('stops at the wait while it still waits, and has no steps without one', () => {
