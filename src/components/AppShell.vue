@@ -303,6 +303,7 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .shell {
+  --side-card: calc(var(--side-w) - 18px);
   /* Where the toolbar's sidebar button starts when the sidebar is collapsed: clear of the three window buttons
      (trafficLightPosition x 22 in tauri.conf.json). Windows has its window buttons in the title bar: windows.css. */
   --toolbar-start: 92px;
@@ -311,8 +312,11 @@ onBeforeUnmount(() => {
 /* A floating glass sidebar, inset from the window edge, with the traffic lights inside it (the boards' window()).
    Its width is the user's (--side-w, from lib/sidebar.ts); collapsed it narrows to nothing and fades. */
 .sidebar {
-  width: var(--side-w); flex: none; box-sizing: border-box; overflow: hidden;
-  margin: 8px 0 8px 8px; border-radius: 14px;
+  /* Measured on a macOS 26 window (Chatkeep, 2026-11-12): the sidebar's column is --side-w in all. The card
+     sits 8 from the window's edges and leaves 10 to the content, so it is 18 narrower than the column; its
+     corners are 18, concentric with the window's 26. */
+  width: var(--side-card); flex: none; box-sizing: border-box; overflow: hidden;
+  margin: 8px 0 8px 8px; border-radius: 18px;
   background: var(--glass-side); box-shadow: var(--glass-side-edge);
   -webkit-backdrop-filter: blur(30px) saturate(180%); backdrop-filter: blur(30px) saturate(180%);
   transition: margin-left 220ms var(--ease), opacity 220ms var(--ease);
@@ -320,9 +324,11 @@ onBeforeUnmount(() => {
 .shell.toggling .sidebar { transition: width 220ms var(--ease), margin-left 220ms var(--ease), opacity 220ms var(--ease); }
 .shell.collapsed .sidebar { width: 0; margin-left: 0; opacity: 0; }
 .side-inner {
-  width: var(--side-w); height: 100%; box-sizing: border-box; display: flex; flex-direction: column; padding: 0 10px 10px;
+  width: var(--side-card); height: 100%; box-sizing: border-box; display: flex; flex-direction: column; padding: 0 10px 10px;
 }
-.traffic-space { height: 44px; flex: none; display: flex; align-items: center; justify-content: flex-end; }
+/* 44 high, so the first row starts 52 from the window's top; the button is centred 26 from it, on the line of
+   the window buttons. */
+.traffic-space { box-sizing: border-box; height: 44px; padding-bottom: 8px; flex: none; display: flex; align-items: center; justify-content: flex-end; }
 /* The macOS sidebar button: the glyph alone, a soft fill on hover. */
 .side-toggle {
   box-sizing: border-box; width: 28px; height: 28px; flex: none; display: inline-flex; align-items: center; justify-content: center;
@@ -333,7 +339,7 @@ onBeforeUnmount(() => {
 .side-toggle:focus-visible { outline: none; box-shadow: 0 0 0 3.5px rgba(10, 132, 255, 0.42); }
 .side-label { padding: 6px 8px 4px; }
 .nav {
-  box-sizing: border-box; height: 28px; display: flex; align-items: center; gap: 8px; padding: 0 8px;
+  box-sizing: border-box; height: 32px; display: flex; align-items: center; gap: 8px; padding: 0 8px;
   border-radius: 8px; color: var(--text); text-decoration: none; transition: background-color 150ms ease;
 }
 .nav:hover { background: var(--hover); }
