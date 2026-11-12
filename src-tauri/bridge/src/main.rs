@@ -55,6 +55,8 @@ async fn main() -> ExitCode {
         .expect("HTTP client");
     let mut session: Option<String> = None;
     let mut protocol: Option<String> = None;
+    // The client's own initialize, kept to start a new session with when EB MCP no longer knows this one.
+    let mut initialize: Option<String> = None;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
 
@@ -65,51 +67,61 @@ async fn main() -> ExitCode {
         }
         let message: Option<Value> = serde_json::from_str(line).ok();
         let id = message.as_ref().and_then(|m| m.get("id")).cloned();
-        let mut request = http
-            .post(&url)
-            .bearer_auth(&token)
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .body(line.to_owned());
-        if let Some(s) = &session {
-            request = request.header(SESSION_HEADER, s);
+        let is_initialize = message
+            .as_ref()
+            .and_then(|m| m.get("method"))
+            .and_then(Value::as_str)
+            == Some("initialize");
+        if is_initialize {
+            initialize = Some(line.to_owned());
+            // A new start: whatever session there was is not sent along.
+            session = None;
         }
-        if let Some(p) = &protocol {
-            request = request.header(PROTOCOL_HEADER, p);
+        let link = Link {
+            http: &http,
+            url: &url,
+            token: &token,
+        };
+        let mut sent = link
+            .post(line, session.as_deref(), protocol.as_deref())
+            .await;
+        // 404 on a session id: EB MCP forgot the session (it was restarted, by an update for one, or the
+        // session sat unused for too long). The MCP rule for a client is to start a new session; the bridge
+        // is that client, so it does so with the client's own initialize and sends the request once more.
+        if let Ok(answer) = &sent
+            && answer.status == 404
+            && session.is_some()
+            && !is_initialize
+            && let Some(first) = initialize.as_deref()
+            && let Some(renewed) = link.new_session(first, protocol.as_deref()).await
+        {
+            session = Some(renewed);
+            sent = link
+                .post(line, session.as_deref(), protocol.as_deref())
+                .await;
         }
-        let answers = match request.send().await {
-            Err(_) => error_for(
+        let answers = match sent {
+            Err(()) => error_for(
                 id,
                 "EB MCP draait niet. Start EB MCP en probeer het opnieuw.",
             ),
-            Ok(response) => {
-                if let Some(s) = response
-                    .headers()
-                    .get(SESSION_HEADER)
-                    .and_then(|v| v.to_str().ok())
-                {
-                    session = Some(s.to_owned());
+            Ok(answer) => {
+                if let Some(s) = answer.session {
+                    session = Some(s);
                 }
-                let status = response.status();
-                let stream = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|c| c.starts_with("text/event-stream"));
-                let body = response.text().await.unwrap_or_default();
-                if status == 401 {
+                if answer.status == 401 {
                     error_for(
                         id,
                         "Het token klopt niet meer. Koppel EB MCP opnieuw met Claude.",
                     )
-                } else if !status.is_success() {
-                    error_for(id, &format!("EB MCP gaf {status}"))
-                } else if stream {
-                    events(&body)
-                } else if body.trim().is_empty() {
+                } else if !(200..300).contains(&answer.status) {
+                    error_for(id, &format!("EB MCP gaf {}", answer.status))
+                } else if answer.stream {
+                    events(&answer.body)
+                } else if answer.body.trim().is_empty() {
                     Vec::new()
                 } else {
-                    vec![body.trim().to_owned()]
+                    vec![answer.body.trim().to_owned()]
                 }
             }
         };
@@ -133,6 +145,78 @@ async fn main() -> ExitCode {
         let _ = stdout.flush().await;
     }
     ExitCode::SUCCESS
+}
+
+/// What EB MCP answered to one POST.
+struct Answer {
+    status: u16,
+    /// The session id the answer named, if any.
+    session: Option<String>,
+    /// Whether the body is an event stream (else plain JSON, or nothing).
+    stream: bool,
+    body: String,
+}
+
+/// The way to EB MCP's HTTP server.
+struct Link<'a> {
+    http: &'a reqwest::Client,
+    url: &'a str,
+    token: &'a str,
+}
+
+impl Link<'_> {
+    /// One JSON-RPC line as one POST. `Err` when EB MCP cannot be reached at all.
+    async fn post(
+        &self,
+        line: &str,
+        session: Option<&str>,
+        protocol: Option<&str>,
+    ) -> Result<Answer, ()> {
+        let mut request = self
+            .http
+            .post(self.url)
+            .bearer_auth(self.token)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(line.to_owned());
+        if let Some(s) = session {
+            request = request.header(SESSION_HEADER, s);
+        }
+        if let Some(p) = protocol {
+            request = request.header(PROTOCOL_HEADER, p);
+        }
+        let response = request.send().await.map_err(|_| ())?;
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let session = header(SESSION_HEADER);
+        let stream = header("content-type").is_some_and(|c| c.starts_with("text/event-stream"));
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        Ok(Answer {
+            status,
+            session,
+            stream,
+            body,
+        })
+    }
+
+    /// Starts a new session with the client's own initialize and tells EB MCP the client is ready, as the
+    /// client did the first time. The answers stay here: the client asked for neither. Gives the new session id.
+    async fn new_session(&self, initialize: &str, protocol: Option<&str>) -> Option<String> {
+        let started = self.post(initialize, None, None).await.ok()?;
+        if !(200..300).contains(&started.status) {
+            return None;
+        }
+        let session = started.session?;
+        let ready = json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string();
+        let told = self.post(&ready, Some(&session), protocol).await.ok()?;
+        (200..300).contains(&told.status).then_some(session)
+    }
 }
 
 /// The MCP token: EB_MCP_TOKEN, else the given token file, else EB MCP's own

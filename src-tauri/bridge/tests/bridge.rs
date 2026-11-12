@@ -90,6 +90,139 @@ async fn forwards_lines_with_token_session_and_protocol() {
     assert_eq!(seen.protocol, vec!["", "2025-06-18", "2025-06-18"]);
 }
 
+/// A server that knows one session at a time and can be told to forget it, as EB MCP does when it restarts
+/// (an update) or when a session sat unused for too long: a request on an id it does not know gets 404.
+#[derive(Default)]
+struct Forgetful {
+    /// How many sessions were started; the current one is `s-<started>`.
+    started: u32,
+    forgotten: bool,
+    /// When set, a new session cannot be started either.
+    closed: bool,
+    /// Method and session id of every request, in order.
+    calls: Vec<(String, String)>,
+}
+
+async fn forgetful(state: Arc<Mutex<Forgetful>>) -> String {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let app = Router::new().route(
+        "/mcp",
+        post(move |headers: HeaderMap, body: String| {
+            let state = state.clone();
+            async move {
+                let message: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let method = message["method"].as_str().unwrap_or_default().to_owned();
+                let sent = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+                let mut s = state.lock().unwrap();
+                s.calls.push((method.clone(), sent.clone()));
+                if method == "initialize" {
+                    if s.closed {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    s.started += 1;
+                    s.forgotten = false;
+                    let id = format!("s-{}", s.started);
+                    return (
+                        [("content-type", "application/json".to_owned()), ("mcp-session-id", id)],
+                        serde_json::json!({"jsonrpc": "2.0", "id": message["id"], "result": {"protocolVersion": "2025-06-18"}}).to_string(),
+                    )
+                        .into_response();
+                }
+                if s.forgotten || sent != format!("s-{}", s.started) {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                if method == "notifications/initialized" {
+                    return StatusCode::ACCEPTED.into_response();
+                }
+                (
+                    [("content-type", "application/json")],
+                    serde_json::json!({"jsonrpc": "2.0", "id": message["id"], "result": {"session": sent}}).to_string(),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://127.0.0.1:{}/mcp", addr.port())
+}
+
+#[tokio::test]
+async fn starts_a_new_session_by_itself_when_eb_mcp_forgot_the_old_one() {
+    let state = Arc::new(Mutex::new(Forgetful::default()));
+    let url = forgetful(state.clone()).await;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_eb-mcp-bridge"))
+        .args(["--url", &url])
+        .env("EB_MCP_TOKEN", "t")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut say = async |line: &str| {
+        stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+    };
+    say(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"Claude"}}}"#).await;
+    assert!(
+        out.next_line()
+            .await
+            .unwrap()
+            .unwrap()
+            .contains("2025-06-18")
+    );
+    say(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).await;
+    say(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call"}"#).await;
+    let before = out.next_line().await.unwrap().unwrap();
+    assert!(
+        before.contains("\"id\":2") && before.contains("s-1"),
+        "{before}"
+    );
+
+    // EB MCP forgets the session. The client's next call still gets its answer, on a new session, and the
+    // client sees nothing of how: no answer to an initialize it did not send.
+    state.lock().unwrap().forgotten = true;
+    say(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call"}"#).await;
+    let after = out.next_line().await.unwrap().unwrap();
+    assert!(
+        after.contains("\"id\":3") && after.contains("s-2"),
+        "{after}"
+    );
+    // And the call after that goes straight to the new session.
+    say(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call"}"#).await;
+    let next = out.next_line().await.unwrap().unwrap();
+    assert!(next.contains("\"id\":4") && next.contains("s-2"), "{next}");
+
+    // A new session cannot be started either: the client hears what EB MCP said, once, and nothing loops.
+    {
+        let mut s = state.lock().unwrap();
+        s.forgotten = true;
+        s.closed = true;
+        s.calls.clear();
+    }
+    say(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call"}"#).await;
+    let failed = out.next_line().await.unwrap().unwrap();
+    assert!(
+        failed.contains("\"id\":5") && failed.contains("EB MCP gaf 404"),
+        "{failed}"
+    );
+    drop(stdin);
+    child.wait().await.unwrap();
+
+    let s = state.lock().unwrap();
+    let calls: Vec<(&str, &str)> = s
+        .calls
+        .iter()
+        .map(|(m, id)| (m.as_str(), id.as_str()))
+        .collect();
+    assert_eq!(calls, [("tools/call", "s-2"), ("initialize", "")]);
+}
+
 #[tokio::test]
 async fn says_so_when_eb_mcp_is_not_running() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_eb-mcp-bridge"))

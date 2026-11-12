@@ -21,6 +21,9 @@ use crate::tools::EbMcp;
 pub const PORT: u16 = 47821;
 pub const PATH: &str = "/mcp";
 
+/// How long an MCP session may sit unused before EB MCP forgets it.
+const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 pub fn url() -> String {
     format!("http://127.0.0.1:{PORT}{PATH}")
 }
@@ -32,9 +35,15 @@ pub fn router(state: Arc<AppState>, token: Arc<RwLock<String>>) -> Router {
         // An empty allow list plus enforcement: any request with an Origin header is refused.
         .enforce_origin_validation();
     config.json_response = true;
+    // rmcp forgets a session nobody used for five minutes and answers 404 on its id after that. An AI client
+    // pauses longer than that all the time (the user reads, approves, has lunch), and its first call after
+    // the pause then failed. A session costs next to nothing here and ends with the app, so it may sit unused
+    // for a day; a client that outlasts even that starts a new one (the bridge does so by itself).
+    let mut sessions = LocalSessionManager::default();
+    sessions.session_config.keep_alive = Some(SESSION_IDLE);
     let service = StreamableHttpService::new(
         move || Ok(EbMcp::new(state.clone())),
-        Arc::new(LocalSessionManager::default()),
+        Arc::new(sessions),
         config,
     );
     Router::new()
