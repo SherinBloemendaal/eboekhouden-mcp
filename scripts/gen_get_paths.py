@@ -3,8 +3,8 @@
 Input: the API map CSV from eb-sessions-design (api-map/eboekhouden-api.csv).
 Only plain reads: GET, GET (grid) and GET (autocomplete). Files (export,
 download) and frames are left out, and so is every GET whose path names an
-action (some of e-Boekhouden's GETs change things, such as undelete or
-annuleren), auth, users and API tokens.
+action (some of e-Boekhouden's GETs change things, such as undelete,
+annuleren, aangifte/pay or andersbetaald), auth, users and API tokens.
 
     python3 scripts/gen_get_paths.py ~/projects/eb-sessions-design/api-map/eboekhouden-api.csv
 """
@@ -19,7 +19,12 @@ DENY = re.compile(
     r"annuleer|annuleren|bevestig|undelete|delete|verwijder|reset|wachtwoord|password|uitlog|logout|"
     r"verstuur|versturen|send|verwerk|switch|changelanguage|refresh|toggle|koppel|ontkoppel|activeer|"
     r"deactiveer|opzeg|aanmaken|create|insert|update|save|opslaan|copy|kopie|import|upload|test|poc|"
-    r"oauth|token|login|mail|print|export|download|sms|afmeld|aanmeld|archiveer|herstel|genereer|bereken|maak",
+    r"oauth|token|login|mail|print|export|download|sms|afmeld|aanmeld|archiveer|herstel|genereer|bereken|maak|"
+    # GETs that act although their name does not say "save": paying or marking a return paid, handing an
+    # administration over, starting a bank or licence flow, switching an integration off, closing or cancelling
+    # something, recounting stock; and the pages that show API keys or open a conversation with support.
+    r"pay|betaald|overdragen|onboarding|consent|connection-request|verleng|deactivate|reactivate|cancel|close|"
+    r"actualiseer|licentiewijzigen|licentieupgrade|apiinfo|async|chat|contact",
     re.I,
 )
 DENY_MODULES = {"auth", "user", "apiaccesstokens", "(dynamisch)", "test", "loginwhitelist", "opzeggen", "wachtwoordreset", "gebruikersnaamvergeten"}

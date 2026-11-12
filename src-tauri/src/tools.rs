@@ -51,6 +51,81 @@ static ALLOWED: LazyLock<Vec<Vec<String>>> = LazyLock::new(|| {
         .collect()
 });
 
+/// What a path segment may not contain: the words that name an action in e-Boekhouden's API, where some
+/// GETs change things. The same words as `DENY` in scripts/gen_get_paths.py, which keeps such paths off
+/// the map; keep the two in step.
+const ACTING: &[&str] = &[
+    "annuleer",
+    "annuleren",
+    "bevestig",
+    "undelete",
+    "delete",
+    "verwijder",
+    "reset",
+    "wachtwoord",
+    "password",
+    "uitlog",
+    "logout",
+    "verstuur",
+    "versturen",
+    "send",
+    "verwerk",
+    "switch",
+    "changelanguage",
+    "refresh",
+    "toggle",
+    "koppel",
+    "ontkoppel",
+    "activeer",
+    "deactiveer",
+    "opzeg",
+    "aanmaken",
+    "create",
+    "insert",
+    "update",
+    "save",
+    "opslaan",
+    "copy",
+    "kopie",
+    "import",
+    "upload",
+    "test",
+    "poc",
+    "oauth",
+    "token",
+    "login",
+    "mail",
+    "print",
+    "export",
+    "download",
+    "sms",
+    "afmeld",
+    "aanmeld",
+    "archiveer",
+    "herstel",
+    "genereer",
+    "bereken",
+    "maak",
+    "pay",
+    "betaald",
+    "overdragen",
+    "onboarding",
+    "consent",
+    "connection-request",
+    "verleng",
+    "deactivate",
+    "reactivate",
+    "cancel",
+    "close",
+    "actualiseer",
+    "licentiewijzigen",
+    "licentieupgrade",
+    "apiinfo",
+    "async",
+    "chat",
+    "contact",
+];
+
 /// Whether `path` is a plain read on the API map. `{}` stands for one id-like segment.
 pub fn allowed_path(path: &str) -> bool {
     let path = path.trim().trim_matches('/');
@@ -69,6 +144,14 @@ pub fn allowed_path(path: &str) -> bool {
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     };
     if !parts.iter().all(|p| segment_ok(p)) {
+        return false;
+    }
+    // A `{}` in the map stands for an id or a code, never for an action: "voorraad/{}" must not let
+    // "voorraad/actualiseer" through. So no segment may name one, wherever it sits.
+    if parts
+        .iter()
+        .any(|p| ACTING.iter().any(|word| p.contains(word)))
+    {
         return false;
     }
     ALLOWED.iter().any(|pattern| {
@@ -4454,6 +4537,31 @@ mod tests {
         assert!(!allowed_path("relatie/../auth/login"));
         assert!(!allowed_path("relatie/gridtable?x=1"));
         assert!(!allowed_path("relatie"));
+        // GETs that act: paying or marking a btw return paid, handing an administration over, starting or
+        // stopping an integration, recounting stock, and the page that shows API keys.
+        for acting in [
+            "aangifte/pay/12",
+            "aangifte/paystatus/12",
+            "aangifte/12/andersbetaald",
+            "accountant/administratie/7/overdragen",
+            "ing/connection-request",
+            "kvk/verleng/starter",
+            "microsoft/auth/office/deactivate",
+            "tabletactie/cancel",
+            "tip/3/close",
+            "voorraad/actualiseer",
+            "apiinfo/getByKey/abc",
+            "ibanxs/newConsent",
+            // An action word where the map has an id.
+            "aangifte/pay",
+            "factuur/verwijder",
+            "folder/undelete",
+            "vasteactiva/delete",
+        ] {
+            assert!(!allowed_path(acting), "{acting}");
+        }
+        assert!(allowed_path("aangifte/gridtable"));
+        assert!(allowed_path("aangifte/12"));
         assert!(!allowed_path(""));
     }
 
