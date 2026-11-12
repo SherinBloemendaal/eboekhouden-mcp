@@ -69,7 +69,7 @@ pub struct VastactiefToevoegenArgs {
     pub rekening_activa: Option<String>,
     /// Code van de winst-en-verliesrekening voor de afschrijvingen (standaard die van de groep).
     pub rekening_afschrijvingen: Option<String>,
-    /// Geavanceerd: afschrijven starten per deze datum, JJJJ-MM-DD (voor een activum dat al eerder in gebruik was).
+    /// Geavanceerd: afschrijven starten per deze datum, JJJJ-MM-DD (voor een vast actief dat al eerder in gebruik was).
     pub afschrijven_vanaf: Option<String>,
     /// Geavanceerd: de boekwaarde in euro op de startdatum van het afschrijven.
     pub boekwaarde_bij_start: Option<f64>,
@@ -79,7 +79,7 @@ pub struct VastactiefToevoegenArgs {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct VastactiefWijzigenArgs {
-    /// Id van het vaste activum (uit vaste_activa).
+    /// Id van het vaste actief (uit vaste_activa).
     pub id: u64,
     /// Id van de nieuwe groep. Zonder afschrijven_in_jaren en rekeningen nemen die de waarden van de nieuwe groep over, zoals in e-Boekhouden.
     pub groep_id: Option<u64>,
@@ -111,7 +111,7 @@ pub struct VastactiefWijzigenArgs {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct AfschrijvingsschemaArgs {
-    /// Id van het vaste activum (uit vaste_activa).
+    /// Id van het vaste actief (uit vaste_activa).
     pub id: u64,
     /// Aantal rijen, 1 tot 200 (standaard 50).
     pub limit: Option<u32>,
@@ -197,7 +197,7 @@ impl ActivaContext {
     }
 }
 
-/// One vaste activum, as the form holds it.
+/// One vaste actief, as the form holds it.
 #[derive(Clone, Debug, PartialEq)]
 struct Activum {
     groep: u64,
@@ -218,7 +218,7 @@ impl Activum {
     /// The form's own checks, before anything is asked.
     fn check(&self, ctx: &ActivaContext) -> Result<(), String> {
         if self.omschrijving.is_empty() {
-            return Err("Een vast activum heeft een omschrijving nodig".into());
+            return Err("Een vast actief heeft een omschrijving nodig".into());
         }
         kort(&self.omschrijving, 50, "omschrijving")?;
         ctx.groep(self.groep)?;
@@ -304,47 +304,55 @@ impl Activum {
 
     /// From `GET vasteactiva/{id}`.
     fn from_api(value: &Value) -> Result<Self, String> {
-        let bad = || "e-Boekhouden gaf dit vaste activum in een onbekende vorm terug".to_owned();
-        let number = |key: &str| {
-            value.get(key).and_then(|v| {
-                v.as_u64()
-                    .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
-            })
-        };
-        let amount = |key: &str| value.get(key).and_then(Value::as_f64);
-        let start = value.get("afschrijvenStartenPer").and_then(date_of);
+        // Every value here goes back to e-Boekhouden on an edit: one that cannot be read stops the edit.
+        let bad = |veld: &str| onleesbaar("dit vaste actief", veld);
+        let number = |key: &str| value.get(key).and_then(read_u64).ok_or_else(|| bad(key));
+        let amount = |key: &str| value.get(key).and_then(read_f64).ok_or_else(|| bad(key));
         Ok(Self {
-            groep: number("vasteActivaGroepId").unwrap_or(0),
+            groep: number("vasteActivaGroepId")?,
             omschrijving: value
                 .get("omschrijving")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
+                .ok_or_else(|| bad("omschrijving"))?
                 .trim()
                 .to_owned(),
             aanschafdatum: value
                 .get("aanschafDatum")
                 .and_then(date_of)
-                .ok_or_else(bad)?,
-            aanschafwaarde: amount("aanschafwaarde").ok_or_else(bad)?,
-            restwaarde: amount("restwaarde").unwrap_or(0.0),
-            jaren: number("aantalJaren")
-                .and_then(|j| u32::try_from(j).ok())
-                .ok_or_else(bad)?,
+                .ok_or_else(|| bad("aanschafDatum"))?,
+            aanschafwaarde: amount("aanschafwaarde")?,
+            restwaarde: amount("restwaarde")?,
+            jaren: u32::try_from(number("aantalJaren")?).map_err(|_| bad("aantalJaren"))?,
             per: value
                 .get("boekenPer")
                 .and_then(Value::as_str)
                 .and_then(BoekenPer::from_code)
-                .unwrap_or(BoekenPer::Jaar),
-            activa: number("grootboekrekeningBal").unwrap_or(0),
-            afschrijving: number("grootboekrekeningVw").unwrap_or(0),
-            start,
-            boekwaarde_start: amount("boekwaardePerStart"),
+                .ok_or_else(|| bad("boekenPer"))?,
+            activa: number("grootboekrekeningBal")?,
+            afschrijving: number("grootboekrekeningVw")?,
+            start: optional(value.get("afschrijvenStartenPer"), date_of)
+                .map_err(|()| bad("afschrijvenStartenPer"))?,
+            boekwaarde_start: optional(value.get("boekwaardePerStart"), read_f64)
+                .map_err(|()| bad("boekwaardePerStart"))?,
             geavanceerd: value
                 .get("geavanceerd")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+                .and_then(read_bool)
+                .ok_or_else(|| bad("geavanceerd"))?,
         })
     }
+}
+
+/// A purchase date: a real date on or after 1-1-1900, as the form's date validator wants it.
+fn aanschafdatum(text: &str) -> Result<Date, String> {
+    let early = text
+        .trim()
+        .get(..4)
+        .and_then(|y| y.parse::<i32>().ok())
+        .is_some_and(|y| y < 1900);
+    if early {
+        return Err("De aanschafdatum moet op of na 01-01-1900 liggen".into());
+    }
+    parse_date(text)
 }
 
 fn vastactief_nieuw(args: &VastactiefToevoegenArgs, ctx: &ActivaContext) -> Result<Built, String> {
@@ -357,7 +365,7 @@ fn vastactief_nieuw(args: &VastactiefToevoegenArgs, ctx: &ActivaContext) -> Resu
             }
             _ => {
                 return Err(format!(
-                    "Geef met groep_id aan in welke groep het vaste activum hoort: {}",
+                    "Geef met groep_id aan in welke groep het vaste actief hoort: {}",
                     ctx.groepen_lijst()
                 ));
             }
@@ -406,7 +414,7 @@ fn vastactief_nieuw(args: &VastactiefToevoegenArgs, ctx: &ActivaContext) -> Resu
     let activum = Activum {
         groep: groep.id,
         omschrijving: tekst(Some(&args.omschrijving)).unwrap_or_default(),
-        aanschafdatum: parse_date(&args.aanschafdatum)?,
+        aanschafdatum: aanschafdatum(&args.aanschafdatum)?,
         aanschafwaarde: bedrag(args.aanschafwaarde, "aanschafwaarde")?,
         restwaarde: bedrag(args.restwaarde, "restwaarde")?,
         jaren,
@@ -430,7 +438,7 @@ fn vastactief_nieuw(args: &VastactiefToevoegenArgs, ctx: &ActivaContext) -> Resu
     ));
     Ok(Built {
         body: activum.body(None),
-        title: format!("Vast activum toevoegen: {}", activum.omschrijving),
+        title: format!("Vast actief toevoegen: {}", activum.omschrijving),
         lines,
     })
 }
@@ -439,6 +447,7 @@ fn vastactief_gewijzigd(
     args: &VastactiefWijzigenArgs,
     now: &Value,
     ctx: &ActivaContext,
+    schema: Option<&Schema>,
 ) -> Result<Built, String> {
     let before = Activum::from_api(now)?;
     let mut activum = before.clone();
@@ -446,23 +455,40 @@ fn vastactief_gewijzigd(
         && id != before.groep
     {
         // As the form does when the group changes: its years and rekeningen come along.
+        // A value the group lacks is emptied by the form; here it must be named instead.
         let groep = ctx.groep(id)?;
         activum.groep = groep.id;
-        if let Some(jaren) = groep.jaren {
-            activum.jaren = jaren;
-        }
-        if let Some(activa) = groep.activa {
-            activum.activa = activa;
-        }
-        if let Some(afschrijving) = groep.afschrijving {
-            activum.afschrijving = afschrijving;
-        }
+        let missing = |wat: &str, arg: &str| {
+            format!(
+                "Groep {} heeft geen {wat}; e-Boekhouden maakt dat veld dan leeg. Geef {arg} mee",
+                groep.naam
+            )
+        };
+        activum.jaren = match (groep.jaren, args.afschrijven_in_jaren) {
+            (_, Some(jaren)) | (Some(jaren), None) => jaren,
+            (None, None) => return Err(missing("aantal jaren", "afschrijven_in_jaren")),
+        };
+        activum.activa = match (groep.activa, &args.rekening_activa) {
+            (Some(activa), None) => activa,
+            (_, Some(_)) => activum.activa,
+            (None, None) => return Err(missing("rekening activa", "rekening_activa")),
+        };
+        activum.afschrijving = match (groep.afschrijving, &args.rekening_afschrijvingen) {
+            (Some(afschrijving), None) => afschrijving,
+            (_, Some(_)) => activum.afschrijving,
+            (None, None) => {
+                return Err(missing(
+                    "rekening afschrijvingen",
+                    "rekening_afschrijvingen",
+                ));
+            }
+        };
     }
     if let Some(text) = &args.omschrijving {
         activum.omschrijving = text.trim().to_owned();
     }
     if let Some(date) = &args.aanschafdatum {
-        activum.aanschafdatum = parse_date(date)?;
+        activum.aanschafdatum = aanschafdatum(date)?;
     }
     if let Some(value) = args.aanschafwaarde {
         activum.aanschafwaarde = bedrag(value, "aanschafwaarde")?;
@@ -501,81 +527,204 @@ fn vastactief_gewijzigd(
     if changed.is_empty() && !recalc {
         return Err("Er is niets gewijzigd: geef aan wat er anders moet".into());
     }
-    let mut lines = vec![line("Vast activum", &before.omschrijving)];
+    let mut lines = vec![line("Vast actief", &before.omschrijving)];
     lines.extend(changed);
     lines.extend(activum.warning());
-    lines.push(line(
-        "Afschrijfschema",
-        if recalc {
-            "wordt opnieuw opgemaakt met deze gegevens"
-        } else {
-            "blijft zoals het is (schema_opnieuw staat uit)"
-        },
-    ));
+    match (recalc, schema) {
+        (true, Some(schema)) => {
+            lines.push(line("Afschrijfschema nu", schema.beschrijving()));
+            lines.push(line(
+                "Afschrijfschema",
+                "wordt helemaal opnieuw opgemaakt met deze gegevens. Wat er met al geboekte of met de hand aangepaste regels gebeurt, bepaalt e-Boekhouden; EB MCP kan dat niet vooraf laten zien.",
+            ));
+        }
+        (true, None) => {
+            return Err("EB MCP kon het huidige afschrijfschema niet lezen; zonder dat wordt het niet opnieuw opgemaakt".into());
+        }
+        (false, _) => lines.push(line(
+            "Afschrijfschema",
+            "blijft zoals het is (schema_opnieuw staat uit)",
+        )),
+    }
     let id = now.get("id").and_then(Value::as_u64).unwrap_or(args.id);
     Ok(Built {
         body: activum.body(Some(id)),
-        title: format!("Vast activum wijzigen: {}", before.omschrijving),
+        title: format!("Vast actief wijzigen: {}", before.omschrijving),
         lines,
     })
 }
 
+/// The afschrijfschema of one asset: its rows as read, and how many e-Boekhouden says there are.
+#[derive(Clone, Debug, PartialEq)]
+struct Schema {
+    aantal: u64,
+    rows: Vec<Value>,
+}
+
+impl Schema {
+    fn geboekt(&self) -> Vec<u64> {
+        self.rows
+            .iter()
+            .filter_map(|row| row.get("mutatieNr").and_then(read_u64))
+            .filter(|nr| *nr > 0)
+            .collect()
+    }
+
+    /// "12 regels, waarvan 2 al geboekt als mutatie 4012, 4388", saying so when not every row could be read.
+    fn beschrijving(&self) -> String {
+        let booked = self.geboekt();
+        let mut text = if booked.is_empty() {
+            format!("{} regels, nog geen geboekt", self.aantal)
+        } else {
+            format!(
+                "{} regels, waarvan {} al geboekt als mutatie {}",
+                self.aantal,
+                booked.len(),
+                booked
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        if (self.rows.len() as u64) < self.aantal {
+            text.push_str(&format!(
+                " (EB MCP las de eerste {} regels)",
+                self.rows.len()
+            ));
+        }
+        text
+    }
+
+    /// The rows with a date up to `vandaag` that were not carried out yet: date and amount. A row whose date or
+    /// amount cannot be read is refused, not skipped.
+    fn klaar(&self, vandaag: Date) -> Result<Vec<(Date, f64)>, String> {
+        let mut due = Vec::new();
+        for row in &self.rows {
+            let uitgevoerd = match row.get("datumUitgevoerd") {
+                None | Some(Value::Null) => false,
+                Some(Value::String(s)) => !s.trim().is_empty(),
+                Some(_) => true,
+            };
+            if uitgevoerd {
+                continue;
+            }
+            let datum = row
+                .get("datum")
+                .and_then(date_of)
+                .ok_or_else(|| onleesbaar("een regel van het afschrijfschema", "datum"))?;
+            if datum > vandaag {
+                continue;
+            }
+            let bedrag = row
+                .get("bedrag")
+                .and_then(read_f64)
+                .ok_or_else(|| onleesbaar("een regel van het afschrijfschema", "bedrag"))?;
+            due.push((datum, bedrag));
+        }
+        Ok(due)
+    }
+}
+
 /// The approval for deleting an asset: what it is, and how much of its schedule was booked already.
-fn vastactief_weg(now: &Value, schema: &[Value], ctx: &ActivaContext) -> Result<Built, String> {
+fn vastactief_weg(now: &Value, schema: &Schema, ctx: &ActivaContext) -> Result<Built, String> {
     let activum = Activum::from_api(now)?;
     let mut lines: Vec<approvals::Line> = activum
         .fields(ctx)
         .into_iter()
         .map(|(label, value)| line(label, value))
         .collect();
-    let booked: Vec<String> = schema
-        .iter()
-        .filter_map(|row| row.get("mutatieNr").and_then(Value::as_u64))
-        .filter(|nr| *nr > 0)
-        .map(|nr| nr.to_string())
-        .collect();
-    lines.push(line(
-        "Afschrijfschema",
-        if booked.is_empty() {
-            format!("{} regels, nog geen geboekt", schema.len())
-        } else {
-            format!(
-                "{} regels, waarvan {} al geboekt als mutatie {}",
-                schema.len(),
-                booked.len(),
-                booked.join(", ")
-            )
-        },
-    ));
+    lines.push(line("Afschrijfschema", schema.beschrijving()));
     lines.push(line(
         "Gevolg",
-        "het vaste activum verdwijnt uit e-Boekhouden; dit is niet terug te draaien",
+        "het vaste actief verdwijnt uit e-Boekhouden; dit is niet terug te draaien",
     ));
     Ok(Built {
         body: Value::Null,
-        title: format!("Vast activum verwijderen: {}", activum.omschrijving),
+        title: format!("Vast actief verwijderen: {}", activum.omschrijving),
         lines,
     })
 }
 
-fn afschrijvingen_boeken_built(due: u64) -> Result<Built, String> {
+/// How many assets and dates the approval for booking lists before it sums up the rest.
+const TOON_ACTIVA: usize = 20;
+const TOON_DATUMS: usize = 6;
+
+/// The approval for booking the due depreciations: per asset its due lines (date and amount) and the total, as
+/// read from each schedule (a date up to today, not carried out yet), next to e-Boekhouden's own count.
+fn afschrijvingen_boeken_built(
+    due: u64,
+    per_activum: &[(String, Vec<(Date, f64)>)],
+) -> Result<Built, String> {
     if due == 0 {
         return Err("Er staan geen afschrijvingen klaar om te boeken".into());
     }
+    let with_lines: Vec<&(String, Vec<(Date, f64)>)> =
+        per_activum.iter().filter(|(_, d)| !d.is_empty()).collect();
+    let mut lines = vec![line(
+        "Klaar volgens e-Boekhouden",
+        format!("{due} afschrijvingen"),
+    )];
+    for (naam, regels) in with_lines.iter().take(TOON_ACTIVA) {
+        let mut parts: Vec<String> = regels
+            .iter()
+            .take(TOON_DATUMS)
+            .map(|(datum, bedrag)| format!("{}: {}", dutch(*datum), write::euro(*bedrag)))
+            .collect();
+        if regels.len() > TOON_DATUMS {
+            parts.push(format!("en nog {} regels", regels.len() - TOON_DATUMS));
+        }
+        let som: f64 = regels.iter().map(|(_, b)| b).sum();
+        lines.push(line(
+            naam,
+            format!("{} (samen {})", parts.join("; "), write::euro(som)),
+        ));
+    }
+    if with_lines.len() > TOON_ACTIVA {
+        let rest = &with_lines[TOON_ACTIVA..];
+        let count: usize = rest.iter().map(|(_, r)| r.len()).sum();
+        let som: f64 = rest
+            .iter()
+            .flat_map(|(_, r)| r.iter().map(|(_, b)| b))
+            .sum();
+        lines.push(line(
+            "Nog meer vaste activa",
+            format!(
+                "{} vaste activa met {count} afschrijvingen, samen {}",
+                rest.len(),
+                write::euro(som)
+            ),
+        ));
+    }
+    let found: usize = with_lines.iter().map(|(_, r)| r.len()).sum();
+    let totaal: f64 = with_lines
+        .iter()
+        .flat_map(|(_, r)| r.iter().map(|(_, b)| b))
+        .sum();
+    lines.push(line(
+        "Totaal",
+        format!("{found} afschrijvingen, samen {}", write::euro(totaal)),
+    ));
+    if found as u64 != due {
+        lines.push(line(
+            "Let op",
+            format!(
+                "EB MCP vond in de afschrijfschema's {found} regels met een datum tot en met vandaag die nog niet geboekt zijn; e-Boekhouden telt er {due} en boekt zijn eigen telling"
+            ),
+        ));
+    }
+    lines.push(line(
+        "Gevolg",
+        "e-Boekhouden boekt alle afschrijvingen die klaarstaan, van alle vaste activa, in één keer als mutatie",
+    ));
+    lines.push(line(
+        "Terugdraaien",
+        "kan alleen door elke geboekte mutatie apart te verwijderen",
+    ));
     Ok(Built {
         body: Value::Null,
         title: format!("{due} afschrijvingen boeken"),
-        lines: vec![
-            line("Klaar om te boeken", format!("{due} afschrijvingen")),
-            line(
-                "Gevolg",
-                "e-Boekhouden boekt alle afschrijvingen die klaarstaan, van alle vaste activa, in één keer als mutatie. Bekijk ze eerst met vaste_activa en afschrijvingsschema.",
-            ),
-            line(
-                "Terugdraaien",
-                "kan alleen door elke geboekte mutatie apart te verwijderen",
-            ),
-        ],
+        lines,
     })
 }
 
@@ -602,9 +751,40 @@ impl EbMcp {
             .fetch(run, &format!("vasteactiva/{id}"), Vec::new())
             .await?;
         if now.is_null() {
-            return Err(format!("Er is geen vast activum met id {id}"));
+            return Err(format!("Er is geen vast actief met id {id}"));
         }
         Ok(now)
+    }
+
+    /// The afschrijfschema of one asset, every row of it.
+    async fn schema_lezen(&self, run: &Run, id: u64) -> Result<Schema, String> {
+        let (aantal, rows) = self
+            .alle_rijen(run, &format!("vasteactivamutatie/gridtable/{id}"))
+            .await?;
+        Ok(Schema { aantal, rows })
+    }
+
+    /// Per asset its omschrijving and the schedule rows that are due by date and not carried out yet.
+    async fn klaarstaand(&self, run: &Run) -> Result<Vec<(String, Vec<(Date, f64)>)>, String> {
+        let (_, activa) = self.alle_rijen(run, "vasteactiva/gridtable").await?;
+        let vandaag = today();
+        let mut per_activum = Vec::new();
+        for row in activa {
+            let id = row
+                .get("id")
+                .and_then(read_u64)
+                .ok_or_else(|| onleesbaar("de lijst met vaste activa", "id"))?;
+            let naam = row
+                .get("omschrijving")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Vast actief {id}"));
+            let due = self.schema_lezen(run, id).await?.klaar(vandaag)?;
+            per_activum.push((naam, due));
+        }
+        Ok(per_activum)
     }
 
     /// The number of depreciations that are due, as the list shows it next to "Afschrijvingen boeken".
@@ -622,7 +802,7 @@ impl EbMcp {
 #[tool_router(router = vaste_activa_router, vis = "pub(super)")]
 impl EbMcp {
     #[tool(
-        description = "De vaste activa (bedrijfsmiddelen die worden afgeschreven). Per activum: id, naam (groep), omschrijving, datum (aanschaf), aanschafWaarde, afgeschreven, afTeSchrijven en huidigeWaarde. afschrijvingen_te_boeken zegt hoeveel afschrijvingen klaarstaan om te boeken (afschrijvingen_boeken).",
+        description = "De vaste activa (bedrijfsmiddelen die worden afgeschreven). Per actief: id, naam (groep), omschrijving, datum (aanschaf), aanschafWaarde, afgeschreven, afTeSchrijven en huidigeWaarde. afschrijvingen_te_boeken zegt hoeveel afschrijvingen klaarstaan om te boeken (afschrijvingen_boeken).",
         annotations(title = "Vaste activa", read_only_hint = true)
     )]
     async fn vaste_activa(
@@ -652,8 +832,8 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Eén vast activum, op id (uit vaste_activa): groep, omschrijving, aanschafdatum, aanschafwaarde, restwaarde, aantal jaren, boeken per jaar of maand, de rekening activa en de rekening afschrijvingen met code en naam, en de geavanceerde start van het afschrijven. Het schema geeft afschrijvingsschema.",
-        annotations(title = "Vast activum", read_only_hint = true)
+        description = "Eén vast actief, op id (uit vaste_activa): groep, omschrijving, aanschafdatum, aanschafwaarde, restwaarde, aantal jaren, boeken per jaar of maand, de rekening activa en de rekening afschrijvingen met code en naam, en de geavanceerde start van het afschrijven. Het schema geeft afschrijvingsschema.",
+        annotations(title = "Vast actief", read_only_hint = true)
     )]
     async fn vastactief(
         &self,
@@ -670,7 +850,7 @@ impl EbMcp {
             let ctx = self.activa_context(&run).await?;
             let id = |key: &str| now.get(key).and_then(Value::as_u64).unwrap_or(0);
             Ok(json!({
-                "vast_activum": now,
+                "vast_actief": now,
                 "groep": ctx.groep_naam(id("vasteActivaGroepId")),
                 "rekening_activa": rekening_naam(&ctx.balans, id("grootboekrekeningBal")),
                 "rekening_afschrijvingen": rekening_naam(&ctx.kosten, id("grootboekrekeningVw")),
@@ -681,7 +861,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "De vaste-activagroepen: per groep id, naam, aantalJaren en de standaard rekening activa (grootboekrekeningActivaId) en rekening afschrijvingen (grootboekrekeningAfschrijvingId). Een nieuw vast activum hoort in een groep en neemt die waarden over.",
+        description = "De vaste-activagroepen: per groep id, naam, aantalJaren en de standaard rekening activa (grootboekrekeningActivaId) en rekening afschrijvingen (grootboekrekeningAfschrijvingId). Een nieuw vast actief hoort in een groep en neemt die waarden over.",
         annotations(title = "Vaste-activagroepen", read_only_hint = true)
     )]
     async fn vaste_activa_groepen(
@@ -701,7 +881,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Het afschrijfschema van één vast activum, op id (uit vaste_activa): per regel datum, omschrijving, bedrag, datumUitgevoerd (wanneer geboekt) en mutatieNr (de mutatie van de boeking, leeg zolang die niet geboekt is).",
+        description = "Het afschrijfschema van één vast actief, op id (uit vaste_activa): per regel datum, omschrijving, bedrag, datumUitgevoerd (wanneer geboekt) en mutatieNr (de mutatie van de boeking, leeg zolang die niet geboekt is).",
         annotations(title = "Afschrijvingsschema", read_only_hint = true)
     )]
     async fn afschrijvingsschema(
@@ -728,9 +908,9 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een vast activum aanmaken, zoals Vaste activa toevoegen in e-Boekhouden. Nodig: omschrijving, aanschafdatum, aanschafwaarde en restwaarde; groep_id als er meer dan één groep is (vaste_activa_groepen). Aantal jaren en de twee rekeningen komen standaard van de groep. e-Boekhouden maakt er een afschrijfschema bij; de aanschaf zelf wordt hiermee niet geboekt en de afschrijvingen pas met afschrijvingen_boeken. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een vast actief aanmaken, zoals Vaste activa toevoegen in e-Boekhouden. Nodig: omschrijving, aanschafdatum, aanschafwaarde en restwaarde; groep_id als er meer dan één groep is (vaste_activa_groepen). Aantal jaren en de twee rekeningen komen standaard van de groep. e-Boekhouden maakt er een afschrijfschema bij; de aanschaf zelf wordt hiermee niet geboekt en de afschrijvingen pas met afschrijvingen_boeken. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
-            title = "Vast activum toevoegen",
+            title = "Vast actief toevoegen",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = false
@@ -748,7 +928,7 @@ impl EbMcp {
             TOOL,
             account.as_deref(),
             args,
-            "Vast activum toegevoegd; data.id is het id",
+            "Vast actief toegevoegd; data.id is het id",
             move |this, run, args| async move {
                 let ctx = this.activa_context(&run).await?;
                 let built = vastactief_nieuw(&args, &ctx)?;
@@ -761,9 +941,9 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een vast activum wijzigen, op id (uit vaste_activa). Wat je niet noemt blijft zoals het is. Het afschrijfschema blijft staan, tenzij schema_opnieuw true is: dan maakt e-Boekhouden het opnieuw op met de nieuwe gegevens, zoals het vinkje Afschrijfschema opnieuw opmaken. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een vast actief wijzigen, op id (uit vaste_activa). Wat je niet noemt blijft zoals het is. Het afschrijfschema blijft staan, tenzij schema_opnieuw true is: dan maakt e-Boekhouden het opnieuw op met de nieuwe gegevens, zoals het vinkje Afschrijfschema opnieuw opmaken. Dat vervangt het hele schema, ook regels die al geboekt of met de hand aangepast zijn, en vraagt daarom altijd het akkoord van de gebruiker; de goedkeuring toont het huidige schema. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
-            title = "Vast activum wijzigen",
+            title = "Vast actief wijzigen",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = false
@@ -781,13 +961,19 @@ impl EbMcp {
             TOOL,
             account.as_deref(),
             args,
-            "Vast activum gewijzigd",
+            "Vast actief gewijzigd",
             move |this, run, args| async move {
                 let now = this.vastactief_lezen(&run, args.id).await?;
                 let ctx = this.activa_context(&run).await?;
-                let built = vastactief_gewijzigd(&args, &now, &ctx)?;
-                this.approve(&run, TOOL, &built, false).await?;
                 let recalc = args.schema_opnieuw.unwrap_or(false);
+                // A new schedule replaces the old one, booked lines and all: it always asks, and shows the schedule.
+                let schema = if recalc {
+                    Some(this.schema_lezen(&run, args.id).await?)
+                } else {
+                    None
+                };
+                let built = vastactief_gewijzigd(&args, &now, &ctx, schema.as_ref())?;
+                this.approve(&run, TOOL, &built, recalc).await?;
                 this.change_query_done(
                     &run,
                     "PUT",
@@ -802,9 +988,9 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een vast activum verwijderen, op id (uit vaste_activa). De goedkeuring laat zien hoeveel van het afschrijfschema al geboekt is. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een vast actief verwijderen, op id (uit vaste_activa). De goedkeuring laat zien hoeveel van het afschrijfschema al geboekt is. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
-            title = "Vast activum verwijderen",
+            title = "Vast actief verwijderen",
             read_only_hint = false,
             destructive_hint = true,
             idempotent_hint = false
@@ -822,18 +1008,11 @@ impl EbMcp {
             TOOL,
             account.as_deref(),
             args,
-            "Vast activum verwijderd",
+            "Vast actief verwijderd",
             move |this, run, args| async move {
                 let now = this.vastactief_lezen(&run, args.id).await?;
                 let ctx = this.activa_context(&run).await?;
-                let schema = rows_of(
-                    this.fetch(
-                        &run,
-                        &format!("vasteactivamutatie/gridtable/{}", args.id),
-                        grid(Some(MAX_ROWS), None)?,
-                    )
-                    .await?,
-                );
+                let schema = this.schema_lezen(&run, args.id).await?;
                 let built = vastactief_weg(&now, &schema, &ctx)?;
                 this.approve(&run, TOOL, &built, true).await?;
                 this.change_done(&run, "DELETE", &format!("vasteactiva/{}", args.id), None)
@@ -844,7 +1023,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Alle afschrijvingen boeken die klaarstaan, zoals Afschrijvingen boeken in e-Boekhouden: elke klaarstaande afschrijving van elk vast activum wordt in één keer als mutatie geboekt. Eén activum kiezen kan niet; vaste_activa zegt hoeveel er klaarstaan. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Alle afschrijvingen boeken die klaarstaan, zoals Afschrijvingen boeken in e-Boekhouden: elke klaarstaande afschrijving van elk vast actief wordt in één keer als mutatie geboekt. Eén vast actief kiezen kan niet; vaste_activa zegt hoeveel er klaarstaan. De goedkeuring toont per vast actief de regels uit het afschrijfschema met een datum tot en met vandaag die nog niet geboekt zijn, met datum, bedrag en totaal. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Afschrijvingen boeken",
             read_only_hint = false,
@@ -867,7 +1046,13 @@ impl EbMcp {
             "Afschrijvingen geboekt",
             move |this, run, _args| async move {
                 let due = this.afschrijvingen_klaar(&run).await?;
-                let built = afschrijvingen_boeken_built(due)?;
+                if due == 0 {
+                    return Err(Halt::Error(
+                        "Er staan geen afschrijvingen klaar om te boeken".into(),
+                    ));
+                }
+                let per_activum = this.klaarstaand(&run).await?;
+                let built = afschrijvingen_boeken_built(due, &per_activum)?;
                 this.approve(&run, TOOL, &built, true).await?;
                 this.change(&run, "POST", "vasteactiva/boeken", None).await
             },
@@ -931,7 +1116,7 @@ mod tests {
                    "aanschafwaarde": 2499.0, "restwaarde": 0.0, "aantalJaren": 3, "boekenPer": "J",
                    "grootboekrekeningBal": 130, "grootboekrekeningVw": 470, "geavanceerd": false})
         );
-        assert_eq!(built.title, "Vast activum toevoegen: MacBook Pro");
+        assert_eq!(built.title, "Vast actief toevoegen: MacBook Pro");
         let lines = label_values(&built);
         assert!(lines.contains(&("Groep".into(), "Computers".into())));
         assert!(lines.contains(&("Aanschafdatum".into(), "15-03-2026".into())));
@@ -1072,11 +1257,21 @@ mod tests {
         }
     }
 
+    fn schema() -> Schema {
+        Schema {
+            aantal: 2,
+            rows: vec![
+                json!({"datum": "2026-12-31T00:00:00", "bedrag": 833, "mutatieNr": 4012, "datumUitgevoerd": "2026-12-31T00:00:00"}),
+                json!({"datum": "2027-12-31T00:00:00", "bedrag": 833, "mutatieNr": null, "datumUitgevoerd": null}),
+            ],
+        }
+    }
+
     #[test]
     fn an_edit_sends_the_whole_asset_back_with_only_the_named_change() {
         let mut args = wijzigen();
         args.restwaarde = Some(250.0);
-        let built = vastactief_gewijzigd(&args, &now(), &ctx()).unwrap();
+        let built = vastactief_gewijzigd(&args, &now(), &ctx(), None).unwrap();
         assert_eq!(
             built.body,
             json!({"id": 12, "vasteActivaGroepId": 3, "omschrijving": "MacBook Pro", "aanschafDatum": {"day": 15, "month": 3, "year": 2026},
@@ -1084,7 +1279,7 @@ mod tests {
                    "grootboekrekeningBal": 130, "grootboekrekeningVw": 470, "geavanceerd": false})
         );
         let lines = label_values(&built);
-        assert_eq!(lines[0], ("Vast activum".into(), "MacBook Pro".into()));
+        assert_eq!(lines[0], ("Vast actief".into(), "MacBook Pro".into()));
         assert!(lines.contains(&("Restwaarde was".into(), "0,00".into())));
         assert!(lines.contains(&("Restwaarde wordt".into(), "250,00".into())));
         assert!(
@@ -1095,53 +1290,154 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_sends_back_what_it_read_monthly_and_advanced_included() {
+        let mut now = now();
+        now["boekenPer"] = json!("M");
+        now["geavanceerd"] = json!(1);
+        now["restwaarde"] = json!("100.50");
+        now["afschrijvenStartenPer"] = json!({"day": 1, "month": 7, "year": 2026});
+        now["boekwaardePerStart"] = json!(2000);
+        let mut args = wijzigen();
+        args.omschrijving = Some("MacBook Pro 16".into());
+        let built = vastactief_gewijzigd(&args, &now, &ctx(), None).unwrap();
+        assert_eq!(built.body["boekenPer"], "M");
+        assert_eq!(built.body["geavanceerd"], true);
+        assert_eq!(built.body["restwaarde"], json!(100.5));
+        assert_eq!(
+            built.body["afschrijvenStartenPer"],
+            json!({"day": 1, "month": 7, "year": 2026})
+        );
+        assert_eq!(built.body["boekwaardePerStart"], json!(2000.0));
+    }
+
+    #[test]
+    fn an_asset_with_a_value_it_cannot_read_is_not_edited() {
+        for (key, value) in [
+            ("restwaarde", Value::Null),
+            ("restwaarde", json!("nul")),
+            ("boekenPer", Value::Null),
+            ("boekenPer", json!("K")),
+            ("geavanceerd", Value::Null),
+            ("geavanceerd", json!(2)),
+            ("grootboekrekeningBal", Value::Null),
+            ("vasteActivaGroepId", json!("x")),
+            ("afschrijvenStartenPer", json!("later")),
+            ("boekwaardePerStart", json!("veel")),
+            ("aanschafwaarde", json!(true)),
+        ] {
+            let mut read = now();
+            read[key] = value.clone();
+            let error = Activum::from_api(&read).unwrap_err();
+            assert!(
+                error.contains(key) && error.contains("onbekende vorm"),
+                "{key} {value}: {error}"
+            );
+            let mut args = wijzigen();
+            args.omschrijving = Some("nieuw".into());
+            assert!(vastactief_gewijzigd(&args, &read, &ctx(), None).is_err());
+        }
+    }
+
+    #[test]
     fn a_new_group_brings_its_years_and_rekeningen_unless_named() {
         let mut args = wijzigen();
         args.groep_id = Some(4);
         args.afschrijven_in_jaren = Some(10);
         args.schema_opnieuw = Some(true);
-        let built = vastactief_gewijzigd(&args, &now(), &ctx()).unwrap();
+        let built = vastactief_gewijzigd(&args, &now(), &ctx(), Some(&schema())).unwrap();
         assert_eq!(built.body["vasteActivaGroepId"], 4);
         assert_eq!(built.body["aantalJaren"], 10);
         assert_eq!(built.body["grootboekrekeningBal"], 131);
         assert_eq!(built.body["grootboekrekeningVw"], 471);
         let lines = label_values(&built);
         assert!(lines.contains(&("Groep wordt".into(), "Inventaris".into())));
+        assert!(lines.contains(&(
+            "Afschrijfschema nu".into(),
+            "2 regels, waarvan 1 al geboekt als mutatie 4012".into()
+        )));
         assert!(
             lines
                 .iter()
-                .any(|(l, v)| l == "Afschrijfschema" && v.contains("opnieuw opgemaakt"))
+                .any(|(l, v)| l == "Afschrijfschema" && v.contains("helemaal opnieuw opgemaakt"))
+        );
+        // Without the current schedule there is no new one.
+        assert!(
+            vastactief_gewijzigd(&args, &now(), &ctx(), None)
+                .unwrap_err()
+                .contains("afschrijfschema")
+        );
+    }
+
+    #[test]
+    fn a_group_without_accounts_needs_them_named() {
+        let ctx = ActivaContext {
+            groepen: groepen(&json!([
+                {"id": 3, "naam": "Computers", "aantalJaren": 3, "grootboekrekeningActivaId": 130, "grootboekrekeningAfschrijvingId": 470},
+                {"id": 5, "naam": "Leeg", "aantalJaren": null, "grootboekrekeningActivaId": 0, "grootboekrekeningAfschrijvingId": null}
+            ])),
+            ..ctx()
+        };
+        let mut args = wijzigen();
+        args.groep_id = Some(5);
+        let error = vastactief_gewijzigd(&args, &now(), &ctx, None).unwrap_err();
+        assert!(error.contains("afschrijven_in_jaren"), "{error}");
+        args.afschrijven_in_jaren = Some(4);
+        let error = vastactief_gewijzigd(&args, &now(), &ctx, None).unwrap_err();
+        assert!(error.contains("rekening_activa"), "{error}");
+        args.rekening_activa = Some("0140".into());
+        let error = vastactief_gewijzigd(&args, &now(), &ctx, None).unwrap_err();
+        assert!(error.contains("rekening_afschrijvingen"), "{error}");
+        args.rekening_afschrijvingen = Some("4710".into());
+        let built = vastactief_gewijzigd(&args, &now(), &ctx, None).unwrap();
+        assert_eq!(built.body["vasteActivaGroepId"], 5);
+        assert_eq!(built.body["grootboekrekeningBal"], 131);
+        assert_eq!(built.body["grootboekrekeningVw"], 471);
+    }
+
+    #[test]
+    fn a_purchase_date_before_1900_is_refused() {
+        let mut args = toevoegen();
+        args.aanschafdatum = "1899-12-31".into();
+        assert!(
+            vastactief_nieuw(&args, &ctx())
+                .unwrap_err()
+                .contains("01-01-1900")
+        );
+        args.aanschafdatum = "1900-01-01".into();
+        assert!(vastactief_nieuw(&args, &ctx()).is_ok());
+        let mut args = wijzigen();
+        args.aanschafdatum = Some("0999-01-01".into());
+        assert!(
+            vastactief_gewijzigd(&args, &now(), &ctx(), None)
+                .unwrap_err()
+                .contains("01-01-1900")
         );
     }
 
     #[test]
     fn an_edit_refuses_nothing_to_do_but_allows_a_new_schedule_alone() {
         assert!(
-            vastactief_gewijzigd(&wijzigen(), &now(), &ctx())
+            vastactief_gewijzigd(&wijzigen(), &now(), &ctx(), None)
                 .unwrap_err()
                 .contains("niets gewijzigd")
         );
         let mut args = wijzigen();
         args.schema_opnieuw = Some(true);
-        assert!(vastactief_gewijzigd(&args, &now(), &ctx()).is_ok());
+        assert!(vastactief_gewijzigd(&args, &now(), &ctx(), Some(&schema())).is_ok());
         let mut args = wijzigen();
         args.aanschafwaarde = Some(-1.0);
         assert!(
-            vastactief_gewijzigd(&args, &now(), &ctx())
+            vastactief_gewijzigd(&args, &now(), &ctx(), None)
                 .unwrap_err()
                 .contains("restwaarde")
         );
-        assert!(vastactief_gewijzigd(&wijzigen(), &json!({"id": 12}), &ctx()).is_err());
+        assert!(vastactief_gewijzigd(&wijzigen(), &json!({"id": 12}), &ctx(), None).is_err());
     }
 
     #[test]
-    fn deleting_says_how_much_was_booked_and_booking_says_how_many() {
-        let schema = vec![
-            json!({"datum": "2026-12-31T00:00:00", "bedrag": 833, "mutatieNr": 4012}),
-            json!({"datum": "2027-12-31T00:00:00", "bedrag": 833, "mutatieNr": null}),
-        ];
-        let built = vastactief_weg(&now(), &schema, &ctx()).unwrap();
-        assert_eq!(built.title, "Vast activum verwijderen: MacBook Pro");
+    fn deleting_says_how_much_was_booked_by_e_boekhoudens_count() {
+        let built = vastactief_weg(&now(), &schema(), &ctx()).unwrap();
+        assert_eq!(built.title, "Vast actief verwijderen: MacBook Pro");
         let lines = label_values(&built);
         assert!(lines.contains(&(
             "Afschrijfschema".into(),
@@ -1152,19 +1448,108 @@ mod tests {
                 .iter()
                 .any(|(l, v)| l == "Gevolg" && v.contains("niet terug te draaien"))
         );
-        let built = vastactief_weg(&now(), &[], &ctx()).unwrap();
+        let empty = Schema {
+            aantal: 0,
+            rows: vec![],
+        };
+        let built = vastactief_weg(&now(), &empty, &ctx()).unwrap();
         assert!(label_values(&built).contains(&(
             "Afschrijfschema".into(),
             "0 regels, nog geen geboekt".into()
         )));
+        // More rows than were read: the count is e-Boekhouden's, and it says so.
+        let big = Schema {
+            aantal: 250,
+            ..schema()
+        };
+        assert_eq!(
+            big.beschrijving(),
+            "250 regels, waarvan 1 al geboekt als mutatie 4012 (EB MCP las de eerste 2 regels)"
+        );
+    }
 
-        let built = afschrijvingen_boeken_built(4).unwrap();
-        assert_eq!(built.title, "4 afschrijvingen boeken");
+    #[test]
+    fn finds_the_due_lines_of_a_schedule() {
+        let schema = Schema {
+            aantal: 4,
+            rows: vec![
+                json!({"datum": "2025-12-31T00:00:00", "bedrag": 833, "datumUitgevoerd": "2025-12-31T00:00:00", "mutatieNr": 4012}),
+                json!({"datum": "2026-06-30T00:00:00", "bedrag": "416.50", "datumUitgevoerd": null}),
+                json!({"datum": {"day": 12, "month": 11, "year": 2026}, "bedrag": 10, "datumUitgevoerd": ""}),
+                json!({"datum": "2026-12-31T00:00:00", "bedrag": 833, "datumUitgevoerd": null}),
+            ],
+        };
+        assert_eq!(
+            schema.klaar((2026, 11, 12)).unwrap(),
+            vec![((2026, 6, 30), 416.5), ((2026, 11, 12), 10.0)]
+        );
+        let broken = Schema {
+            aantal: 1,
+            rows: vec![
+                json!({"datum": "2026-06-30T00:00:00", "bedrag": "veel", "datumUitgevoerd": null}),
+            ],
+        };
+        assert!(broken.klaar((2026, 11, 12)).unwrap_err().contains("bedrag"));
+    }
+
+    #[test]
+    fn booking_lists_per_asset_the_due_lines_and_the_total() {
+        let per_activum = vec![
+            (
+                "MacBook Pro".to_owned(),
+                vec![((2026, 6, 30), 416.5), ((2026, 11, 12), 10.0)],
+            ),
+            ("Bureau".to_owned(), vec![]),
+            ("Bus".to_owned(), vec![((2026, 1, 31), 300.0)]),
+        ];
+        let built = afschrijvingen_boeken_built(3, &per_activum).unwrap();
+        assert_eq!(built.title, "3 afschrijvingen boeken");
         assert_eq!(built.body, Value::Null);
+        let lines = label_values(&built);
+        assert!(lines.contains(&(
+            "MacBook Pro".into(),
+            "30-06-2026: 416,50; 12-11-2026: 10,00 (samen 426,50)".into()
+        )));
+        assert!(lines.contains(&("Bus".into(), "31-01-2026: 300,00 (samen 300,00)".into())));
+        assert!(!lines.iter().any(|(l, _)| l == "Bureau"));
+        assert!(lines.contains(&("Totaal".into(), "3 afschrijvingen, samen 726,50".into())));
+        assert!(!lines.iter().any(|(l, _)| l == "Let op"));
+        // e-Boekhouden counts otherwise: said, not hidden.
+        let built = afschrijvingen_boeken_built(5, &per_activum).unwrap();
         assert!(
-            afschrijvingen_boeken_built(0)
+            label_values(&built)
+                .iter()
+                .any(|(l, v)| l == "Let op" && v.contains("telt er 5"))
+        );
+        assert!(
+            afschrijvingen_boeken_built(0, &per_activum)
                 .unwrap_err()
                 .contains("geen afschrijvingen")
         );
+    }
+
+    #[test]
+    fn a_long_booking_list_is_cut_and_says_how_much_more() {
+        let many: Vec<(String, Vec<(Date, f64)>)> = (0..25)
+            .map(|i| {
+                (
+                    format!("Activum {i}"),
+                    (1..=8).map(|m| ((2026, m, 1), 1.0)).collect(),
+                )
+            })
+            .collect();
+        let built = afschrijvingen_boeken_built(200, &many).unwrap();
+        let lines = label_values(&built);
+        let first = &lines.iter().find(|(l, _)| l == "Activum 0").unwrap().1;
+        assert!(
+            first.contains("en nog 2 regels") && first.contains("samen 8,00"),
+            "{first}"
+        );
+        assert!(!lines.iter().any(|(l, _)| l == "Activum 20"));
+        assert!(lines.contains(&(
+            "Nog meer vaste activa".into(),
+            "5 vaste activa met 40 afschrijvingen, samen 40,00".into()
+        )));
+        assert!(lines.contains(&("Totaal".into(), "200 afschrijvingen, samen 200,00".into())));
     }
 }

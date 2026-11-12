@@ -78,6 +78,29 @@ impl EbMcp {
         Ok(keuzes(&list))
     }
 
+    /// Every row of a grid, page by page (at most ten pages of 200), with e-Boekhouden's own count of them
+    /// (`rowCount`, or the rows read when it gives none).
+    async fn alle_rijen(&self, run: &Run, path: &str) -> Result<(u64, Vec<Value>), String> {
+        const PAGES: u32 = 10;
+        let mut rows: Vec<Value> = Vec::new();
+        let mut total = None;
+        for page in 0..PAGES {
+            let grid = self
+                .fetch(run, path, grid(Some(MAX_ROWS), Some(page * MAX_ROWS))?)
+                .await?;
+            if total.is_none() {
+                total = grid.get("rowCount").and_then(read_u64);
+            }
+            let found = rows_of(grid);
+            let short = found.len() < MAX_ROWS as usize;
+            rows.extend(found);
+            if short || total.is_some_and(|t| rows.len() as u64 >= t) {
+                break;
+            }
+        }
+        Ok((total.unwrap_or(rows.len() as u64), rows))
+    }
+
     /// The grootboekrekeningen of the categories `categorieen` (e-Boekhouden's codes, such as VW, BAL, BTWRC), the
     /// way the screens search them with an empty search term.
     async fn rekeningen_van(&self, run: &Run, categorieen: &str) -> Result<Vec<Keuze>, String> {
@@ -156,16 +179,26 @@ fn rekening_naam(list: &[Keuze], id: u64) -> String {
         .unwrap_or_else(|| format!("rekening met id {id}"))
 }
 
-/// A btw code as `btwinfo/all` gives it.
+/// A btw code as `btwinfo/info` gives it.
 #[derive(Clone, Debug, PartialEq)]
 struct BtwCode {
     code: String,
     naam: String,
     /// "INK", "VERK" or "" (Geen btw).
     soort: String,
+    /// `simpleExtended == "S"`: one of the plain codes, offered also when the extended codes are off.
+    eenvoudig: bool,
+    begin: Option<Date>,
+    eind: Option<Date>,
 }
 
 fn btw_codes(list: &Value) -> Vec<BtwCode> {
+    let text = |c: &Value, key: &str| {
+        c.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
     list.as_array()
         .map(|codes| {
             codes
@@ -173,21 +206,78 @@ fn btw_codes(list: &Value) -> Vec<BtwCode> {
                 .filter_map(|c| {
                     Some(BtwCode {
                         code: c.get("code")?.as_str()?.to_owned(),
-                        naam: c
-                            .get("omschrijving")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        soort: c
-                            .get("soort")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
+                        naam: text(c, "omschrijving"),
+                        soort: text(c, "soort"),
+                        eenvoudig: text(c, "simpleExtended") == "S",
+                        begin: c.get("begindatum").and_then(date_of),
+                        eind: c.get("einddatum").and_then(date_of),
                     })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The btw codes a form offers on `vandaag`, as e-Boekhouden's `filterInfo(info, {date})` keeps them: not ended on
+/// or before today, not starting on or after today; and only the plain ones (`simpleExtended` S) unless the
+/// administration uses the extended codes.
+fn btw_aangeboden(codes: Vec<BtwCode>, vandaag: Date, uitgebreid: bool) -> Vec<BtwCode> {
+    codes
+        .into_iter()
+        .filter(|c| !c.eind.is_some_and(|eind| eind <= vandaag))
+        .filter(|c| !c.begin.is_some_and(|begin| begin >= vandaag))
+        .filter(|c| uitgebreid || c.eenvoudig)
+        .collect()
+}
+
+// ---------------------------------------------------------------- reading values back
+
+/// What a value that goes back to e-Boekhouden must be when it cannot be read: a refusal, never a guess.
+fn onleesbaar(wat: &str, veld: &str) -> String {
+    format!(
+        "e-Boekhouden gaf {wat} in een onbekende vorm terug ({veld} is niet te lezen); EB MCP wijzigt het daarom niet"
+    )
+}
+
+/// A whole number as JSON can carry it: a number or a numeric text.
+fn read_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+/// An amount as JSON can carry it: a number or a numeric text.
+fn read_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+        .filter(|v: &f64| v.is_finite())
+}
+
+/// A yes or no as JSON can carry it: true/false, 0/1, or those as text.
+fn read_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => match n.as_u64() {
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            _ => None,
+        },
+        Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => Some(true),
+            "false" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// An optional field: absent or null is nothing, anything else must be readable.
+fn optional<T>(value: Option<&Value>, read: impl Fn(&Value) -> Option<T>) -> Result<Option<T>, ()> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => read(v).map(Some).ok_or(()),
+    }
 }
 
 // ---------------------------------------------------------------- dates, amounts, texts
@@ -322,6 +412,34 @@ mod tests {
         assert!(kies(&found, "", "tegenrekening").is_err());
         assert_eq!(rekening_naam(&found, 45), "4550 Bankkosten");
         assert_eq!(rekening_naam(&found, 7), "rekening met id 7");
+    }
+
+    #[test]
+    fn reads_values_back_in_the_shapes_json_gives_them_and_nothing_else() {
+        assert_eq!(read_u64(&json!(5)), Some(5));
+        assert_eq!(read_u64(&json!(" 5 ")), Some(5));
+        assert_eq!(read_u64(&json!(-1)), None);
+        assert_eq!(read_f64(&json!("12.50")), Some(12.5));
+        assert_eq!(read_f64(&json!("12,50")), None);
+        assert_eq!(read_f64(&json!(true)), None);
+        for (value, want) in [
+            (json!(true), Some(true)),
+            (json!(false), Some(false)),
+            (json!(1), Some(true)),
+            (json!(0), Some(false)),
+            (json!("True"), Some(true)),
+            (json!("0"), Some(false)),
+            (json!(2), None),
+            (json!("ja"), None),
+            (Value::Null, None),
+        ] {
+            assert_eq!(read_bool(&value), want, "{value}");
+        }
+        assert_eq!(optional(None, read_u64), Ok(None));
+        assert_eq!(optional(Some(&Value::Null), read_u64), Ok(None));
+        assert_eq!(optional(Some(&json!("7")), read_u64), Ok(Some(7)));
+        assert_eq!(optional(Some(&json!("x")), read_u64), Err(()));
+        assert!(onleesbaar("dit", "veld").contains("onbekende vorm"));
     }
 
     #[test]

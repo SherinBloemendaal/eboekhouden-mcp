@@ -42,15 +42,17 @@ struct OpenPosten {
     crediteuren: Option<f64>,
 }
 
-/// An amount as the API gives it in a regel: a number, a text, or nothing (0).
-fn num(value: Option<&Value>) -> f64 {
-    value
-        .and_then(|v| {
-            v.as_f64()
-                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+/// An amount of a regel (`activa` or `passiva`): a number or a numeric text; nothing counts as 0, as the form
+/// does (`e.activa || 0`). Anything else is refused: the whole beginbalans goes back, so a guess would be sent.
+fn num(regel: &Value, key: &str) -> Result<f64, String> {
+    optional(regel.get(key), read_f64)
+        .map(|v| v.unwrap_or(0.0))
+        .map_err(|()| {
+            onleesbaar(
+                "de beginbalans",
+                &format!("{key} van rekening {}", regel_label(regel)),
+            )
         })
-        .filter(|v| v.is_finite())
-        .unwrap_or(0.0)
 }
 
 fn cents(amount: f64) -> i64 {
@@ -66,7 +68,7 @@ struct Totalen {
     crediteuren: f64,
 }
 
-fn totalen(regels: &[Value]) -> Totalen {
+fn totalen(regels: &[Value]) -> Result<Totalen, String> {
     let mut t = Totalen {
         activa: 0.0,
         passiva: 0.0,
@@ -74,7 +76,7 @@ fn totalen(regels: &[Value]) -> Totalen {
         crediteuren: 0.0,
     };
     for regel in regels {
-        let (activa, passiva) = (num(regel.get("activa")), num(regel.get("passiva")));
+        let (activa, passiva) = (num(regel, "activa")?, num(regel, "passiva")?);
         t.activa += activa;
         t.passiva += passiva;
         match regel.get("soort").and_then(Value::as_str) {
@@ -87,7 +89,7 @@ fn totalen(regels: &[Value]) -> Totalen {
     t.passiva = round2(t.passiva);
     t.debiteuren = round2(t.debiteuren);
     t.crediteuren = round2(t.crediteuren);
-    t
+    Ok(t)
 }
 
 fn regel_label(regel: &Value) -> String {
@@ -144,7 +146,7 @@ fn beginbalans_gewijzigd(
     let mut regels = before.clone();
     // As the form does: every regel goes out with both amounts, an empty one as 0.
     for regel in regels.iter_mut() {
-        let (activa, passiva) = (num(regel.get("activa")), num(regel.get("passiva")));
+        let (activa, passiva) = (num(regel, "activa")?, num(regel, "passiva")?);
         let regel = regel.as_object_mut().ok_or_else(bad)?;
         regel.insert("activa".into(), json!(activa));
         regel.insert("passiva".into(), json!(passiva));
@@ -224,10 +226,11 @@ fn beginbalans_gewijzigd(
     for regel in &regels {
         let id = regel.get("gbId");
         let old = before.iter().find(|r| r.get("gbId") == id);
-        let (old_a, old_p) = old.map_or((0.0, 0.0), |r| {
-            (num(r.get("activa")), num(r.get("passiva")))
-        });
-        let (new_a, new_p) = (num(regel.get("activa")), num(regel.get("passiva")));
+        let (old_a, old_p) = match old {
+            Some(r) => (num(r, "activa")?, num(r, "passiva")?),
+            None => (0.0, 0.0),
+        };
+        let (new_a, new_p) = (num(regel, "activa")?, num(regel, "passiva")?);
         if cents(old_a) == cents(new_a) && cents(old_p) == cents(new_p) {
             continue;
         }
@@ -262,7 +265,7 @@ fn beginbalans_gewijzigd(
         );
     }
 
-    let (was, wordt) = (totalen(&before), totalen(&regels));
+    let (was, wordt) = (totalen(&before)?, totalen(&regels)?);
     if cents(wordt.activa) != cents(wordt.passiva) {
         return Err(format!(
             "Activa ({}) en passiva ({}) zijn dan niet gelijk; het verschil is {}. Debet en credit van de beginbalans moeten precies gelijk zijn: pas de regels zo aan dat beide kanten even groot worden",
@@ -349,7 +352,7 @@ impl EbMcp {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let t = totalen(&regels);
+            let t = totalen(&regels)?;
             Ok(json!({
                 "beginbalans": now,
                 "totaal_activa": t.activa,
@@ -661,7 +664,7 @@ mod tests {
     #[test]
     fn adds_up_the_columns_as_the_page_does() {
         let regels = now()["regels"].as_array().cloned().unwrap();
-        let t = totalen(&regels);
+        let t = totalen(&regels).unwrap();
         assert_eq!(
             t,
             Totalen {
@@ -671,8 +674,27 @@ mod tests {
                 crediteuren: 0.0
             }
         );
-        assert_eq!(num(Some(&json!("12.5"))), 12.5);
-        assert_eq!(num(Some(&Value::Null)), 0.0);
+        assert_eq!(num(&json!({"activa": "12.5"}), "activa").unwrap(), 12.5);
+        assert_eq!(num(&json!({"activa": null}), "activa").unwrap(), 0.0);
+        assert_eq!(num(&json!({}), "passiva").unwrap(), 0.0);
+        assert!(totalen(&[json!({"code": "1010", "activa": "veel"})]).is_err());
         assert!(open_posten_lines(&t, OpenPosten::default()).is_empty());
+    }
+
+    #[test]
+    fn a_line_it_cannot_read_stops_the_change() {
+        let mut now = now();
+        now["regels"][2]["passiva"] = json!("1.500,00");
+        let error = beginbalans_gewijzigd(
+            &args(None, vec![("1010", Some(1250.0), None)]),
+            &now,
+            &[],
+            open(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("onbekende vorm") && error.contains("0500 Eigen vermogen"),
+            "{error}"
+        );
     }
 }
