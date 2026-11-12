@@ -66,21 +66,28 @@ impl EbMcp {
         offerte_id: u64,
         id: u64,
     ) -> Result<(), String> {
-        let grid = named_rows(
-            self.fetch(
-                run,
-                &format!("{list}/gridtable/{offerte_id}"),
-                grid(Some(MAX_ROWS), None)?,
-            )
-            .await?,
-        );
-        if rows(&grid).iter().any(|r| id_of(r, "id") == Some(id)) {
-            Ok(())
-        } else {
-            Err(format!(
-                "Regel {id} hoort niet bij offerte {offerte_id}; kijk met offerte_voortgang of offerte_agenda welke er zijn"
-            ))
+        // Page through every entry: a quote with many is not a reason to say an entry is not its own.
+        let mut offset = 0;
+        loop {
+            let page = rows(&named_rows(
+                self.fetch(
+                    run,
+                    &format!("{list}/gridtable/{offerte_id}"),
+                    grid(Some(MAX_ROWS), Some(offset))?,
+                )
+                .await?,
+            ));
+            if page.iter().any(|r| id_of(r, "id") == Some(id)) {
+                return Ok(());
+            }
+            if page.len() < MAX_ROWS as usize || offset >= 100 * MAX_ROWS {
+                break;
+            }
+            offset += MAX_ROWS;
         }
+        Err(format!(
+            "Regel {id} hoort niet bij offerte {offerte_id}; kijk met offerte_voortgang of offerte_agenda welke er zijn"
+        ))
     }
 }
 
@@ -431,10 +438,11 @@ impl EbMcp {
             move |this, run, args| async move {
                 let nummer = this.offerte_nummer(&run, args.offerte_id).await?;
                 let users = this.fetch(&run, "user/selectlist", Vec::new()).await?;
-                let user = this.fetch(&run, "user", Vec::new()).await?;
-                let ingelogd = id_of(&user, "id").ok_or_else(|| {
-                    Halt::Error("e-Boekhouden gaf de ingelogde gebruiker niet terug".into())
-                })?;
+                // The signed-in user is only the default; `user` need not carry an id (the capture has none).
+                let ingelogd = match args.medewerker_id {
+                    Some(_) => None,
+                    None => id_of(&this.fetch(&run, "user", Vec::new()).await?, "id"),
+                };
                 let built = agenda_nieuw(&args, &nummer, &users, ingelogd)?;
                 this.approve(&run, TOOL, &built, false).await?;
                 this.change(&run, "POST", "offerteagenda", Some(&built.body))
@@ -551,9 +559,24 @@ impl EbMcp {
             let admin = this.fetch(&run, "administratie/incassoinfo", Vec::new()).await?;
             let info = this.fetch(&run, "factuur/incassoinfo", Vec::new()).await?;
             let facturen = named_rows(this.fetch(&run, "factuur/machtiginggrid", grid(Some(MAX_ROWS), None)?).await?);
-            let (built, query) = incasso_plan(uitvoer, vandaag, &admin, &info, &facturen)?;
+            let (built, query, lijst) = incasso_plan(uitvoer, vandaag, &admin, &info, &facturen)?;
             this.approve(&run, TOOL, &built, true).await?;
-            let made = this.fetch(&run, "incassobestand/create", query).await.map_err(Halt::Error)?;
+            // The file takes every invoice ready at the moment it is made, and the approval may have waited for
+            // hours: the list must still be the one the user saw.
+            let info = this.fetch(&run, "factuur/incassoinfo", Vec::new()).await?;
+            let facturen = named_rows(this.fetch(&run, "factuur/machtiginggrid", grid(Some(MAX_ROWS), None)?).await?);
+            incasso_zelfde(&lijst, &info, &facturen)?;
+            let made = match this.change_query(&run, "GET", "incassobestand/create", &query, None).await {
+                Ok(made) => made,
+                Err(Halt::Error(e) | Halt::Refused(e)) if certainly_not_done(&e) => {
+                    return Err(Halt::Error(format!("e-Boekhouden heeft het incassobestand niet gemaakt: {e}")));
+                }
+                Err(Halt::Error(e) | Halt::Refused(e)) => {
+                    return Err(Halt::Error(format!(
+                        "Of het incassobestand is gemaakt, is niet zeker ({e}). Kijk in e-Boekhouden onder Facturen > Incassobestand > Oude incassobestanden voordat je het opnieuw probeert."
+                    )));
+                }
+            };
             let name = made.as_str().unwrap_or_default().to_owned();
             // From here the file exists at e-Boekhouden: whatever happens with the download, the change is done.
             let manual = "Download het in e-Boekhouden onder Facturen > Incassobestand > Oude incassobestanden.";
@@ -596,12 +619,31 @@ impl EbMcp {
         const TOOL: &str = "peppol_versturen";
         let account = args.account.clone();
         self.write_tool(&context, TOOL, account.as_deref(), args, "Factuur verstuurd via Peppol", move |this, run, args| async move {
+            // As the web app: only an administration on Peppol looks at Peppol sendings (`peppol/getpeppolaccount`).
+            // It answers the account, or nothing (null or an empty body) when there is none.
+            let call = this.state.api_get(run.account.id, "peppol/getpeppolaccount", &[], Some(run.id), &run.client).await;
+            if !call.ok() {
+                return Err(Halt::Error(call.error.unwrap_or_else(|| format!("e-Boekhouden gaf {} op peppol/getpeppolaccount", call.status))));
+            }
+            if !call.json.as_ref().is_some_and(Value::is_object) {
+                return Err(Halt::Error(
+                    "Deze administratie is niet op Peppol aangesloten; koppel eerst een Peppol-account in e-Boekhouden onder Beheer > Koppelingen".into(),
+                ));
+            }
             let factuur = this.fetch(&run, &format!("factuur/{}", args.id), Vec::new()).await?;
             let relatie_id = id_of(&factuur, "relatieId").unwrap_or(0);
             let relatie = this.fetch(&run, &format!("relatie/{relatie_id}"), Vec::new()).await?;
             let verstuurd = this.fetch(&run, &format!("factuur/haspeppolverzending/{}", args.id), Vec::new()).await?;
             let built = peppol_plan(args.id, &factuur, &relatie, &verstuurd)?;
             this.approve(&run, TOOL, &built, true).await?;
+            // An invoice goes over Peppol once: it may have gone while the approval waited.
+            let verstuurd = this.fetch(&run, &format!("factuur/haspeppolverzending/{}", args.id), Vec::new()).await?;
+            if verstuurd.as_bool() != Some(false) {
+                return Err(Halt::Error(format!(
+                    "Factuur {} is niet verstuurd: hij is intussen al via Peppol verstuurd, of e-Boekhouden zegt dat niet duidelijk ({verstuurd}).",
+                    s(&factuur, "nummer")
+                )));
+            }
             this.change(&run, "POST", "peppol/send", Some(&built.body)).await?;
             Ok(json!({"factuur": s(&factuur, "nummer"), "verstuurd_via": "Peppol", "aan": s(&relatie, "bedrijf")}))
         })
@@ -609,7 +651,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Meerdere verkoopfacturen per e-mail versturen (hoogstens 50), elk naar het factuur- of e-mailadres van zijn eigen relatie en met de eigen factuur als pdf in de bijlage. Onderwerp en bericht komen uit een e-mailsjabloon (sjabloon_id) of geef je zelf mee; codes zoals [FACTNUMMER] vult e-Boekhouden per factuur in. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar elke factuur met zijn ontvanger. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Meerdere verkoopfacturen per e-mail versturen (hoogstens 50), elk naar het factuur- of e-mailadres van zijn eigen relatie en met de eigen factuur als pdf in de bijlage. Onderwerp en bericht komen uit een e-mailsjabloon voor facturen (sjabloon_id), per factuur zoals e-Boekhouden het invult, of geef je zelf mee; eigen tekst gaat zoals hij is naar elke ontvanger, dus zonder codes zoals [FACTNUMMER]. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar elke factuur met zijn ontvanger, onderwerp en bericht. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Facturen mailen",
             read_only_hint = false,
@@ -627,12 +669,12 @@ impl EbMcp {
         let account = args.account.clone();
         self.write_tool(&context, TOOL, account.as_deref(), args, "Facturen verstuurd per e-mail", move |this, run, args| async move {
             check_ids(&args.ids)?;
-            let template = match args.sjabloon_id {
-                Some(id) => Some(this.fetch(&run, &format!("EmailSjabloonAb/{id}"), Vec::new()).await?),
-                None => None,
-            };
+            own_text_without_codes(given(&args.onderwerp).as_deref(), given(&args.bericht).as_deref())?;
+            if let Some(id) = args.sjabloon_id {
+                for_invoices(&this.fetch(&run, "emailsjabloonab/forfactuur", Vec::new()).await?, id)?;
+            }
             let user = this.fetch(&run, "user", Vec::new()).await?;
-            let gemeen = facturen_mail_gemeen(&args, template.as_ref(), &user, run.account.administration.as_deref())?;
+            let eigen = EigenMail { onderwerp: &args.onderwerp, bericht: &args.bericht, cc: &args.cc, bcc: &args.bcc };
             let mut relaties: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
             let mut ontvangers = Vec::new();
             let mut zonder = Vec::new();
@@ -644,15 +686,18 @@ impl EbMcp {
                     slot.insert(this.fetch(&run, &format!("relatie/{relatie_id}"), Vec::new()).await?);
                 }
                 let relatie = &relaties[&relatie_id];
-                match factuur_adres(relatie) {
-                    Some(aan) => ontvangers.push(Ontvanger {
-                        factuur_id: *id,
-                        nummer,
-                        relatie: known(s(relatie, "bedrijf")),
-                        aan: email(&aan, &format!("Het e-mailadres van de relatie van factuur {}", s(&factuur, "nummer")))?,
-                    }),
-                    None => zonder.push(format!("{nummer} ({})", known(s(relatie, "bedrijf")))),
-                }
+                let Some(aan) = factuur_adres(relatie) else {
+                    zonder.push(format!("{nummer} ({})", known(s(relatie, "bedrijf"))));
+                    continue;
+                };
+                // The template's text as e-Boekhouden fills it for this invoice: what is shown is what is sent.
+                let filled = match args.sjabloon_id {
+                    Some(sjabloon) => Some(this.fetch(&run, &format!("factuur/maildata/{sjabloon}/{id}"), Vec::new()).await?),
+                    None => None,
+                };
+                let mail = factuur_mail(&eigen, filled.as_ref(), &aan, &user, run.account.administration.as_deref())
+                    .map_err(|e| Halt::Error(format!("Factuur {nummer}: {e}")))?;
+                ontvangers.push(Ontvanger { factuur_id: *id, nummer, relatie: known(s(relatie, "bedrijf")), mail });
             }
             if !zonder.is_empty() {
                 return Err(Halt::Error(format!(
@@ -660,32 +705,29 @@ impl EbMcp {
                     zonder.join(", ")
                 )));
             }
-            let built = facturen_mail_built(&gemeen, &ontvangers);
+            let built = facturen_mail_built(&ontvangers, args.ubl.unwrap_or(false));
             this.approve(&run, TOOL, &built, true).await?;
-            let mut verstuurd = Vec::new();
-            for (mail, ontvanger) in rows(&built.body["mails"]).iter().zip(&ontvangers) {
-                let failed = match this.change(&run, "POST", "factuur/mail", Some(mail)).await {
-                    Ok(sent) => mail_failed(&sent),
-                    Err(Halt::Error(e) | Halt::Refused(e)) => Some(e),
+            for (at, mail) in rows(&built.body["mails"]).iter().enumerate() {
+                let stopped = match this.change(&run, "POST", "factuur/mail", Some(mail)).await {
+                    // e-Boekhouden answered and said it did not send: certain.
+                    Ok(sent) => mail_failed(&sent).map(|why| (why, true)),
+                    // A timeout or lost connection can come after the mail went out.
+                    Err(Halt::Error(e) | Halt::Refused(e)) => {
+                        let certain = certainly_not_done(&e);
+                        Some((e, certain))
+                    }
                 };
-                if let Some(why) = failed {
-                    let rest: Vec<&str> = ontvangers.iter().skip(verstuurd.len()).map(|o| o.nummer.as_str()).collect();
-                    return Err(Halt::Error(format!(
-                        "Factuur {} is niet verstuurd: {why}. Al verstuurd: {}. Niet verstuurd: {}.",
-                        ontvanger.nummer,
-                        if verstuurd.is_empty() { "geen".to_owned() } else { verstuurd.join(", ") },
-                        rest.join(", ")
-                    )));
+                if let Some((why, certain)) = stopped {
+                    return Err(Halt::Error(bulk_mail_stopped(&ontvangers, at, &why, certain)));
                 }
-                verstuurd.push(ontvanger.nummer.clone());
             }
-            Ok(json!({"verstuurd": ontvangers.iter().map(|o| json!({"factuur": o.nummer, "aan": o.aan})).collect::<Vec<_>>()}))
+            Ok(json!({"verstuurd": ontvangers.iter().map(|o| json!({"factuur": o.nummer, "aan": o.mail.aan})).collect::<Vec<_>>()}))
         })
         .await
     }
 
     #[tool(
-        description = "Meerdere verkoopfacturen als pdf ophalen om af te drukken (hoogstens 50), op id (uit facturen). Elke pdf wordt op deze computer opgeslagen, standaard in de map Downloads; het antwoord geeft per factuur het volledige pad, zodat de gebruiker ze kan openen en afdrukken. Bestaande bestanden worden niet overschreven. Wil je één pdf zelf lezen, gebruik dan factuur_pdf.",
+        description = "Meerdere verkoopfacturen als pdf ophalen om af te drukken (hoogstens 50), op id (uit facturen). Elke pdf wordt op deze computer opgeslagen, standaard in de map Downloads; het antwoord geeft per factuur het volledige pad, zodat de gebruiker ze kan openen en afdrukken. Bestaande bestanden worden niet overschreven. Leest alleen: er wordt niets verstuurd of gewijzigd, al houdt e-Boekhouden mogelijk bij hoe vaak een factuur is afgedrukt (net als bij factuur_pdf). Wil je één pdf zelf lezen, gebruik dan factuur_pdf.",
         annotations(title = "Facturen afdrukken", read_only_hint = true)
     )]
     async fn facturen_afdrukken(
@@ -741,7 +783,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een bestand in het digitaal archief loskoppelen: van één mutatie (mutatie_nr) of van alles waar het aan hangt (alles: true, ook bankregels, relaties en offertes). Het bestand zelf blijft; e-Boekhouden verwijdert een gekoppeld bestand niet, dus koppel het eerst los als het weg moet (archief_verwijderen). Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een bestand in het digitaal archief loskoppelen: van één mutatie (mutatie_nr) of van alles waar het aan hangt (alles: true, ook bankregels, relaties en offertes). Het bestand zelf blijft; e-Boekhouden verwijdert een gekoppeld bestand niet, dus koppel het eerst los als het weg moet (archief_verwijderen). Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP, en altijd als er een koppeling met een bankregel, relatie of offerte verdwijnt (die kan EB MCP niet terugzetten). Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Bestand ontkoppelen",
             read_only_hint = false,
@@ -763,8 +805,8 @@ impl EbMcp {
                 return Err(Halt::Error(format!("{naam} is een map, geen bestand")));
             }
             let links = this.fetch(&run, &format!("folder/{}/koppel", args.bestand_id), Vec::new()).await?;
-            let (built, ids) = ontkoppel_plan(&naam, &links, args.mutatie_nr, args.alles.unwrap_or(false))?;
-            this.approve(&run, TOOL, &built, false).await?;
+            let (built, ids, danger) = ontkoppel_plan(&naam, &links, args.mutatie_nr, args.alles.unwrap_or(false))?;
+            this.approve(&run, TOOL, &built, danger).await?;
             for (n, id) in ids.iter().enumerate() {
                 if let Err(Halt::Error(e) | Halt::Refused(e)) = this.change_done(&run, "DELETE", &format!("folderkoppel/{id}"), None).await {
                     return Err(Halt::Error(if n == 0 {
@@ -780,7 +822,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "De codes die je in een e-mailsjabloon voor facturen kunt gebruiken (onderwerp en bericht), met hun uitleg, zoals e-Boekhoudens pagina Sjablooncodes factuur mailen ze geeft: [RELBEDRIJF], [FACTNUMMER], [TOTAAL], [ABBEDRIJF] en de rest. e-Boekhouden vult ze per factuur in bij het mailen. De codes van de opmaak van een factuur- of offertesjabloon geeft de tool sjabloon.",
+        description = "De codes die je in een e-mailsjabloon voor facturen kunt gebruiken (onderwerp en bericht), met hun uitleg, zoals e-Boekhoudens pagina Sjablooncodes factuur mailen ze geeft: [RELBEDRIJF], [FACTNUMMER], [TOTAAL], [ABBEDRIJF] en de rest. e-Boekhouden vult ze in wanneer een factuur met dat sjabloon wordt gemaild (factuur_mailen of facturen_mailen met sjabloon_id); in eigen tekst werken ze niet. De codes van de opmaak van een factuur- of offertesjabloon geeft de tool sjabloon.",
         annotations(title = "E-mailsjabloon codes", read_only_hint = true)
     )]
     async fn emailsjabloon_codes(

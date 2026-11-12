@@ -1178,6 +1178,17 @@ pub fn factuur_sjabloon(id: u64, sjablonen: Option<&Value>) -> Result<(u64, Stri
     }
 }
 
+/// The name of any of the administration's invoice templates, inactive ones too: for the old value of an edit.
+fn factuur_sjabloon_naam(id: u64, sjablonen: Option<&Value>) -> Option<String> {
+    let rows = match sjablonen? {
+        Value::Array(rows) => rows.clone(),
+        grid => grid.get("data")?.as_array()?.clone(),
+    };
+    rows.iter()
+        .find(|r| r.get("id").and_then(Value::as_u64) == Some(id))
+        .and_then(|r| r.get("naam")?.as_str().map(|n| n.trim().to_owned()))
+}
+
 /// What a new invoice takes from the administration's settings.
 #[derive(Clone, Debug)]
 pub struct FactuurContext {
@@ -1419,13 +1430,14 @@ pub fn factuur_gewijzigd(
         factuur.insert("kenmerk".into(), json!(kenmerk.trim()));
         changed = true;
     }
-    if let Some(id) = args.sjabloon_id {
+    // Keeping the template the invoice has is no change, also when that template is inactive by now.
+    let old = now.get("sjabloonId").and_then(Value::as_u64);
+    if let Some(id) = args.sjabloon_id.filter(|id| Some(*id) != old) {
         let (id, naam) = factuur_sjabloon(id, sjablonen)?;
-        let old = now.get("sjabloonId").and_then(Value::as_u64);
-        if old != Some(id) {
+        {
             let was = old
-                .and_then(|old| factuur_sjabloon(old, sjablonen).ok())
-                .map_or_else(|| "onbekend".to_owned(), |(_, naam)| naam);
+                .and_then(|old| factuur_sjabloon_naam(old, sjablonen))
+                .unwrap_or_else(|| "onbekend".to_owned());
             lines.push(line("Factuursjabloon wordt", format!("{naam} (was {was})")));
             factuur.insert("sjabloonId".into(), json!(id));
             changed = true;
@@ -3038,6 +3050,30 @@ mod tests {
             "{:?}",
             built.lines
         );
+        // From an inactive template to an active one: the old one is named.
+        let mut oud = now.clone();
+        oud["sjabloonId"] = json!(900002);
+        let built = factuur_gewijzigd(&args, &oud, &items, &books(), Some(&sjablonen())).unwrap();
+        assert!(
+            built
+                .lines
+                .iter()
+                .any(|l| l.label == "Factuursjabloon wordt" && l.value == "Engels (was Oud)"),
+            "{:?}",
+            built.lines
+        );
+        // Naming the inactive template the invoice has already is allowed, and is no change.
+        args.sjabloon_id = Some(900002);
+        args.kenmerk = Some("K1".into());
+        let built = factuur_gewijzigd(&args, &oud, &items, &books(), Some(&sjablonen())).unwrap();
+        assert_eq!(built.body["factuur"]["sjabloonId"], 900002);
+        assert!(
+            !built
+                .lines
+                .iter()
+                .any(|l| l.label.starts_with("Factuursjabloon"))
+        );
+        args.kenmerk = None;
         // The template it has already is no change.
         args.sjabloon_id = Some(878203);
         assert!(

@@ -10,6 +10,8 @@ use crate::approvals::Line;
 use serde_json::Map;
 
 pub(super) type Date = (i32, u32, u32);
+/// Query parameters of a request.
+pub(super) type Query = Vec<(String, String)>;
 
 /// Most invoices one bulk tool handles in one go: every one is a request of its own, and the approval lists each.
 pub(super) const MAX_BULK: usize = 50;
@@ -69,8 +71,9 @@ pub(super) fn given(value: &Option<String>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Whole cents, as e-Boekhouden's own forms round (`write::round_cents`).
 pub(super) fn round2(amount: f64) -> f64 {
-    (amount * 100.0).round() / 100.0
+    crate::write::round_cents(amount)
 }
 
 /// A number as JavaScript writes it into a URL or a text (`${t}`): 50, 12.5.
@@ -134,11 +137,11 @@ pub struct OfferteMailenArgs {
     pub id: u64,
     /// E-mailadres van de ontvanger (standaard het e-mailadres van de relatie).
     pub aan: Option<String>,
-    /// Id van een e-mailsjabloon voor offertes (uit emailsjablonen) voor onderwerp, bericht en afzender. e-Boekhouden vult de codes in.
+    /// Id van een e-mailsjabloon voor offertes (uit emailsjablonen) voor onderwerp, bericht en afzender. EB MCP haalt de tekst op zoals e-Boekhouden hem voor deze offerte invult, en toont precies die.
     pub sjabloon_id: Option<u64>,
-    /// Onderwerp (gaat voor het sjabloon), hoogstens 110 tekens.
+    /// Eigen onderwerp (gaat voor het sjabloon), hoogstens 110 tekens. Gaat zoals het is: zonder codes, schrijf die uit.
     pub onderwerp: Option<String>,
-    /// Bericht als HTML (gaat voor het sjabloon).
+    /// Eigen bericht als HTML (gaat voor het sjabloon). Gaat zoals het is: zonder codes, schrijf die uit.
     pub bericht: Option<String>,
     /// Cc-adres.
     pub cc: Option<String>,
@@ -171,6 +174,10 @@ pub(super) fn offerte_mail(
     relatie: &Value,
     user: &Value,
 ) -> Result<Mail, String> {
+    own_text_without_codes(
+        given(&args.onderwerp).as_deref(),
+        given(&args.bericht).as_deref(),
+    )?;
     let from_template = |key: &str| template.and_then(|t| filled(t, key));
     let aan = given(&args.aan)
         .or_else(|| filled(relatie, "email"))
@@ -340,10 +347,11 @@ pub(super) struct OfferteBron<'a> {
     pub relatie: &'a Value,
 }
 
-/// One line of the new invoice and what it adds up to.
+/// One line of the new invoice, with the line's total after discount as e-Boekhouden computed it on the quote
+/// (`regelMetKortingExcl`, `regelMetKortingIncl`), when it comes from a quote line.
 struct FactuurRegel {
     item: Map<String, Value>,
-    totaal_incl: f64,
+    met_korting: (Option<f64>, Option<f64>),
 }
 
 /// The fields `app-offerte-factureren-regels` copies from a quote line into an invoice line (`btwCode` becomes `btw`).
@@ -387,7 +395,7 @@ fn deel_regel(
     }
     FactuurRegel {
         item,
-        totaal_incl: incl,
+        met_korting: (None, None),
     }
 }
 
@@ -457,11 +465,11 @@ fn factuur_regels(deel: &Deel, bron: &OfferteBron) -> Result<Vec<FactuurRegel>, 
                         item.insert(to.into(), value.clone());
                     }
                 }
-                let totaal_incl = amount_of(regel, "regelMetKortingIncl").unwrap_or_else(|| {
-                    amount_of(regel, "aantal").unwrap_or(0.0)
-                        * amount_of(regel, "prijsIncl").unwrap_or(0.0)
-                });
-                out.push(FactuurRegel { item, totaal_incl });
+                let met_korting = (
+                    amount_of(regel, "regelMetKortingExcl"),
+                    amount_of(regel, "regelMetKortingIncl"),
+                );
+                out.push(FactuurRegel { item, met_korting });
             }
         }
         Deel::Percentage(t) | Deel::Bedrag(t) => {
@@ -549,6 +557,52 @@ fn factuur_regels(deel: &Deel, bron: &OfferteBron) -> Result<Vec<FactuurRegel>, 
     Ok(out)
 }
 
+/// A line's totals excl. and incl. btw, from the price that leads (excl. on an invoice excl. btw, incl. on one
+/// incl. btw) after its discount, with btw on top or taken out; and its discount in words for the summary.
+fn regel_totaal(
+    regel: &FactuurRegel,
+    in_ex: &str,
+    books: &Books,
+) -> Result<(f64, f64, String), String> {
+    let item = Value::Object(regel.item.clone());
+    let incl_leads = in_ex == "IN";
+    let aantal = amount_of(&item, "aantal").unwrap_or(0.0);
+    let prijs = amount_of(&item, if incl_leads { "prijsIncl" } else { "prijsExcl" }).unwrap_or(0.0);
+    let korting = amount_of(&item, "korting").unwrap_or(0.0);
+    let percentage = item
+        .get("kortingIsPerc")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let given = if incl_leads {
+        regel.met_korting.1
+    } else {
+        regel.met_korting.0
+    };
+    let net = given.unwrap_or_else(|| {
+        let bruto = aantal * prijs;
+        match (korting > 0.0, percentage) {
+            (false, _) => bruto,
+            (true, true) => bruto * (1.0 - korting / 100.0),
+            (true, false) => bruto - korting,
+        }
+    });
+    let code = s(&item, "btw");
+    let pct = books.btw(&code)?.percentage;
+    let (excl, incl) = if incl_leads {
+        let incl = round2(net);
+        (round2(incl / (1.0 + pct / 100.0)), incl)
+    } else {
+        let excl = round2(net);
+        (excl, excl + round2(excl * pct / 100.0))
+    };
+    let words = match (korting > 0.0, percentage) {
+        (false, _) => String::new(),
+        (true, true) => format!(", korting {}%", js_number(korting)),
+        (true, false) => format!(", korting {}", write::euro(korting)),
+    };
+    Ok((excl, incl, words))
+}
+
 /// The invoice the quote's "Factuur maken" opens, saved as the invoice form saves it: `POST factuur/model` with
 /// `factuur.offerteId`, `kenmerk` the quote's number and the quote's e-mail template for invoices
 /// (`getFactuurFromState` in the factuur form; the prefill in `app-offerte-factureren-*`).
@@ -633,25 +687,36 @@ pub(super) fn offerte_factuur(
         ),
     ];
     let mut items = Vec::new();
-    let mut totaal = 0.0;
+    let (mut totaal_excl, mut totaal_incl) = (0.0, 0.0);
     for (n, mut regel) in regels.into_iter().enumerate() {
+        let (excl, incl, korting) = regel_totaal(&regel, in_ex, books)?;
+        totaal_excl += excl;
+        totaal_incl += incl;
         let item = &regel.item;
         let field = |key: &str| amount_of(&Value::Object(item.clone()), key).unwrap_or(0.0);
         lines.push(line(
             &format!("Regel {}", n + 1),
             format!(
-                "{} x {}: {} excl. / {} incl. btw per stuk ({}), op {}",
+                "{} x {}: {} per stuk {}{} ({}), op {}",
                 js_number(field("aantal")),
                 item.get("omschrijving")
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
-                write::euro(field("prijsExcl")),
-                write::euro(field("prijsIncl")),
+                write::euro(field(if in_ex == "IN" {
+                    "prijsIncl"
+                } else {
+                    "prijsExcl"
+                })),
+                if in_ex == "IN" {
+                    "incl. btw"
+                } else {
+                    "excl. btw"
+                },
+                korting,
                 item.get("btw").and_then(Value::as_str).unwrap_or_default(),
                 rekening(field("grootboekId") as u64)
             ),
         ));
-        totaal += regel.totaal_incl;
         regel.item.insert("id".into(), json!(-((n + 1) as i64)));
         regel.item.insert("factuurId".into(), json!(0));
         regel.item.insert("prijs".into(), Value::Null);
@@ -659,7 +724,9 @@ pub(super) fn offerte_factuur(
         regel.item.entry("kortingIsPerc").or_insert(json!(true));
         items.push(Value::Object(regel.item));
     }
-    lines.push(line("Totaal incl. btw", write::euro(totaal)));
+    lines.push(line("Totaal excl. btw", write::euro(totaal_excl)));
+    lines.push(line("Btw", write::euro(totaal_incl - totaal_excl)));
+    lines.push(line("Totaal incl. btw", write::euro(totaal_incl)));
     let mut body = Map::new();
     body.insert("factuur".into(), Value::Object(factuur));
     body.insert(
@@ -673,11 +740,11 @@ pub(super) fn offerte_factuur(
         );
     }
     lines.push(line(
-        "Boeken",
+        "Meteen boeken",
         if boeken {
-            "meteen als mutatie Factuur verstuurd"
+            "ja, de factuur wordt meteen geboekt als mutatie Factuur verstuurd (zet direct_boeken op false om dat niet te doen)"
         } else {
-            "nog niet"
+            "nee, de factuur wordt nog niet geboekt"
         },
     ));
     lines.push(line("Versturen", "de factuur wordt niet verstuurd"));
@@ -898,7 +965,7 @@ pub struct OfferteAgendaToevoegenArgs {
     pub onderwerp: String,
     /// Bericht als HTML (optioneel).
     pub bericht: Option<String>,
-    /// Id van de medewerker (uit offerte_agenda; standaard de ingelogde gebruiker).
+    /// Id van de medewerker (uit offerte_agenda). Zonder: de ingelogde gebruiker, als e-Boekhouden die met id teruggeeft; anders is medewerker_id nodig.
     pub medewerker_id: Option<u64>,
     /// Datum waarop het is afgehandeld, JJJJ-MM-DD (optioneel).
     pub afgehandeld: Option<String>,
@@ -977,12 +1044,14 @@ pub(super) fn agenda_nieuw(
     args: &OfferteAgendaToevoegenArgs,
     offerte_nummer: &str,
     users: &Value,
-    ingelogd: u64,
+    ingelogd: Option<u64>,
 ) -> Result<Built, String> {
     let datum = parse_date(&args.datum)?;
     let tijd = parse_time(&args.tijd)?;
     let onderwerp = onderwerp_ok(&args.onderwerp)?;
-    let gebruiker = args.medewerker_id.unwrap_or(ingelogd);
+    let gebruiker = args.medewerker_id.or(ingelogd).ok_or(
+        "e-Boekhouden zegt niet wie er is ingelogd; geef de medewerker op met medewerker_id (offerte_agenda noemt de medewerkers)",
+    )?;
     let naam = medewerker(gebruiker, users)?;
     let mut body = json!({"offerteId": args.offerte_id, "onderwerp": onderwerp, "datum": moment(datum, tijd), "gebruikerId": gebruiker});
     let mut lines = vec![
@@ -1134,31 +1203,19 @@ pub struct IncassobestandArgs {
 /// IBAN and contract id (`administratie/incassoinfo`, never changed here), the invoices that are ready
 /// (`factuur/incassoinfo` {aantal, bedrag}, and per invoice `factuur/machtiginggrid` with its problems in
 /// `machtigingMessage`), and `GET incassobestand/create?iban=&incassoidrekhouder=&uitvoerdatum=DD-MM-YYYY`.
-pub(super) fn incasso_plan(
-    uitvoer: Date,
-    vandaag: Date,
-    admin: &Value,
-    info: &Value,
-    facturen: &Value,
-) -> Result<(Built, Vec<(String, String)>), String> {
-    let iban: String = s(admin, "iban")
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .to_uppercase();
-    if iban.is_empty() {
-        return Err("Er is in e-Boekhouden geen IBAN voor incasso ingesteld. Stel die zelf in e-Boekhouden in; EB MCP wijzigt hem niet.".into());
-    }
-    let contract = s(admin, "incassoContractId");
-    if contract.is_empty() {
-        return Err("Er is in e-Boekhouden geen incassocontract-ID ingesteld. Stel die zelf in e-Boekhouden in; EB MCP wijzigt hem niet.".into());
-    }
-    if !contract.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err("Het incassocontract-ID in e-Boekhouden mag enkel letters en cijfers bevatten; pas het daar aan".into());
-    }
-    if uitvoer < vandaag {
-        return Err("De uitvoerdatum ligt in het verleden".into());
-    }
+/// The invoices ready for incasso as the user approves them: compared again right before the file is made.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct IncassoLijst {
+    pub aantal: usize,
+    pub bedrag: f64,
+    /// The invoice numbers, sorted.
+    pub nummers: Vec<String>,
+    pub facturen: Vec<Value>,
+}
+
+/// The invoices ready for incasso, from `factuur/incassoinfo` and `factuur/machtiginggrid`, refused when they do not
+/// agree or one has a problem with its mandate (the web app does not offer the file then).
+pub(super) fn incasso_lijst(info: &Value, facturen: &Value) -> Result<IncassoLijst, String> {
     let aantal = id_of(info, "aantal").unwrap_or(0) as usize;
     if aantal == 0 {
         return Err("Er staan op dit moment geen facturen klaar voor incasso".into());
@@ -1187,6 +1244,92 @@ pub(super) fn incasso_plan(
             write::euro(som)
         ));
     }
+    let mut nummers: Vec<String> = list.iter().map(|f| s(f, "nummer")).collect();
+    nummers.sort();
+    Ok(IncassoLijst {
+        aantal,
+        bedrag,
+        nummers,
+        facturen: list,
+    })
+}
+
+/// `GET incassobestand/create` takes no list: e-Boekhouden puts in every invoice ready at that moment. So right
+/// before it is called, the list is read again and must be the one the user approved.
+pub(super) fn incasso_zelfde(
+    approved: &IncassoLijst,
+    info: &Value,
+    facturen: &Value,
+) -> Result<(), String> {
+    let now = incasso_lijst(info, facturen).map_err(|why| {
+        format!(
+            "Er is geen incassobestand gemaakt: sinds de goedkeuring is er iets veranderd. {why}"
+        )
+    })?;
+    if now.aantal == approved.aantal
+        && (now.bedrag - approved.bedrag).abs() <= 0.005
+        && now.nummers == approved.nummers
+    {
+        return Ok(());
+    }
+    let extra: Vec<&str> = now
+        .nummers
+        .iter()
+        .filter(|n| !approved.nummers.contains(n))
+        .map(String::as_str)
+        .collect();
+    let weg: Vec<&str> = approved
+        .nummers
+        .iter()
+        .filter(|n| !now.nummers.contains(n))
+        .map(String::as_str)
+        .collect();
+    let mut what = vec![format!(
+        "goedgekeurd waren {} facturen voor {}, nu staan er {} voor {} klaar",
+        approved.aantal,
+        write::euro(approved.bedrag),
+        now.aantal,
+        write::euro(now.bedrag)
+    )];
+    if !extra.is_empty() {
+        what.push(format!("erbij: {}", extra.join(", ")));
+    }
+    if !weg.is_empty() {
+        what.push(format!("niet meer: {}", weg.join(", ")));
+    }
+    Err(format!(
+        "Er is geen incassobestand gemaakt: de facturen die klaarstaan voor incasso zijn veranderd sinds de goedkeuring ({}). Vraag het opnieuw aan, zodat je ziet welke facturen meegaan.",
+        what.join("; ")
+    ))
+}
+
+pub(super) fn incasso_plan(
+    uitvoer: Date,
+    vandaag: Date,
+    admin: &Value,
+    info: &Value,
+    facturen: &Value,
+) -> Result<(Built, Query, IncassoLijst), String> {
+    let iban: String = s(admin, "iban")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_uppercase();
+    if iban.is_empty() {
+        return Err("Er is in e-Boekhouden geen IBAN voor incasso ingesteld. Stel die zelf in e-Boekhouden in; EB MCP wijzigt hem niet.".into());
+    }
+    let contract = s(admin, "incassoContractId");
+    if contract.is_empty() {
+        return Err("Er is in e-Boekhouden geen incassocontract-ID ingesteld. Stel die zelf in e-Boekhouden in; EB MCP wijzigt hem niet.".into());
+    }
+    if !contract.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("Het incassocontract-ID in e-Boekhouden mag enkel letters en cijfers bevatten; pas het daar aan".into());
+    }
+    if uitvoer < vandaag {
+        return Err("De uitvoerdatum ligt in het verleden".into());
+    }
+    let lijst = incasso_lijst(info, facturen)?;
+    let (aantal, bedrag) = (lijst.aantal, lijst.bedrag);
     let query = vec![
         ("iban".to_owned(), iban.clone()),
         ("incassoidrekhouder".to_owned(), contract.clone()),
@@ -1197,7 +1340,7 @@ pub(super) fn incasso_plan(
         line("Incassocontract-ID", &contract),
         line("Uitvoerdatum", dutch(uitvoer)),
     ];
-    for factuur in &list {
+    for factuur in &lijst.facturen {
         lines.push(line(
             &format!("Factuur {}", s(factuur, "nummer")),
             format!(
@@ -1217,7 +1360,7 @@ pub(super) fn incasso_plan(
     ));
     lines.push(line(
         "Let op",
-        "dit is een betaalopdracht voor de bank en is in EB MCP niet terug te draaien",
+        "dit is een betaalopdracht voor de bank en is in EB MCP niet terug te draaien. Komt er voor het maken een factuur bij of gaat er een af, dan maakt EB MCP het bestand niet.",
     ));
     Ok((
         Built {
@@ -1229,6 +1372,7 @@ pub(super) fn incasso_plan(
             lines,
         },
         query,
+        lijst,
     ))
 }
 
@@ -1297,11 +1441,11 @@ pub(super) fn peppol_plan(
 pub struct FacturenMailenArgs {
     /// Ids van de facturen (uit facturen), hoogstens 50. Elke factuur gaat naar het factuur- of e-mailadres van zijn eigen relatie.
     pub ids: Vec<u64>,
-    /// Id van een e-mailsjabloon (uit emailsjablonen) voor onderwerp, bericht en afzender. e-Boekhouden vult de codes zoals [FACTNUMMER] per factuur in.
+    /// Id van een e-mailsjabloon voor facturen (uit emailsjablonen). EB MCP haalt per factuur de tekst op zoals e-Boekhouden hem invult, en toont precies die.
     pub sjabloon_id: Option<u64>,
-    /// Onderwerp (gaat voor het sjabloon); gebruik codes zoals [FACTNUMMER] voor wat per factuur verschilt.
+    /// Eigen onderwerp voor elke mail (gaat voor het sjabloon), hoogstens 110 tekens. Gaat zoals het is: zonder codes zoals [FACTNUMMER].
     pub onderwerp: Option<String>,
-    /// Bericht als HTML (gaat voor het sjabloon).
+    /// Eigen bericht als HTML voor elke mail (gaat voor het sjabloon). Gaat zoals het is: zonder codes.
     pub bericht: Option<String>,
     /// Cc-adres voor elke mail.
     pub cc: Option<String>,
@@ -1323,71 +1467,13 @@ pub struct FacturenAfdrukkenArgs {
     pub account: Option<String>,
 }
 
-/// What every mail of a bulk send shares, settled as factuur_mailen settles it: the template
-/// (`EmailSjabloonAb/{id}`: subject, body, cc, bcc, vanNaam, vanEmail), then the administration and the user.
-#[derive(Debug, PartialEq)]
-pub(super) struct Gemeen {
-    pub cc: Option<String>,
-    pub bcc: Option<String>,
-    pub van_naam: String,
-    pub van_email: String,
-    pub onderwerp: String,
-    pub bericht: String,
-    pub ubl: bool,
-}
-
-pub(super) fn facturen_mail_gemeen(
-    args: &FacturenMailenArgs,
-    template: Option<&Value>,
-    user: &Value,
-    administratie: Option<&str>,
-) -> Result<Gemeen, String> {
-    let from_template = |key: &str| template.and_then(|t| filled(t, key));
-    let cc = given(&args.cc)
-        .or_else(|| from_template("cc"))
-        .map(|v| email(&v, "Het cc-adres"))
-        .transpose()?;
-    let bcc = given(&args.bcc)
-        .or_else(|| from_template("bcc"))
-        .map(|v| email(&v, "Het bcc-adres"))
-        .transpose()?;
-    let onderwerp = given(&args.onderwerp)
-        .or_else(|| from_template("subject"))
-        .ok_or("Geef een onderwerp, of een e-mailsjabloon met sjabloon_id")?;
-    let bericht = given(&args.bericht)
-        .or_else(|| from_template("body"))
-        .ok_or("Geef een bericht, of een e-mailsjabloon met sjabloon_id")?;
-    let van_naam = from_template("vanNaam")
-        .or_else(|| {
-            administratie
-                .map(str::trim)
-                .filter(|a| !a.is_empty())
-                .map(str::to_owned)
-        })
-        .or_else(|| filled(user, "naam"))
-        .ok_or("De naam van de afzender is niet bekend")?;
-    let van_email = from_template("vanEmail")
-        .or_else(|| filled(user, "email"))
-        .ok_or("Het e-mailadres van de afzender is niet bekend")?;
-    let van_email = email(&van_email, "Het adres van de afzender")?;
-    Ok(Gemeen {
-        cc,
-        bcc,
-        van_naam,
-        van_email,
-        onderwerp,
-        bericht,
-        ubl: args.ubl.unwrap_or(false),
-    })
-}
-
-/// One invoice of a bulk send: where it goes.
+/// One invoice of a bulk send: its mail, settled per invoice as factuur_mailen settles one (`factuur_mail`).
 #[derive(Debug, PartialEq)]
 pub(super) struct Ontvanger {
     pub factuur_id: u64,
     pub nummer: String,
     pub relatie: String,
-    pub aan: String,
+    pub mail: FactuurMail,
 }
 
 /// The address an invoice goes to: the relatie's invoice address, else its general one.
@@ -1395,70 +1481,147 @@ pub(super) fn factuur_adres(relatie: &Value) -> Option<String> {
     filled(relatie, "emailFactuur").or_else(|| filled(relatie, "email"))
 }
 
+type Part = fn(&FactuurMail) -> String;
+
+fn van(m: &FactuurMail) -> String {
+    format!("{} <{}>", m.van_naam, m.van_email)
+}
+
+fn cc_of(m: &FactuurMail) -> String {
+    m.cc.clone().unwrap_or_default()
+}
+
+fn bcc_of(m: &FactuurMail) -> String {
+    m.bcc.clone().unwrap_or_default()
+}
+
+fn onderwerp_of(m: &FactuurMail) -> String {
+    m.onderwerp.clone()
+}
+
+fn bericht_of(m: &FactuurMail) -> String {
+    plain_text(&m.bericht)
+}
+
 /// Every mail of a bulk send, each the body `POST factuur/mail` takes for one invoice (the request factuur_mailen
-/// sends), under `mails` in the order they go out.
-pub(super) fn facturen_mail_built(gemeen: &Gemeen, ontvangers: &[Ontvanger]) -> Built {
+/// sends), under `mails` in the order they go out. The approval shows each invoice's recipient, subject and
+/// message as they will be sent; what all mails share is shown once.
+pub(super) fn facturen_mail_built(ontvangers: &[Ontvanger], ubl: bool) -> Built {
     let mails: Vec<Value> = ontvangers
         .iter()
-        .map(|o| {
-            json!({
-                "vanNaam": gemeen.van_naam, "vanEmail": gemeen.van_email, "aanEmail": o.aan, "ccEmail": gemeen.cc,
-                "bccEmail": gemeen.bcc, "subject": gemeen.onderwerp, "body": gemeen.bericht, "factuurUbl": gemeen.ubl,
-                "rememberMessage": false, "useEmailSjabloon": false, "bijlagen": [], "factuurId": o.factuur_id
-            })
-        })
+        .map(|o| factuur_mail_body(&o.mail, ubl, o.factuur_id))
         .collect();
-    let mut lines: Vec<Line> = ontvangers
-        .iter()
-        .map(|o| {
-            line(
-                &format!("Factuur {}", o.nummer),
-                format!("aan {} ({})", o.aan, o.relatie),
-            )
-        })
-        .collect();
-    lines.extend(
-        [
-            gemeen.cc.as_ref().map(|cc| line("Cc bij elke mail", cc)),
-            gemeen
-                .bcc
-                .as_ref()
-                .map(|bcc| line("Bcc bij elke mail", bcc)),
-            Some(line(
-                "Van",
-                format!("{} <{}>", gemeen.van_naam, gemeen.van_email),
-            )),
-            Some(line("Onderwerp", &gemeen.onderwerp)),
-            Some(line("Bericht", plain_text(&gemeen.bericht))),
-            targets(&gemeen.bericht).map(|t| line("Links en afbeeldingen in het bericht", t)),
-            Some(line(
-                "Bijlage",
-                if gemeen.ubl {
-                    "de eigen factuur als pdf en als UBL"
-                } else {
-                    "de eigen factuur als pdf"
-                },
-            )),
-            Some(line(
-                "Codes",
-                "codes zoals [FACTNUMMER] vult e-Boekhouden per factuur in",
-            )),
-            Some(line(
-                "Let op",
-                format!(
-                    "dit verstuurt {} echte e-mails, één per factuur, en is niet terug te draaien",
-                    ontvangers.len()
-                ),
-            )),
-        ]
-        .into_iter()
-        .flatten(),
-    );
+    let parts: [(&str, Part); 5] = [
+        ("van", van),
+        ("cc", cc_of),
+        ("bcc", bcc_of),
+        ("onderwerp", onderwerp_of),
+        ("bericht", bericht_of),
+    ];
+    let mut per_mail: Vec<(&str, Part)> = Vec::new();
+    let mut shared = Vec::new();
+    for (label, part) in parts {
+        let first = ontvangers
+            .first()
+            .map(|o| part(&o.mail))
+            .unwrap_or_default();
+        if ontvangers.iter().all(|o| part(&o.mail) == first) {
+            if !first.is_empty() {
+                let mut label = label.to_owned();
+                label[..1].make_ascii_uppercase();
+                shared.push(line(&format!("{label} bij elke mail"), first));
+            }
+        } else {
+            per_mail.push((label, part));
+        }
+    }
+    let mut lines = Vec::new();
+    for o in ontvangers {
+        lines.push(line(
+            &format!("Factuur {}", o.nummer),
+            format!("aan {} ({})", o.mail.aan, o.relatie),
+        ));
+        for (label, part) in &per_mail {
+            let value = part(&o.mail);
+            if !value.is_empty() {
+                lines.push(line(&format!("Factuur {}, {label}", o.nummer), value));
+            }
+        }
+        if let Some(links) = targets(&o.mail.bericht) {
+            lines.push(line(
+                &format!("Factuur {}, links en afbeeldingen", o.nummer),
+                links,
+            ));
+        }
+    }
+    lines.extend(shared);
+    lines.push(line(
+        "Bijlage",
+        if ubl {
+            "de eigen factuur als pdf en als UBL"
+        } else {
+            "de eigen factuur als pdf"
+        },
+    ));
+    lines.push(line(
+        "Let op",
+        format!(
+            "dit verstuurt {} echte e-mails, één per factuur, precies zoals hierboven, en is niet terug te draaien",
+            ontvangers.len()
+        ),
+    ));
     Built {
         body: json!({"mails": mails}),
         title: format!("{} facturen mailen", ontvangers.len()),
         lines,
     }
+}
+
+/// Whether an error of a change means e-Boekhouden certainly did not do it: it refused in words, the session
+/// was gone, or the request never went out. A timeout or a lost connection can come after the change was done.
+pub(super) fn certainly_not_done(error: &str) -> bool {
+    [
+        "e-Boekhouden weigert dit",
+        "Niet (meer) ingelogd",
+        "Niet ingelogd",
+        "Geen toegang",
+        "Dit pad bestaat niet",
+        "e-Boekhouden vraagt om rustiger",
+    ]
+    .iter()
+    .any(|start| error.starts_with(start))
+}
+
+/// What a bulk mail that stopped at invoice `at` says: what went out, what happened to that one, what was not tried.
+pub(super) fn bulk_mail_stopped(
+    ontvangers: &[Ontvanger],
+    at: usize,
+    why: &str,
+    certain: bool,
+) -> String {
+    let nummers = |part: &[Ontvanger]| {
+        if part.is_empty() {
+            "geen".to_owned()
+        } else {
+            part.iter()
+                .map(|o| o.nummer.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let nummer = &ontvangers[at].nummer;
+    let this = if certain {
+        format!("Factuur {nummer} is niet verstuurd: {why}.")
+    } else {
+        format!(
+            "Factuur {nummer}: onbekend, mogelijk verstuurd ({why}). Kijk in e-Boekhouden of hij is verstuurd voordat je hem opnieuw mailt."
+        )
+    };
+    format!(
+        "{this} Verstuurd: {}. Niet geprobeerd: {}.",
+        nummers(&ontvangers[..at]),
+        nummers(&ontvangers[at + 1..])
+    )
 }
 
 // ---------------------------------------------------------------- archief ontkoppelen
@@ -1506,7 +1669,7 @@ pub(super) fn ontkoppel_plan(
     links: &Value,
     mutatie_nr: Option<u64>,
     alles: bool,
-) -> Result<(Built, Vec<u64>), String> {
+) -> Result<(Built, Vec<u64>, bool), String> {
     if mutatie_nr.is_some() == alles {
         return Err(
             "Geef mutatie_nr om één mutatie los te maken, of alles: true voor alle koppelingen"
@@ -1558,6 +1721,8 @@ pub(super) fn ontkoppel_plan(
     }
     let mut ids = Vec::new();
     let mut lines = vec![line("Bestand", naam)];
+    // A link to a mutatie comes back with archief_koppelen; one to a bank line, relatie or quote EB MCP cannot restore.
+    let danger = chosen.iter().any(|(kind, _)| *kind != "koppelMutatie");
     for (kind, item) in &chosen {
         let id = id_of(item, "id")
             .ok_or("e-Boekhouden gaf een koppeling zonder id terug; ontkoppel dit bestand in e-Boekhouden zelf")?;
@@ -1568,6 +1733,12 @@ pub(super) fn ontkoppel_plan(
         "Gevolg",
         "alleen de koppeling verdwijnt; het bestand blijft in het digitaal archief en kan daarna worden verwijderd",
     ));
+    if danger {
+        lines.push(line(
+            "Let op",
+            "een koppeling met een bankregel, relatie of offerte kan EB MCP niet terugzetten; dat moet dan in e-Boekhouden zelf",
+        ));
+    }
     Ok((
         Built {
             body: json!({"koppelIds": ids}),
@@ -1575,6 +1746,7 @@ pub(super) fn ontkoppel_plan(
             lines,
         },
         ids,
+        danger,
     ))
 }
 
