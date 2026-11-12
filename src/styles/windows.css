@@ -31,8 +31,12 @@
 /* Fluent keeps a flat sidebar on Mica: no floating glass card as on macOS (AppShell.vue). */
 :root[data-platform='windows'] .shell { background: transparent; }
 :root[data-platform='windows'] .sidebar {
-  margin: 0; padding: 0 10px 12px; border-radius: 0; background: transparent; box-shadow: none;
+  margin: 0; border-radius: 0; background: transparent; box-shadow: none;
   -webkit-backdrop-filter: none; backdrop-filter: none;
 }
+:root[data-platform='windows'] .side-inner { padding: 0 10px 12px; }
+/* The window buttons sit in Windows' own title bar, so the collapsed toolbar needs no room for them. */
+:root[data-platform='windows'] .shell { --toolbar-start: 16px; }
+:root[data-platform='windows'] .side-toggle { border-radius: 4px; }
 :root[data-platform='windows'] .traffic-space { height: 52px; }
 :root[data-platform='windows'] .main { background: var(--content); border-left: 0.5px solid var(--line-soft); }

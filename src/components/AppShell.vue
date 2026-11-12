@@ -1,10 +1,14 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Alert from './Alert.vue'
 import { store } from '../lib/accounts'
 import { approvalState, connectApprovals, quitWarning, waitingText, type Proposal } from '../lib/approvals'
 import { hostPort, inApp, modKey, quitApp, server, startupNotice, watchServer } from '../lib/server'
+import {
+  clampWidth, isSidebarShortcut, loadSidebar, saveSidebar, setSidebarCollapsed, setSidebarWidth, sidebar, sidebarShortcut, sidebarShortcutAria,
+  SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SIDEBAR_STEP,
+} from '../lib/sidebar'
 import Icon from './Icon.vue'
 import ToastStack, { type Toast } from './ToastStack.vue'
 import UpdateUi from './UpdateUi.vue'
@@ -20,12 +24,76 @@ const nav = [
 const route = useRoute()
 const router = useRouter()
 
+// The width and the collapsed state the user left, read before the first render so the sidebar never jumps.
+loadSidebar()
+
 // Cmd+, (Ctrl+, on Windows) opens Instellingen, as in every Mac app.
 function onKey(event: KeyboardEvent) {
   if (event.key === ',' && (event.metaKey || event.ctrlKey)) {
     event.preventDefault()
     void router.push('/instellingen')
+    return
   }
+  if (isSidebarShortcut(event)) {
+    event.preventDefault()
+    // Not behind an open dialog: it would hand the focus back to a sidebar that is no longer there.
+    if (!document.querySelector('[aria-modal="true"]')) void toggleSidebar()
+  }
+}
+
+// Collapsing: the sidebar's button moves to the toolbar. Whoever had the focus on one button (or in the sidebar)
+// gets it on the other, so the focus never stays behind in a sidebar that is out of reach.
+const sideEl = ref<HTMLElement | null>(null)
+const sideToggle = ref<HTMLButtonElement | null>(null)
+const barToggle = ref<HTMLButtonElement | null>(null)
+const toggleLabel = computed(() => (sidebar.collapsed ? 'Zijbalk tonen' : 'Zijbalk verbergen'))
+// The width animates only while the sidebar opens or closes; dragging and the arrow keys follow the hand at once.
+const toggling = ref(false)
+let toggleTimer: ReturnType<typeof setTimeout> | undefined
+async function toggleSidebar() {
+  const active = document.activeElement
+  const moveFocus = active === sideToggle.value || active === barToggle.value || (active instanceof Node && !!sideEl.value?.contains(active))
+  toggling.value = true
+  clearTimeout(toggleTimer)
+  toggleTimer = setTimeout(() => (toggling.value = false), 300)
+  setSidebarCollapsed(!sidebar.collapsed)
+  if (!moveFocus) return
+  await nextTick()
+  ;(sidebar.collapsed ? barToggle.value : sideToggle.value)?.focus()
+}
+
+// The handle on the sidebar's right edge: drag it, or use the arrow keys, Home and End; a double click resets it.
+const resizing = ref(false)
+let drag: { pointer: number; startX: number; startWidth: number } | null = null
+function onHandleDown(event: PointerEvent) {
+  if (event.button !== 0 || sidebar.collapsed) return
+  // No text selection and no focus ring from the press itself.
+  event.preventDefault()
+  const handle = event.currentTarget as HTMLElement
+  handle.setPointerCapture?.(event.pointerId)
+  drag = { pointer: event.pointerId, startX: event.clientX, startWidth: sidebar.width }
+  resizing.value = true
+}
+function onHandleMove(event: PointerEvent) {
+  if (!drag || event.pointerId !== drag.pointer) return
+  sidebar.width = clampWidth(drag.startWidth + event.clientX - drag.startX)
+}
+function onHandleUp(event: PointerEvent) {
+  if (!drag || event.pointerId !== drag.pointer) return
+  drag = null
+  resizing.value = false
+  const handle = event.currentTarget as HTMLElement
+  if (handle.hasPointerCapture?.(event.pointerId)) handle.releasePointerCapture(event.pointerId)
+  saveSidebar()
+}
+function onHandleKey(event: KeyboardEvent) {
+  const next: Record<string, number> = {
+    ArrowLeft: sidebar.width - SIDEBAR_STEP, ArrowRight: sidebar.width + SIDEBAR_STEP, Home: SIDEBAR_MIN, End: SIDEBAR_MAX,
+  }
+  const width = next[event.key]
+  if (width === undefined) return
+  event.preventDefault()
+  setSidebarWidth(width)
 }
 onMounted(() => window.addEventListener('keydown', onKey))
 
@@ -116,43 +184,78 @@ function openToast(id: Toast['id']) {
 onBeforeUnmount(() => {
   unmounted = true
   window.removeEventListener('keydown', onKey)
+  clearTimeout(toggleTimer)
   unlistenQuit?.()
   stopServer?.()
 })
 </script>
 
 <template>
-  <div class="shell">
-    <nav class="sidebar" aria-label="Hoofdmenu" data-tauri-drag-region>
-      <div class="traffic-space" data-tauri-drag-region />
-      <div class="section-label side-label" data-tauri-drag-region>EB MCP</div>
-      <RouterLink
-        v-for="item in nav" :key="item.to" :to="item.to" class="nav" active-class="active"
-        :aria-label="item.to === '/akkoord' && waiting ? `${item.label}, ${waitingText(waiting)}` : undefined"
-      >
-        <Icon :name="item.icon" class="nav-icon" />
-        <span>{{ item.label }}</span>
-        <Transition v-if="item.to === '/akkoord'" name="pop">
-          <span v-if="waiting" class="nav-badge" aria-hidden="true">{{ waiting }}</span>
-        </Transition>
-      </RouterLink>
-      <div class="side-foot">
-        <UpdateUi />
-        <RouterLink to="/instellingen" class="nav settings" active-class="active">
-          <Icon name="settings" class="nav-icon" />
-          <span>Instellingen</span>
-          <span class="shortcut">{{ modKey }},</span>
+  <div
+    class="shell" :class="{ collapsed: sidebar.collapsed, toggling, resizing }"
+    :style="{ '--side-w': `${sidebar.width}px` }"
+  >
+    <!-- Collapsed, the sidebar is inert: its links leave the tab order and assistive tech skips them. Open, the attribute
+         is left out (undefined), never written as inert="false", which would still count as inert. -->
+    <nav id="app-sidebar" ref="sideEl" class="sidebar" aria-label="Hoofdmenu" :inert="sidebar.collapsed || undefined" data-tauri-drag-region>
+      <!-- The inside keeps the full width while the sidebar opens or closes, so nothing in it wraps or shifts. -->
+      <div class="side-inner" data-tauri-drag-region>
+        <div class="traffic-space" data-tauri-drag-region>
+          <button
+            ref="sideToggle" type="button" class="side-toggle" aria-controls="app-sidebar" :aria-expanded="!sidebar.collapsed"
+            :aria-label="toggleLabel" :aria-keyshortcuts="sidebarShortcutAria" :title="`${toggleLabel} (${sidebarShortcut})`"
+            @click="toggleSidebar"
+          >
+            <Icon name="sidebar-left" :size="18" />
+          </button>
+        </div>
+        <div class="section-label side-label" data-tauri-drag-region>EB MCP</div>
+        <RouterLink
+          v-for="item in nav" :key="item.to" :to="item.to" class="nav" active-class="active"
+          :aria-label="item.to === '/akkoord' && waiting ? `${item.label}, ${waitingText(waiting)}` : undefined"
+        >
+          <Icon :name="item.icon" class="nav-icon" />
+          <span class="nav-label">{{ item.label }}</span>
+          <Transition v-if="item.to === '/akkoord'" name="pop">
+            <span v-if="waiting" class="nav-badge" aria-hidden="true">{{ waiting }}</span>
+          </Transition>
         </RouterLink>
-        <span class="server-line">
-          <span class="dot" :class="info?.running ? 'on' : 'bad'" />
-          {{ info?.running ? 'MCP actief' : 'MCP staat uit' }}
-        </span>
-        <span class="mono server-addr">{{ info?.error ?? (address || '\u00a0') }}</span>
+        <div class="side-foot">
+          <UpdateUi />
+          <RouterLink to="/instellingen" class="nav settings" active-class="active">
+            <Icon name="settings" class="nav-icon" />
+            <span class="nav-label">Instellingen</span>
+            <span class="shortcut">{{ modKey }},</span>
+          </RouterLink>
+          <span class="server-line">
+            <span class="dot" :class="info?.running ? 'on' : 'bad'" />
+            <span class="server-state">{{ info?.running ? 'MCP actief' : 'MCP staat uit' }}</span>
+          </span>
+          <span class="mono server-addr">{{ info?.error ?? (address || '\u00a0') }}</span>
+        </div>
       </div>
     </nav>
+    <div
+      class="side-handle" :class="{ 'at-min': sidebar.width <= SIDEBAR_MIN, 'at-max': sidebar.width >= SIDEBAR_MAX }"
+      role="separator" aria-orientation="vertical" aria-label="Breedte van de zijbalk" aria-controls="app-sidebar"
+      :aria-valuemin="SIDEBAR_MIN" :aria-valuemax="SIDEBAR_MAX" :aria-valuenow="sidebar.width"
+      :aria-valuetext="`${sidebar.width} pixels breed`" :tabindex="sidebar.collapsed ? -1 : 0" :inert="sidebar.collapsed || undefined"
+      @pointerdown="onHandleDown" @pointermove="onHandleMove" @pointerup="onHandleUp" @pointercancel="onHandleUp"
+      @lostpointercapture="onHandleUp" @dblclick="setSidebarWidth(SIDEBAR_DEFAULT)" @keydown="onHandleKey"
+    />
     <main class="main">
       <!-- deep: the title drags too; buttons in the toolbar stay clickable. -->
       <header class="toolbar" data-tauri-drag-region="deep">
+        <!-- Collapsed, the sidebar's button waits here, clear of the window buttons; the title moves aside for it. -->
+        <Transition name="fade">
+          <button
+            v-if="sidebar.collapsed" ref="barToggle" type="button" class="side-toggle bar-toggle" aria-controls="app-sidebar"
+            :aria-expanded="!sidebar.collapsed" :aria-label="toggleLabel" :aria-keyshortcuts="sidebarShortcutAria"
+            :title="`${toggleLabel} (${sidebarShortcut})`" @click="toggleSidebar"
+          >
+            <Icon name="sidebar-left" :size="18" />
+          </button>
+        </Transition>
         <h1>{{ title }}</h1>
         <span id="toolbar-actions" class="toolbar-actions" />
       </header>
@@ -199,15 +302,35 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.shell { display: flex; height: 100%; background: var(--glass-window); }
-/* A floating glass sidebar, inset from the window edge, with the traffic lights inside it (the boards' window()). */
+.shell {
+  /* Where the toolbar's sidebar button starts when the sidebar is collapsed: clear of the three window buttons
+     (trafficLightPosition x 22 in tauri.conf.json). Windows has its window buttons in the title bar: windows.css. */
+  --toolbar-start: 92px;
+  display: flex; height: 100%; background: var(--glass-window);
+}
+/* A floating glass sidebar, inset from the window edge, with the traffic lights inside it (the boards' window()).
+   Its width is the user's (--side-w, from lib/sidebar.ts); collapsed it narrows to nothing and fades. */
 .sidebar {
-  width: 216px; flex: none; box-sizing: border-box; display: flex; flex-direction: column;
-  margin: 8px 0 8px 8px; padding: 0 10px 10px; border-radius: 14px;
+  width: var(--side-w); flex: none; box-sizing: border-box; overflow: hidden;
+  margin: 8px 0 8px 8px; border-radius: 14px;
   background: var(--glass-side); box-shadow: var(--glass-side-edge);
   -webkit-backdrop-filter: blur(30px) saturate(180%); backdrop-filter: blur(30px) saturate(180%);
+  transition: margin-left 220ms var(--ease), opacity 220ms var(--ease);
 }
-.traffic-space { height: 44px; flex: none; }
+.shell.toggling .sidebar { transition: width 220ms var(--ease), margin-left 220ms var(--ease), opacity 220ms var(--ease); }
+.shell.collapsed .sidebar { width: 0; margin-left: 0; opacity: 0; }
+.side-inner {
+  width: var(--side-w); height: 100%; box-sizing: border-box; display: flex; flex-direction: column; padding: 0 10px 10px;
+}
+.traffic-space { height: 44px; flex: none; display: flex; align-items: center; justify-content: flex-end; }
+/* The macOS sidebar button: the glyph alone, a soft fill on hover. */
+.side-toggle {
+  box-sizing: border-box; width: 28px; height: 28px; flex: none; display: inline-flex; align-items: center; justify-content: center;
+  padding: 0; border: 0; border-radius: 999px; background: transparent; color: var(--muted);
+  transition: background-color 150ms ease, color 150ms ease, box-shadow 150ms ease;
+}
+.side-toggle:hover { background: var(--hover); color: var(--text); }
+.side-toggle:focus-visible { outline: none; box-shadow: 0 0 0 3.5px rgba(10, 132, 255, 0.42); }
 .side-label { padding: 6px 8px 4px; }
 .nav {
   box-sizing: border-box; height: 28px; display: flex; align-items: center; gap: 8px; padding: 0 8px;
@@ -216,14 +339,38 @@ onBeforeUnmount(() => {
 .nav:hover { background: var(--hover); }
 .nav.active { background: var(--selected); }
 .nav-icon { color: var(--accent); }
+/* A narrow sidebar shortens the label, never the badge or the shortcut beside it. */
+.nav-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .settings { margin: 0 -4px 4px; }
-.shortcut { margin-left: auto; font-size: 11px; color: var(--muted); }
-.side-foot { margin-top: auto; display: flex; flex-direction: column; gap: 6px; padding: 0 4px; }
-.server-line { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 500; }
-.server-addr { font-size: 11px; color: var(--muted); padding-left: 14px; }
+.shortcut { flex: none; margin-left: auto; font-size: 11px; color: var(--muted); }
+.side-foot { margin-top: auto; display: flex; flex-direction: column; gap: 6px; padding: 0 4px; min-width: 0; }
+.server-line { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 500; min-width: 0; }
+.server-state { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* An error from the server wraps rather than being cut: it is the only place it shows. */
+.server-addr { font-size: 11px; color: var(--muted); padding-left: 14px; overflow-wrap: anywhere; }
+/* The handle straddles the sidebar's right edge without taking room; a thin line fades in on hover. */
+.side-handle {
+  position: relative; z-index: 2; flex: none; width: 10px; margin: 8px -5px; cursor: col-resize; outline: none; touch-action: none;
+}
+.side-handle.at-min { cursor: e-resize; }
+.side-handle.at-max { cursor: w-resize; }
+.side-handle::after {
+  content: ''; position: absolute; top: 14px; bottom: 14px; left: 4px; width: 2px; border-radius: 1px;
+  background: var(--line); opacity: 0; transition: opacity 150ms ease, background-color 150ms ease;
+}
+.side-handle:hover::after, .shell.resizing .side-handle::after { opacity: 1; }
+.side-handle:focus-visible::after { opacity: 1; background: var(--accent); }
+.shell.collapsed .side-handle { visibility: hidden; }
+/* While dragging: the resize cursor everywhere and no text selection, also over the content. */
+.shell.resizing, .shell.resizing :deep(*) { cursor: col-resize; -webkit-user-select: none; user-select: none; }
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.toolbar { height: 52px; flex: none; display: flex; align-items: center; padding: 0 20px; }
-.toolbar h1 { font-size: 15px; font-weight: 700; }
+.toolbar {
+  position: relative; height: 52px; flex: none; display: flex; align-items: center; padding: 0 20px;
+  transition: padding-left 220ms var(--ease);
+}
+.shell.collapsed .toolbar { padding-left: calc(var(--toolbar-start) + 28px + 10px); }
+.bar-toggle { position: absolute; left: var(--toolbar-start); top: 50%; margin-top: -14px; }
+.toolbar h1 { font-size: 15px; font-weight: 700; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .toolbar-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 .content-area { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 .content { flex: 1; min-height: 0; overflow: auto; }
@@ -240,6 +387,9 @@ onBeforeUnmount(() => {
 .nav-badge {
   margin-left: auto; box-sizing: border-box; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px;
   background: var(--accent); color: #fff; font-size: 11px; font-weight: 600; line-height: 18px; text-align: center;
-  font-variant-numeric: tabular-nums;
+  font-variant-numeric: tabular-nums; flex: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sidebar, .shell.toggling .sidebar, .toolbar { transition: none; }
 }
 </style>

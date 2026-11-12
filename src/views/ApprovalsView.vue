@@ -763,7 +763,8 @@ h3 { margin: 0; }
 .confirm-list li { overflow-wrap: anywhere; }
 .confirm-list li.danger { color: var(--danger); }
 .confirm-list .confirm-account, .confirm-list .more { color: var(--muted); }
-@media (max-width: 1240px) { .detail { width: 340px; } }
+/* Below the default window width (1240): the detail keeps its full 400 at the size the app opens in. */
+@media (max-width: 1239px) { .detail { width: 340px; } }
 @media (max-width: 1080px) { .detail { width: 300px; } }
 @media (prefers-reduced-motion: reduce) {
   .detail { animation: fade-in 150ms ease both; }

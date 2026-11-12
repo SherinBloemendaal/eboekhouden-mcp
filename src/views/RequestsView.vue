@@ -565,7 +565,8 @@ h3 { display: flex; align-items: center; margin: 0; }
 .icon-btn { width: 24px; height: 24px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); transition: background-color 150ms ease, color 150ms ease, transform 120ms var(--ease); }
 .icon-btn:hover { background: var(--hover); color: var(--text); }
 .icon-btn:active { transform: scale(0.92); }
-@media (max-width: 1240px) { .detail { width: 340px; } }
+/* Below the default window width (1240): the detail keeps its full 400 at the size the app opens in. */
+@media (max-width: 1239px) { .detail { width: 340px; } }
 @media (max-width: 1080px) { .detail { width: 300px; } }
 /* A wide list with a wait listed gives Duur room for the wait beside the work time; narrower, Duur is as it always was. */
 @container requests (min-width: 900px) {
