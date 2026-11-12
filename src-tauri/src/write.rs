@@ -88,7 +88,7 @@ pub fn kostenplaatsen_from_api(list: &Value) -> Result<Vec<Kostenplaats>, String
 /// Whether one of the lines a mutatie tool was given names a kostenplaats: only then are the kostenplaatsen
 /// read and checked.
 pub fn names_kostenplaats(regels: Option<&[RegelArg]>) -> bool {
-    regels.is_some_and(|r| r.iter().any(|r| r.kostenplaats_id.is_some()))
+    regels.is_some_and(|r| r.iter().any(|r| r.kostenplaats_id.unwrap_or(0) > 0))
 }
 
 /// Whether a mutatie as `GET mutatie/nr/{nr}/model` gives it has a kostenplaats on one of its lines.
@@ -455,7 +455,7 @@ pub struct RegelArg {
     pub btw_code: Option<String>,
     /// Eigen omschrijving van deze regel (standaard die van de mutatie).
     pub omschrijving: Option<String>,
-    /// Id van een actieve kostenplaats voor deze regel (uit kostenplaatsen). Alleen als de administratie kostenplaatsen gebruikt.
+    /// Id van een actieve kostenplaats voor deze regel (uit kostenplaatsen). Alleen als de administratie kostenplaatsen gebruikt; 0 of weglaten is geen kostenplaats.
     #[serde(default)]
     pub kostenplaats_id: Option<u64>,
 }
@@ -587,6 +587,7 @@ fn regels_from(args: &[RegelArg], books: &Books) -> Result<Vec<Regel>, String> {
                 omschrijving: text(&regel.omschrijving),
                 kostenplaats: regel
                     .kostenplaats_id
+                    .filter(|id| *id > 0)
                     .map(|id| books.kostenplaats(id).map(|k| k.id))
                     .transpose()?,
             })
@@ -991,6 +992,19 @@ pub fn mutatie_gewijzigd(
     }
     let mut lines = vec![line("Mutatie", format!("nr {}", args.nr))];
     lines.extend(mutatie.lines(books, None));
+    // New lines replace the old ones: a kostenplaats an old line had and no new line carries lapses, said aloud.
+    let mut vervalt: Vec<u64> = Vec::new();
+    for id in before.regels.iter().filter_map(|r| r.kostenplaats) {
+        if !mutatie.regels.iter().any(|r| r.kostenplaats == Some(id)) && !vervalt.contains(&id) {
+            vervalt.push(id);
+        }
+    }
+    for id in vervalt {
+        lines.push(line(
+            "Kostenplaats",
+            format!("kostenplaats {} vervalt", books.kostenplaats_label(id)),
+        ));
+    }
     Ok(Built {
         body: mutatie.body(Some(args.nr), None),
         title: format!("Mutatie {} wijzigen ({})", args.nr, mutatie.soort.naam()),
@@ -2598,10 +2612,42 @@ mod tests {
         let mut line = regel("4550", 2.0, None);
         line.kostenplaats_id = Some(501);
         args.regels = Some(vec![line]);
-        let body = mutatie_gewijzigd(&args, &model, &met_kostenplaatsen())
-            .unwrap()
-            .body;
-        assert_eq!(body["mutatieRegels"][0]["kostenplaats"], 501);
+        let built = mutatie_gewijzigd(&args, &model, &met_kostenplaatsen()).unwrap();
+        assert_eq!(built.body["mutatieRegels"][0]["kostenplaats"], 501);
+        // The old line's kostenplaats is on no new line: the approval says it lapses.
+        let lapses = |built: &Built| {
+            built
+                .lines
+                .iter()
+                .filter(|l| l.label == "Kostenplaats")
+                .map(|l| l.value.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lapses(&built), ["kostenplaats Projecten>Noord vervalt"]);
+        // New lines without any kostenplaats: the same, and the body carries none.
+        args.regels = Some(vec![regel("4550", 2.0, None)]);
+        let built = mutatie_gewijzigd(&args, &model, &met_kostenplaatsen()).unwrap();
+        assert!(built.body["mutatieRegels"][0].get("kostenplaats").is_none());
+        assert_eq!(lapses(&built), ["kostenplaats Projecten>Noord vervalt"]);
+        // A new line that carries the same kostenplaats keeps it: nothing lapses.
+        let mut same = regel("4700", 3.0, None);
+        same.kostenplaats_id = Some(502);
+        args.regels = Some(vec![same]);
+        let built = mutatie_gewijzigd(&args, &model, &met_kostenplaatsen()).unwrap();
+        assert!(lapses(&built).is_empty(), "{:?}", built.lines);
+    }
+
+    #[test]
+    fn a_kostenplaats_id_of_zero_is_no_kostenplaats() {
+        let mut args = toevoegen(Soort::GeldUitgegeven);
+        args.rekening = Some("1010".into());
+        let mut line = regel("4550", 2.0, None);
+        line.kostenplaats_id = Some(0);
+        args.regels = Some(vec![line]);
+        assert!(!names_kostenplaats(args.regels.as_deref()));
+        // No kostenplaatsen read (an empty list) and still fine: 0 asks for none.
+        let built = mutatie_nieuw(&args, &books()).unwrap();
+        assert!(built.body["mutatieRegels"][0].get("kostenplaats").is_none());
     }
 
     #[test]

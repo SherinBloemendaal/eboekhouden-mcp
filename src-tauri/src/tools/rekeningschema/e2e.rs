@@ -4,7 +4,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use axum::body::Bytes;
 use axum::extract::{Path, RawQuery};
+use axum::http::{Method, Uri};
 use axum::routing::{get, post};
 use serde_json::{Value, json};
 
@@ -34,6 +36,19 @@ async fn eboekhouden(changes: Changes, kostenplaatsen_aan: Arc<AtomicBool>) -> S
             let changes = changes.clone();
             async move {
                 note(&changes, format!("DELETE {path}/{id}"), Value::Null);
+                axum::Json(json!(true))
+            }
+        }
+    };
+    // Any request to a path or method this stand-in does not know is noted as a stray, so a change that goes
+    // anywhere unexpected shows up in the tests' lists of what was sent.
+    let stray = {
+        let changes = changes.clone();
+        move |method: Method, uri: Uri, body: Bytes| {
+            let changes = changes.clone();
+            async move {
+                let body = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+                note(&changes, format!("STRAY {method} {}", uri.path()), body);
                 axum::Json(json!(true))
             }
         }
@@ -128,9 +143,28 @@ async fn eboekhouden(changes: Changes, kostenplaatsen_aan: Arc<AtomicBool>) -> S
             get(|| async { axum::Json(json!([{"code": "GEEN", "omschrijving": "Geen btw", "percentage": 0, "soort": ""}])) }),
         )
         .route(
+            "/v1/api/setting/administratie.use-rgs",
+            get(|| async { axum::Json(json!({"name": "administratie.use-rgs", "value": "nee"})) }),
+        )
+        .route(
             "/v1/api/mutatie",
-            post(sent(c.clone(), "POST", "mutatie", json!({"mutNr": 3909, "mutId": 4770877557u64}))),
-        );
+            post(sent(c.clone(), "POST", "mutatie", json!({"mutNr": 3909, "mutId": 4770877557u64})))
+                .put(sent(c.clone(), "PUT", "mutatie", json!({"mutNr": 3908, "mutId": 4770877558u64}))),
+        )
+        .route(
+            "/v1/api/mutatie/nr/3908/model",
+            // A mutatie whose one line has kostenplaats 502 (Projecten>Noord).
+            get(|| async {
+                axum::Json(json!({
+                    "folderKoppelId": 3908,
+                    "mutatie": {"betalingsKenmerk": "", "boekstuk": "", "datum": "2026-11-06T00:00:00", "factuur": "", "inEx": "IN", "nr": 3908,
+                                "omschrijving": "Parkeergarage", "rekening": 11, "relatieId": 0, "soort": 6, "termijn": 0},
+                    "mutatieRegels": [{"bedrag": 2, "btw": 0, "btwCode": "GEEN", "index": 0, "kostenplaats": 502, "omschrijving": "Parkeergarage", "tegenRekening": 45}]
+                }))
+            }),
+        )
+        .fallback(stray.clone())
+        .method_not_allowed_fallback(stray);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -247,6 +281,15 @@ impl Harness {
             .accounts
             .update(self.account.id, input(mode))
             .unwrap();
+    }
+
+    /// Nothing went to a path or method the stand-in does not know.
+    fn no_strays(&self) {
+        let changes = self.changes();
+        assert!(
+            !changes.iter().any(|(what, _)| what.starts_with("STRAY")),
+            "{changes:?}"
+        );
     }
 
     fn changes(&self) -> Vec<(String, Value)> {
@@ -428,6 +471,7 @@ async fn grootboekrekeningen_change_only_after_approval() {
         .await;
     assert_eq!(status, Status::Done);
     assert_eq!(h.changes().last().unwrap().0, "DELETE grootboekrekening/45");
+    h.no_strays();
     assert_eq!(h.changes().len(), 4);
 }
 
@@ -486,10 +530,28 @@ async fn rekeninggroepen_change_only_after_approval() {
             json!({"code":"KOST","id":7,"naam":"Algemene kosten"})
         )
     );
+    // An id the administration does not know: said plainly, nothing asked or sent.
+    for tool in ["rekeninggroep_wijzigen", "rekeninggroep_verwijderen"] {
+        let (is_error, text) = h.call(tool, json!({"id": 99, "naam": "x"})).await;
+        assert!(
+            is_error && text.contains("Geen rekeninggroep met id 99"),
+            "{tool}: {text}"
+        );
+    }
+    assert_eq!(h.state.approvals.count(), 0);
+    assert_eq!(h.changes().len(), 2);
+
+    // A new code always asks, and says how many rekeningen are in the group.
     h.call("rekeninggroep_wijzigen", json!({"id": 7, "code": "ALG"}))
         .await;
-    h.decide(true, "Rekeninggroep wijzigen: KOST Kosten", true)
+    let (proposal, _) = h
+        .decide(true, "Rekeninggroep wijzigen: KOST Kosten", true)
         .await;
+    assert!(
+        has_line(&proposal, "Rekeningen in deze groep", "1: 4550 Bankkosten"),
+        "{:?}",
+        proposal.lines
+    );
     assert_eq!(
         h.changes()[2],
         change(
@@ -499,9 +561,16 @@ async fn rekeninggroepen_change_only_after_approval() {
     );
 
     h.call("rekeninggroep_verwijderen", json!({"id": 7})).await;
-    h.decide(true, "Rekeninggroep verwijderen: KOST Kosten", true)
+    let (proposal, _) = h
+        .decide(true, "Rekeninggroep verwijderen: KOST Kosten", true)
         .await;
+    assert!(
+        has_line(&proposal, "Rekeningen in deze groep", "1: 4550 Bankkosten"),
+        "{:?}",
+        proposal.lines
+    );
     assert_eq!(h.changes().last().unwrap().0, "DELETE rekeninggroep/7");
+    h.no_strays();
 }
 
 #[tokio::test]
@@ -615,4 +684,79 @@ async fn kostenplaatsen_change_only_after_approval_and_go_on_a_mutatie_line() {
         "{:?}",
         history.proposal.lines
     );
+    h.no_strays();
+}
+
+#[tokio::test]
+async fn an_edited_mutatie_keeps_or_names_its_kostenplaats() {
+    let h = Harness::new().await;
+    h.set_write(WriteMode::Auto);
+    let last_lines = |h: &Harness| h.state.approvals.history(Some(1))[0].proposal.lines.clone();
+
+    // A kept line keeps its kostenplaats and shows it by name; with kostenplaatsen turned off that still works,
+    // since nothing new is named.
+    h.kostenplaatsen_aan.store(false, Ordering::SeqCst);
+    let (is_error, text) = h
+        .call(
+            "mutatie_wijzigen",
+            json!({"nr": 3908, "datum": "2026-11-07"}),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    let (what, body) = &h.changes()[0];
+    assert_eq!(what, "PUT mutatie");
+    assert_eq!(body["mutatieRegels"][0]["kostenplaats"], 502, "{body}");
+    assert_eq!(body["mutatie"]["datum"], "2026-11-07");
+    assert!(
+        last_lines(&h)
+            .iter()
+            .any(|l| l.label == "Regel 1" && l.value.ends_with("kostenplaats Projecten>Noord")),
+        "{:?}",
+        last_lines(&h)
+    );
+
+    // A named one needs kostenplaatsen turned on.
+    let named = json!({"nr": 3908, "regels": [{"tegenrekening": "4550", "bedrag": 2, "kostenplaats_id": 501}]});
+    let (is_error, text) = h.call("mutatie_wijzigen", named.clone()).await;
+    assert!(is_error && text.contains("geen kostenplaatsen"), "{text}");
+    assert_eq!(h.changes().len(), 1);
+
+    // New lines with another kostenplaats: sent, and the approval says the old one lapses.
+    h.kostenplaatsen_aan.store(true, Ordering::SeqCst);
+    let (is_error, text) = h.call("mutatie_wijzigen", named).await;
+    assert!(!is_error, "{text}");
+    assert_eq!(h.changes()[1].1["mutatieRegels"][0]["kostenplaats"], 501);
+    let lines = last_lines(&h);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.label == "Regel 1" && l.value.ends_with("kostenplaats Projecten")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.label == "Kostenplaats" && l.value == "kostenplaats Projecten>Noord vervalt"),
+        "{lines:?}"
+    );
+
+    // 0 is no kostenplaats: nothing is checked, the line goes without one, and the old one lapses.
+    let (is_error, text) = h
+        .call("mutatie_wijzigen", json!({"nr": 3908, "regels": [{"tegenrekening": "4550", "bedrag": 2, "kostenplaats_id": 0}]}))
+        .await;
+    assert!(!is_error, "{text}");
+    assert!(
+        h.changes()[2].1["mutatieRegels"][0]
+            .get("kostenplaats")
+            .is_none()
+    );
+    assert!(
+        last_lines(&h)
+            .iter()
+            .any(|l| l.value == "kostenplaats Projecten>Noord vervalt"),
+        "{:?}",
+        last_lines(&h)
+    );
+    assert_eq!(h.changes().len(), 3);
+    h.no_strays();
 }

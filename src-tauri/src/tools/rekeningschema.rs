@@ -148,6 +148,8 @@ pub struct KostenplaatsWijzigenArgs {
 
 /// The setting e-Boekhouden's mutatie form reads to show the kostenplaats of a line (`administratieUseKostenplaatsen`).
 const KOSTENPLAATSEN_AAN: &str = "setting/administratie.use-kostenplaatsen";
+/// The setting the grootboekrekening form reads to send a rekening's RGS code (`administratieUseRgs`).
+const RGS: &str = "setting/administratie.use-rgs";
 
 impl EbMcp {
     /// Every grootboekrekening of the administration, inactive ones included.
@@ -177,6 +179,18 @@ impl EbMcp {
 
     async fn groepen(&self, run: &Run) -> Result<Vec<Groep>, String> {
         build::groepen_from(&self.fetch(run, "rekeninggroep", Vec::new()).await?)
+    }
+
+    /// Whether the administration uses RGS codes, as the grootboekrekening form decides it (`hasRgs`): the setting
+    /// `administratie.use-rgs` is there and is not "nee".
+    async fn rgs(&self, run: &Run) -> Result<bool, String> {
+        let setting = self
+            .fetch(run, RGS, vec![("acc".to_owned(), "false".to_owned())])
+            .await?;
+        Ok(setting
+            .get("value")
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.trim().eq_ignore_ascii_case("nee")))
     }
 
     async fn kostenplaats_lijst(&self, run: &Run) -> Result<Vec<Kostenplaats>, String> {
@@ -434,6 +448,7 @@ impl EbMcp {
                     .await?;
                 let categorieen = this.categorieen(&run, true).await?;
                 let groepen = this.groepen(&run).await?;
+                let rgs = this.rgs(&run).await?;
                 let (built, serious) = build::grootboekrekening_gewijzigd(
                     &args,
                     id,
@@ -441,6 +456,7 @@ impl EbMcp {
                     &rekeningen,
                     &categorieen,
                     &groepen,
+                    rgs,
                 )?;
                 this.approve(&run, TOOL, &built, serious).await?;
                 this.change_done(&run, "PUT", "grootboekrekening", Some(&built.body))
@@ -546,11 +562,14 @@ impl EbMcp {
             args,
             "Rekeninggroep gewijzigd",
             move |this, run, args| async move {
+                let groepen = this.groepen(&run).await?;
+                build::groep_bekend(&groepen, args.id)?;
                 let now = this
                     .fetch(&run, &format!("rekeninggroep/{}", args.id), Vec::new())
                     .await?;
-                let groepen = this.groepen(&run).await?;
-                let (built, serious) = build::rekeninggroep_gewijzigd(&args, &now, &groepen)?;
+                let rekeningen = this.alle_rekeningen(&run).await?;
+                let (built, serious) =
+                    build::rekeninggroep_gewijzigd(&args, &now, &groepen, &rekeningen)?;
                 this.approve(&run, TOOL, &built, serious).await?;
                 this.change_done(&run, "PUT", "rekeninggroep", Some(&built.body))
                     .await
@@ -582,10 +601,13 @@ impl EbMcp {
             args,
             "Rekeninggroep verwijderd",
             move |this, run, args| async move {
+                let groepen = this.groepen(&run).await?;
+                build::groep_bekend(&groepen, args.id)?;
                 let now = this
                     .fetch(&run, &format!("rekeninggroep/{}", args.id), Vec::new())
                     .await?;
-                let built = build::rekeninggroep_weg(&now)?;
+                let rekeningen = this.alle_rekeningen(&run).await?;
+                let built = build::rekeninggroep_weg(args.id, &now, &rekeningen)?;
                 this.approve(&run, TOOL, &built, true).await?;
                 this.change_done(&run, "DELETE", &format!("rekeninggroep/{}", args.id), None)
                     .await

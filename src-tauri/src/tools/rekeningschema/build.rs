@@ -95,6 +95,8 @@ pub(super) struct GridRekening {
     pub id: u64,
     pub code: String,
     pub omschrijving: String,
+    /// The grid's `rekeningGroep` column, empty when the rekening is in no group.
+    pub groep: String,
 }
 
 /// The rows of `grootboekrekening/gridtable` after `named_rows`.
@@ -115,9 +117,66 @@ pub(super) fn rekeningen_from(grid: &Value) -> Result<Vec<GridRekening>, String>
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
+                groep: row
+                    .get("rekeningGroep")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned(),
             })
         })
         .collect())
+}
+
+/// The rekeningen of a group. The grid's `rekeningGroep` column names the group; the bundle does not show
+/// whether by code, by naam or as the picker's "code - naam", so any of the three counts.
+fn in_groep<'a>(rekeningen: &'a [GridRekening], groep: &Groep) -> Vec<&'a GridRekening> {
+    let picker = format!("{} - {}", groep.code, groep.naam);
+    rekeningen
+        .iter()
+        .filter(|r| {
+            !r.groep.is_empty()
+                && (r.groep == groep.code
+                    || r.groep.eq_ignore_ascii_case(&groep.naam)
+                    || r.groep == picker)
+        })
+        .collect()
+}
+
+/// The approval line that says how many rekeningen a group holds, and which.
+fn in_groep_line(rekeningen: &[GridRekening], groep: &Groep) -> Line {
+    let found = in_groep(rekeningen, groep);
+    let value = match found.len() {
+        0 => "geen".to_owned(),
+        n => format!(
+            "{n}: {}",
+            found
+                .iter()
+                .map(|r| format!("{} {}", r.code, r.omschrijving))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    line("Rekeningen in deze groep", value)
+}
+
+/// Whether the group list knows `id`, before the group itself is read. A list without ids proves nothing.
+pub(super) fn groep_bekend(groepen: &[Groep], id: u64) -> Result<(), String> {
+    if groepen.iter().any(|g| g.id > 0) && !groepen.iter().any(|g| g.id == id) {
+        return Err(geen_groep(id));
+    }
+    Ok(())
+}
+
+fn geen_groep(id: u64) -> String {
+    format!("Geen rekeninggroep met id {id} in deze administratie (zie rekeninggroepen)")
+}
+
+/// The group `GET rekeninggroep/{id}` gave, or the plain refusal when it gave none.
+fn groep_of(now: &Value, id: u64) -> Result<Groep, String> {
+    groep_from(now)
+        .filter(|g| g.id == 0 || g.id == id)
+        .ok_or_else(|| geen_groep(id))
 }
 
 /// The id of the rekening a tool names, by id or by code (one of the two).
@@ -295,7 +354,7 @@ pub(super) fn grootboekrekening_nieuw(
 
 /// `PUT grootboekrekening`: the fields the form sends, from the rekening as it is now with the named changes.
 /// The second value says whether the change always asks: a new code or category moves every booking on the
-/// rekening along with it.
+/// rekening along with it. `rgs`: the administration uses RGS codes (the setting the form reads, `hasRgs`).
 pub(super) fn grootboekrekening_gewijzigd(
     args: &GrootboekrekeningWijzigenArgs,
     id: u64,
@@ -303,6 +362,7 @@ pub(super) fn grootboekrekening_gewijzigd(
     rekeningen: &[GridRekening],
     categorieen: &[Categorie],
     groepen: &[Groep],
+    rgs: bool,
 ) -> Result<(Built, bool), String> {
     if !now.is_object() {
         return Err("e-Boekhouden gaf deze grootboekrekening in een onbekende vorm terug".into());
@@ -347,7 +407,15 @@ pub(super) fn grootboekrekening_gewijzigd(
         }
     }
     let mut categorie = categorie_was.clone();
-    if let Some(wanted) = &args.categorie {
+    // Naming the category the rekening has already is no change, also when it is one the form keeps fixed.
+    let huidige = |wanted: &str| {
+        let wanted = wanted.trim();
+        wanted.eq_ignore_ascii_case(&categorie_was)
+            || categorieen
+                .iter()
+                .any(|c| c.code == categorie_was && c.omschrijving.eq_ignore_ascii_case(wanted))
+    };
+    if let Some(wanted) = args.categorie.as_deref().filter(|w| !huidige(w)) {
         let nieuw = pick_categorie(categorieen, wanted)?;
         if nieuw.code != categorie_was {
             if categorieen
@@ -413,12 +481,13 @@ pub(super) fn grootboekrekening_gewijzigd(
     if !groep.is_empty() {
         body.insert("rekeningGroepCode".into(), json!(groep));
     }
-    // What the form carries along for an administration that has them (RGS, and the Belgian fields): kept as
-    // they are, so an edit here never clears them.
-    for key in ["rgscodeId", "inkoopklasse", "uitsluitenBtwAangifte"] {
-        if let Some(value) = now.get(key).filter(|v| !v.is_null()) {
-            body.insert(key.into(), value.clone());
-        }
+    // As the form: rgscodeId only for an administration with RGS, sent back as it was read. The Belgian fields
+    // (inkoopklasse, uitsluitenBtwAangifte) go only on the .be domain, and EB MCP works on e-boekhouden.nl.
+    if rgs {
+        body.insert(
+            "rgscodeId".into(),
+            now.get("rgscodeId").cloned().unwrap_or(Value::Null),
+        );
     }
     body.insert("id".into(), json!(id));
     Ok((
@@ -480,9 +549,9 @@ pub(super) fn rekeninggroep_gewijzigd(
     args: &RekeninggroepWijzigenArgs,
     now: &Value,
     groepen: &[Groep],
+    rekeningen: &[GridRekening],
 ) -> Result<(Built, bool), String> {
-    let was =
-        groep_from(now).ok_or("e-Boekhouden gaf deze rekeninggroep in een onbekende vorm terug")?;
+    let was = groep_of(now, args.id)?;
     let mut lines = vec![line("Groep", groep_label(&was))];
     let mut serious = false;
     let mut code = was.code.clone();
@@ -514,6 +583,7 @@ pub(super) fn rekeninggroep_gewijzigd(
         return Err("Er is niets gewijzigd: geef aan wat er anders moet".into());
     }
     if serious {
+        lines.push(in_groep_line(rekeningen, &was));
         lines.push(line(
             "Let op",
             format!(
@@ -532,14 +602,18 @@ pub(super) fn rekeninggroep_gewijzigd(
 }
 
 /// The approval of `DELETE rekeninggroep/{id}`.
-pub(super) fn rekeninggroep_weg(now: &Value) -> Result<Built, String> {
-    let groep =
-        groep_from(now).ok_or("e-Boekhouden gaf deze rekeninggroep in een onbekende vorm terug")?;
+pub(super) fn rekeninggroep_weg(
+    id: u64,
+    now: &Value,
+    rekeningen: &[GridRekening],
+) -> Result<Built, String> {
+    let groep = groep_of(now, id)?;
     Ok(Built {
         body: Value::Null,
         title: format!("Rekeninggroep verwijderen: {}", groep_label(&groep)),
         lines: vec![
             line("Groep", groep_label(&groep)),
+            in_groep_line(rekeningen, &groep),
             line(
                 "Gevolg",
                 "de groep verdwijnt uit het rekeningschema; dit is niet terug te draaien",
@@ -588,6 +662,29 @@ fn pad_onder(parent: &str, omschrijving: &str) -> Result<String, String> {
     Ok(pad)
 }
 
+/// Every kostenplaats below `top`, at any depth: under it in the tree, or with a path that starts with its path
+/// (the web app treats each one whose path holds "<name>>" as gone with it). In the order of the list.
+fn onder<'a>(lijst: &'a [Kostenplaats], top: &Kostenplaats) -> Vec<&'a Kostenplaats> {
+    let prefix = format!("{}>", top.pad);
+    let mut ids = vec![top.id];
+    // Walk down the tree; a list never holds more levels than it has rows.
+    for _ in 0..lijst.len() {
+        let before = ids.len();
+        for k in lijst {
+            if !ids.contains(&k.id) && ids.contains(&k.parent) {
+                ids.push(k.id);
+            }
+        }
+        if ids.len() == before {
+            break;
+        }
+    }
+    lijst
+        .iter()
+        .filter(|k| k.id != top.id && (ids.contains(&k.id) || k.pad.starts_with(&prefix)))
+        .collect()
+}
+
 fn find_kostenplaats(lijst: &[Kostenplaats], id: u64) -> Result<&Kostenplaats, String> {
     lijst
         .iter()
@@ -632,11 +729,16 @@ pub(super) fn kostenplaats_gewijzigd(
     lijst: &[Kostenplaats],
 ) -> Result<Built, String> {
     let now = find_kostenplaats(lijst, args.id)?;
-    let pad_was = pad_van(lijst, now.id);
+    let pad_was = now.pad.clone();
+    // As the form's getFullPath: the parent's own path (its volledigPad) with the new omschrijving after it.
     let parent_pad = if now.parent == 0 {
         String::new()
     } else {
-        pad_van(lijst, now.parent)
+        lijst
+            .iter()
+            .find(|k| k.id == now.parent)
+            .map(|p| p.pad.clone())
+            .unwrap_or_else(|| pad_van(lijst, now.parent))
     };
     let mut lines = vec![line("Kostenplaats", &pad_was)];
     let mut omschrijving = now.omschrijving.clone();
@@ -660,7 +762,7 @@ pub(super) fn kostenplaats_gewijzigd(
         return Err("Er is niets gewijzigd: geef aan wat er anders moet".into());
     }
     let pad = pad_onder(&parent_pad, &omschrijving)?;
-    let onder = lijst.iter().filter(|k| k.parent == now.id).count();
+    let onder = onder(lijst, now).len();
     if onder > 0 && omschrijving != now.omschrijving {
         lines.push(line(
             "Onderliggend",
@@ -677,20 +779,24 @@ pub(super) fn kostenplaats_gewijzigd(
 /// The approval of `DELETE kostenplaats/{id}`.
 pub(super) fn kostenplaats_weg(id: u64, lijst: &[Kostenplaats]) -> Result<Built, String> {
     let now = find_kostenplaats(lijst, id)?;
-    let pad = pad_van(lijst, now.id);
+    let pad = now.pad.clone();
     let mut lines: Vec<Line> = vec![line("Kostenplaats", &pad)];
-    let onder: Vec<String> = lijst
-        .iter()
-        .filter(|k| k.parent == now.id)
-        .map(|k| pad_van(lijst, k.id))
-        .collect();
-    if !onder.is_empty() {
+    let onder: Vec<String> = onder(lijst, now).iter().map(|k| k.pad.clone()).collect();
+    if onder.is_empty() {
+        lines.push(line(
+            "Gevolg",
+            "de kostenplaats verdwijnt; dit is niet terug te draaien",
+        ));
+    } else {
         lines.push(line("Eronder", onder.join(", ")));
+        lines.push(line(
+            "Gevolg",
+            format!(
+                "de kostenplaats en de {} kostenplaats(en) eronder worden verwijderd; dit is niet terug te draaien",
+                onder.len()
+            ),
+        ));
     }
-    lines.push(line(
-        "Gevolg",
-        "de kostenplaats verdwijnt; dit is niet terug te draaien",
-    ));
     Ok(Built {
         body: Value::Null,
         title: format!("Kostenplaats verwijderen: {pad}"),
@@ -723,7 +829,7 @@ mod tests {
     fn rekeningen() -> Vec<GridRekening> {
         rekeningen_from(&json!({"data": [
             {"id": 11, "code": "1010", "omschrijving": "Bank", "categorie": "Financiële rekeningen", "inactief": false},
-            {"id": 45, "code": "4550", "omschrijving": "Bankkosten", "categorie": "Winst & verlies", "inactief": false},
+            {"id": 45, "code": "4550", "omschrijving": "Bankkosten", "categorie": "Winst & verlies", "rekeningGroep": "KOST", "inactief": false},
             {"id": 99, "code": "8999", "omschrijving": "Oud", "categorie": "Winst & verlies", "inactief": true}
         ]}))
         .unwrap()
@@ -882,19 +988,24 @@ mod tests {
         let (r, c, g) = (rekeningen(), categorieen(), groepen());
         let mut args = wijzigen();
         assert!(
-            grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g)
+            grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g, false)
                 .unwrap_err()
                 .contains("niets gewijzigd")
         );
         args.omschrijving = Some("Bank- en betaalkosten".into());
+        // With RGS on, the form sends the rekening's RGS code back; never the Belgian fields.
         let (built, serious) =
-            grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g).unwrap();
+            grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g, true).unwrap();
         assert!(!serious);
         assert_eq!(
             built.body,
             json!({"omschrijving": "Bank- en betaalkosten", "code": "4550", "rekeningCategorie": "VW", "inactief": false,
                    "rekeningGroepCode": "KOST", "rgscodeId": 1234, "id": 45})
         );
+        let (built, _) =
+            grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g, false).unwrap();
+        assert!(built.body.get("rgscodeId").is_none(), "no RGS, no RGS code");
+        assert!(built.body.get("inkoopklasse").is_none());
         assert_eq!(built.title, "Grootboekrekening wijzigen: 4550 Bankkosten");
         assert_eq!(
             shown(&built),
@@ -909,7 +1020,7 @@ mod tests {
         args.groep = Some(String::new());
         args.inactief = Some(true);
         let (built, serious) =
-            grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g).unwrap();
+            grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g, false).unwrap();
         assert!(!serious);
         assert!(built.body.get("rekeningGroepCode").is_none());
         assert_eq!(built.body["inactief"], true);
@@ -923,7 +1034,7 @@ mod tests {
         let mut args = wijzigen();
         args.nieuwe_code = Some("4551".into());
         let (built, serious) =
-            grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g).unwrap();
+            grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g, false).unwrap();
         assert!(serious);
         assert_eq!(built.body["code"], "4551");
         let lines = shown(&built);
@@ -939,28 +1050,43 @@ mod tests {
         );
         // The same code again is no change at all.
         args.nieuwe_code = Some("4550".into());
-        assert!(grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g).is_err());
+        assert!(grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g, false).is_err());
         args.nieuwe_code = Some("1010".into());
         assert!(
-            grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g)
+            grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g, false)
                 .unwrap_err()
                 .contains("Bank")
         );
         let mut args = wijzigen();
         args.categorie = Some("BAL".into());
         let (built, serious) =
-            grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g).unwrap();
+            grootboekrekening_gewijzigd(&args, 45, &bankkosten(), &r, &c, &g, false).unwrap();
         assert!(serious);
         assert_eq!(built.body["rekeningCategorie"], "BAL");
         assert!(shown(&built).contains(&"Categorie was: VW (Winst & verlies)".to_owned()));
         // A rekening in a category the form keeps fixed cannot move out of it.
         let bank = json!({"id": 11, "code": "1010", "omschrijving": "Bank", "rekeningCategorie": "FIN", "inactief": false});
         assert!(
-            grootboekrekening_gewijzigd(&args, 11, &bank, &r, &c, &g)
+            grootboekrekening_gewijzigd(&args, 11, &bank, &r, &c, &g, false)
                 .unwrap_err()
                 .contains("staat vast")
         );
-        assert!(grootboekrekening_gewijzigd(&args, 11, &json!([]), &r, &c, &g).is_err());
+        assert!(grootboekrekening_gewijzigd(&args, 11, &json!([]), &r, &c, &g, false).is_err());
+        // Naming the fixed category it has already is no change, by code or by name.
+        for same in ["FIN", "financiële rekeningen"] {
+            let mut args = wijzigen();
+            args.categorie = Some(same.into());
+            assert!(
+                grootboekrekening_gewijzigd(&args, 11, &bank, &r, &c, &g, false)
+                    .unwrap_err()
+                    .contains("niets gewijzigd")
+            );
+            args.omschrijving = Some("Bank ING".into());
+            let (built, serious) =
+                grootboekrekening_gewijzigd(&args, 11, &bank, &r, &c, &g, false).unwrap();
+            assert!(!serious);
+            assert_eq!(built.body["rekeningCategorie"], "FIN");
+        }
     }
 
     #[test]
@@ -1013,12 +1139,13 @@ mod tests {
             account: None,
         };
         assert!(
-            rekeninggroep_gewijzigd(&args, &now, &groepen())
+            rekeninggroep_gewijzigd(&args, &now, &groepen(), &rekeningen())
                 .unwrap_err()
                 .contains("niets gewijzigd")
         );
         args.naam = Some("Algemene kosten".into());
-        let (built, serious) = rekeninggroep_gewijzigd(&args, &now, &groepen()).unwrap();
+        let (built, serious) =
+            rekeninggroep_gewijzigd(&args, &now, &groepen(), &rekeningen()).unwrap();
         assert!(!serious);
         assert_eq!(
             built.body,
@@ -1026,25 +1153,78 @@ mod tests {
         );
         args.code = Some("OMZ".into());
         assert!(
-            rekeninggroep_gewijzigd(&args, &now, &groepen())
+            rekeninggroep_gewijzigd(&args, &now, &groepen(), &rekeningen())
                 .unwrap_err()
                 .contains("Omzet")
         );
         args.code = Some("ALG".into());
-        let (built, serious) = rekeninggroep_gewijzigd(&args, &now, &groepen()).unwrap();
+        let (built, serious) =
+            rekeninggroep_gewijzigd(&args, &now, &groepen(), &rekeningen()).unwrap();
         assert!(serious);
         assert_eq!(built.body["code"], "ALG");
         assert!(shown(&built).iter().any(|l| l.starts_with("Let op:")));
-        let gone = rekeninggroep_weg(&now).unwrap();
+        assert!(
+            shown(&built).contains(&"Rekeningen in deze groep: 1: 4550 Bankkosten".to_owned()),
+            "{:?}",
+            shown(&built)
+        );
+        let gone = rekeninggroep_weg(7, &now, &rekeningen()).unwrap();
         assert_eq!(gone.title, "Rekeninggroep verwijderen: KOST Kosten");
-        assert!(rekeninggroep_weg(&json!({})).is_err());
+        assert!(shown(&gone).contains(&"Rekeningen in deze groep: 1: 4550 Bankkosten".to_owned()));
+        let omzet = json!({"id": 8, "code": "OMZ", "naam": "Omzet"});
+        let empty = rekeninggroep_weg(8, &omzet, &rekeningen()).unwrap();
+        assert!(shown(&empty).contains(&"Rekeningen in deze groep: geen".to_owned()));
+    }
+
+    #[test]
+    fn an_unknown_group_is_named_as_such() {
+        assert_eq!(
+            groep_bekend(&groepen(), 99).unwrap_err(),
+            "Geen rekeninggroep met id 99 in deze administratie (zie rekeninggroepen)"
+        );
+        assert!(groep_bekend(&groepen(), 7).is_ok());
+        assert!(
+            groep_bekend(&[], 99).is_ok(),
+            "a list without ids proves nothing"
+        );
+        // What GET rekeninggroep/{id} gives for an id it does not know.
+        for now in [
+            json!(null),
+            json!({}),
+            json!({"id": 8, "code": "OMZ", "naam": "Omzet"}),
+        ] {
+            assert!(
+                rekeninggroep_weg(99, &now, &rekeningen())
+                    .unwrap_err()
+                    .contains("id 99")
+            );
+            let args = RekeninggroepWijzigenArgs {
+                id: 99,
+                code: None,
+                naam: Some("x".into()),
+                account: None,
+            };
+            assert!(
+                rekeninggroep_gewijzigd(&args, &now, &groepen(), &rekeningen())
+                    .unwrap_err()
+                    .contains("id 99")
+            );
+        }
+        // The group column may name the group by code, by naam or as the picker does.
+        for groep in ["KOST", "kosten", "KOST - Kosten"] {
+            let mut r = rekeningen();
+            r[1].groep = groep.into();
+            let kost = &groepen()[0];
+            assert_eq!(in_groep(&r, kost).len(), 1, "{groep}");
+        }
     }
 
     fn lijst() -> Vec<Kostenplaats> {
         kostenplaatsen_from_api(&json!([
             {"id": 501, "omschrijving": "Projecten", "parentKostenplaatsId": 0, "actief": true, "volledigPad": "Projecten"},
             {"id": 502, "omschrijving": "Noord", "parentKostenplaatsId": 501, "actief": true, "volledigPad": "Projecten>Noord"},
-            {"id": 503, "omschrijving": "Oud", "parentKostenplaatsId": 0, "actief": false, "volledigPad": "Oud"}
+            {"id": 503, "omschrijving": "Oud", "parentKostenplaatsId": 0, "actief": false, "volledigPad": "Oud"},
+            {"id": 505, "omschrijving": "Groningen", "parentKostenplaatsId": 502, "actief": true, "volledigPad": "Projecten>Noord>Groningen"}
         ]))
         .unwrap()
     }
@@ -1170,7 +1350,7 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.starts_with("Onderliggend: 1")),
+            lines.iter().any(|l| l.starts_with("Onderliggend: 2")),
             "{lines:?}"
         );
         let gone = KostenplaatsWijzigenArgs {
@@ -1183,12 +1363,58 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_builds_the_path_on_the_parents_own_path() {
+        // The parent's stored path differs from its omschrijvingen up the tree: the stored one counts, as in the form.
+        let lijst = kostenplaatsen_from_api(&json!([
+            {"id": 601, "omschrijving": "Projecten", "parentKostenplaatsId": 0, "actief": true, "volledigPad": "Werk>Projecten"},
+            {"id": 602, "omschrijving": "Noord", "parentKostenplaatsId": 601, "actief": true, "volledigPad": "Werk>Projecten>Noord"}
+        ]))
+        .unwrap();
+        let args = KostenplaatsWijzigenArgs {
+            id: 602,
+            omschrijving: Some("Zuid".into()),
+            inactief: None,
+            account: None,
+        };
+        let built = kostenplaats_gewijzigd(&args, &lijst).unwrap();
+        assert_eq!(built.body["volledigPad"], "Werk>Projecten>Zuid");
+        assert_eq!(built.title, "Kostenplaats wijzigen: Werk>Projecten>Noord");
+    }
+
+    #[test]
     fn deleting_a_kostenplaats_names_what_is_under_it() {
         let built = kostenplaats_weg(501, &lijst()).unwrap();
         assert_eq!(built.title, "Kostenplaats verwijderen: Projecten");
-        assert!(shown(&built).contains(&"Eronder: Projecten>Noord".to_owned()));
-        let leaf = kostenplaats_weg(502, &lijst()).unwrap();
+        // Every level below, not only the first.
+        assert!(
+            shown(&built)
+                .contains(&"Eronder: Projecten>Noord, Projecten>Noord>Groningen".to_owned()),
+            "{:?}",
+            shown(&built)
+        );
+        assert!(
+            shown(&built).iter().any(|l| l.starts_with(
+                "Gevolg: de kostenplaats en de 2 kostenplaats(en) eronder worden verwijderd"
+            )),
+            "{:?}",
+            shown(&built)
+        );
+        let leaf = kostenplaats_weg(505, &lijst()).unwrap();
         assert!(!shown(&leaf).iter().any(|l| l.starts_with("Eronder")));
+        // One whose path says it is below, though the tree does not link it.
+        let mut loose = lijst();
+        loose.push(Kostenplaats {
+            id: 506,
+            omschrijving: "Los".into(),
+            parent: 0,
+            actief: true,
+            pad: "Projecten>Los".into(),
+        });
+        assert!(
+            shown(&kostenplaats_weg(501, &loose).unwrap())
+                .iter()
+                .any(|l| l.contains("Projecten>Los"))
+        );
         assert!(kostenplaats_weg(9, &lijst()).is_err());
     }
 }
