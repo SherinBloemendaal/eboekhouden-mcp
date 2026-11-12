@@ -4,7 +4,7 @@ import App from '../App.vue'
 import AccountForm from '../components/AccountForm.vue'
 import { store, type AccountView } from '../lib/accounts'
 import {
-  ago, approvalState, filterHistory, nameList, quitWarning, refreshApprovals, type ApprovalDetail, type ApprovalRecord, type DecideAllResult, type Proposal,
+  ago, approvalState, filterHistory, followSelection, nameList, proposalKind, quitWarning, refreshApprovals, splitTitle, type ApprovalDetail, type ApprovalRecord, type DecideAllResult, type Proposal,
 } from '../lib/approvals'
 import { statusLabel, type McpEntry } from '../lib/log'
 import { router } from '../router'
@@ -110,67 +110,133 @@ async function mountAt(path: string) {
 
 const buttons = (root: ParentNode, text: string) =>
   [...root.querySelectorAll<HTMLButtonElement>('button')].filter((b) => b.textContent?.trim() === text)
-const card = (title: string) =>
-  [...document.querySelectorAll<HTMLElement>('.card')].find((c) => c.querySelector('.title')?.textContent === title)!
 const alertDialog = () => document.querySelector<HTMLElement>('[role="alertdialog"]')
 const decideCalls = () => invoke.mock.calls.filter((c) => c[0] === 'approval_decide' || c[0] === 'approvals_decide_all')
 
-async function expand(title: string) {
-  card(title).querySelector<HTMLButtonElement>('.card-head')!.click()
+/** The queue's rows, the one of a proposal, the selected one, and the detail beside them. */
+const rows = () => [...document.querySelectorAll<HTMLButtonElement>('.q-list .q-row')]
+const row = (id: number) => document.querySelector<HTMLButtonElement>(`#q-row-${id}`)!
+const rowNumbers = () => rows().map((r) => r.querySelector('.pill')?.textContent)
+const selectedRows = () => rows().filter((r) => r.getAttribute('aria-current') === 'true')
+const detail = () => document.querySelector<HTMLElement>('#q-detail')!
+const detailTitle = () => detail().querySelector('#q-detail-title')?.textContent
+const detailPosition = () => detail().querySelector('.q-pos')?.textContent
+
+async function choose(id: number) {
+  row(id).click()
+  await flushPromises()
+}
+
+async function press(key: string) {
+  document.querySelector('.q-list')!.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }))
   await flushPromises()
 }
 
 describe('the queue', () => {
-  it('lists each waiting change with its account, title, client and age, and opens it in place', async () => {
-    waiting = [proposal(), proposal({ id: 8, account: 'Bakkerij Zuid', title: 'Relatie wijzigen: Jansen', client: 'Cursor' })]
+  it('lists each waiting change oldest first, and shows the first one beside the list', async () => {
+    waiting = [proposal(), proposal({ id: 8, account: 'Bakkerij Zuid', tool: 'relatie_wijzigen', title: 'Relatie wijzigen: Jansen', client: 'Cursor' })]
     await mountAt('/akkoord')
-    const cards = [...document.querySelectorAll('.card')]
-    expect(cards.map((c) => c.querySelector('.title')?.textContent)).toEqual(['Mutatie toevoegen: Geld uitgegeven', 'Relatie wijzigen: Jansen'])
-    expect(cards[0]!.querySelector('.sub')?.textContent).toBe('Voorstel 7 · Studio Noord · Claude · 5 min geleden')
-    expect(cards[1]!.querySelector('.sub')?.textContent).toContain('Bakkerij Zuid · Cursor')
+    expect(rowNumbers()).toEqual(['#7', '#8'])
+    // What happens and its subject on two lines, from "what: subject"; account and age under them.
+    expect(row(7).querySelector('.q-what')?.textContent).toBe('Mutatie toevoegen')
+    expect(row(7).querySelector('.q-subject')?.textContent).toBe('Geld uitgegeven')
+    expect(row(7).querySelector('.q-meta')?.textContent).toBe('Studio Noord · 5 min geleden')
+    expect(row(8).querySelector('.q-meta')?.textContent).toContain('Bakkerij Zuid')
+    // The account's initials are gone; the kind of change has an icon instead.
+    expect(document.querySelector('.q-list .avatar')).toBeNull()
+    expect(row(7).querySelector('.kind')?.classList.contains('accent')).toBe(true)
+    expect(row(8).querySelector('.kind')?.classList.contains('neutral')).toBe(true)
 
-    const head = cards[0]!.querySelector<HTMLButtonElement>('.card-head')!
-    expect(head.getAttribute('aria-expanded')).toBe('false')
-    expect(cards[0]!.querySelector('dl')).toBeNull()
-    await expand('Mutatie toevoegen: Geld uitgegeven')
-    expect(head.getAttribute('aria-expanded')).toBe('true')
-    expect([...cards[0]!.querySelectorAll('dt')].map((e) => e.textContent)).toEqual(['Rekening', 'Omschrijving'])
+    // The first is selected on open, and only the list's selected row is a tab stop.
+    expect(selectedRows()).toEqual([row(7)])
+    expect(rows().map((r) => r.tabIndex)).toEqual([0, -1])
+    expect(detail().getAttribute('role')).toBe('region')
+    expect(detail().getAttribute('aria-labelledby')).toBe('q-detail-title')
+    expect(detail().querySelector('.q-of')?.textContent).toBe('#7Voorstel 7 van Claude')
+    expect(detailTitle()).toBe('Mutatie toevoegen: Geld uitgegeven')
+    expect(detail().querySelector('.q-asked')?.textContent).toBe('Studio Noord · gevraagd door Claude · 5 min geleden')
+    expect(detail().textContent).toContain('Wat er verandert')
+    expect([...detail().querySelectorAll('dt')].map((e) => e.textContent)).toEqual(['Rekening', 'Omschrijving'])
     // The value keeps its line break; the stylesheet shows it with white-space: pre-line.
-    expect([...cards[0]!.querySelectorAll('dd')].map((e) => e.textContent)).toEqual(['1010 Bank', 'Regel een\nRegel twee'])
-    expect(buttons(cards[0]!, 'Goedkeuren')).toHaveLength(1)
-    expect(buttons(cards[0]!, 'Weigeren')).toHaveLength(1)
-    // The other one stays closed.
-    expect(cards[1]!.querySelector('dl')).toBeNull()
+    expect([...detail().querySelectorAll('dd')].map((e) => e.textContent)).toEqual(['1010 Bank', 'Regel een\nRegel twee'])
+    expect(detailPosition()).toBe('Voorstel #7, 1 van 2 in de wachtrij')
+    // The answer is given in the detail only, for the one shown there.
+    expect(buttons(detail(), 'Goedkeuren')).toHaveLength(1)
+    expect(buttons(detail(), 'Weigeren')).toHaveLength(1)
+    expect(buttons(document.querySelector('.q-list')!, 'Goedkeuren')).toHaveLength(0)
+  })
+
+  it('shows the proposal whose row is clicked', async () => {
+    waiting = [proposal(), proposal({ id: 8, account: 'Bakkerij Zuid', title: 'Relatie wijzigen: Jansen', client: 'Cursor', lines: [{ label: 'Relatie', value: 'Jansen' }] })]
+    await mountAt('/akkoord')
+    await choose(8)
+    expect(selectedRows()).toEqual([row(8)])
+    expect(rows().map((r) => r.tabIndex)).toEqual([-1, 0])
+    expect(detailTitle()).toBe('Relatie wijzigen: Jansen')
+    expect(detail().querySelector('.q-of')?.textContent).toBe('#8Voorstel 8 van Cursor')
+    expect([...detail().querySelectorAll('dt')].map((e) => e.textContent)).toEqual(['Relatie'])
+    expect(detailPosition()).toBe('Voorstel #8, 2 van 2 in de wachtrij')
+  })
+
+  it('moves the selection with the arrow keys, Home and End', async () => {
+    waiting = [proposal(), proposal({ id: 8 }), proposal({ id: 9 })]
+    await mountAt('/akkoord')
+    row(7).focus()
+    await press('ArrowDown')
+    expect(selectedRows()).toEqual([row(8)])
+    expect(document.activeElement).toBe(row(8))
+    expect(detailPosition()).toBe('Voorstel #8, 2 van 3 in de wachtrij')
+    await press('ArrowDown')
+    await press('ArrowDown')
+    // It stops at the end rather than wrap.
+    expect(selectedRows()).toEqual([row(9)])
+    await press('ArrowUp')
+    expect(selectedRows()).toEqual([row(8)])
+    expect(document.activeElement).toBe(row(8))
+    await press('Home')
+    expect(selectedRows()).toEqual([row(7)])
+    await press('End')
+    expect(selectedRows()).toEqual([row(9)])
+    expect(rows().map((r) => r.tabIndex)).toEqual([-1, -1, 0])
+    // Other keys are left alone.
+    await press('a')
+    expect(selectedRows()).toEqual([row(9)])
   })
 
   it('shows the shared empty state when nothing waits', async () => {
     await mountAt('/akkoord')
     expect(document.querySelector('.empty h2')?.textContent).toBe('Niets wacht op je akkoord')
     expect(buttons(document, 'Alles weigeren')).toHaveLength(0)
+    expect(document.querySelector('#q-detail')).toBeNull()
   })
 
-  it('sends a change only on Goedkeuren', async () => {
+  it('sends a change only on Goedkeuren, then shows the next one', async () => {
     waiting = [proposal(), proposal({ id: 8, title: 'Factuur F00012 verwijderen' })]
     await mountAt('/akkoord')
-    await expand('Mutatie toevoegen: Geld uitgegeven')
-    buttons(card('Mutatie toevoegen: Geld uitgegeven'), 'Goedkeuren')[0]!.click()
+    // Picking a row approves nothing.
+    await choose(8)
+    await choose(7)
+    expect(decideCalls()).toEqual([])
+    buttons(detail(), 'Goedkeuren')[0]!.click()
     await flushPromises()
     expect(decideCalls()).toEqual([['approval_decide', { id: 7, approve: true }]])
-    expect([...document.querySelectorAll('.card .title')].map((e) => e.textContent)).toEqual(['Factuur F00012 verwijderen'])
+    expect(rowNumbers()).toEqual(['#8'])
+    expect(selectedRows()).toEqual([row(8)])
+    expect(detailTitle()).toBe('Factuur F00012 verwijderen')
+    expect(detailPosition()).toBe('Voorstel #8, 1 van 1 in de wachtrij')
   })
 
   it('refuses on Weigeren and never approves by accident', async () => {
     waiting = [proposal()]
     await mountAt('/akkoord')
-    await expand('Mutatie toevoegen: Geld uitgegeven')
     const refuse = deferred<void>()
     onDecide = () => refuse.promise
-    const button = buttons(card('Mutatie toevoegen: Geld uitgegeven'), 'Weigeren')[0]!
+    const button = buttons(detail(), 'Weigeren')[0]!
     button.click()
     await flushPromises()
     // Busy while the app answers, and nothing else can be clicked meanwhile.
     expect(button.getAttribute('aria-busy')).toBe('true')
-    expect(buttons(card('Mutatie toevoegen: Geld uitgegeven'), 'Goedkeuren')[0]!.disabled).toBe(true)
+    expect(buttons(detail(), 'Goedkeuren')[0]!.disabled).toBe(true)
     waiting = []
     refuse.resolve()
     await flushPromises()
@@ -179,38 +245,131 @@ describe('the queue', () => {
     expect(document.querySelector('.empty h2')?.textContent).toBe('Niets wacht op je akkoord')
   })
 
+  it('selects the one before after the last one is answered', async () => {
+    waiting = [proposal(), proposal({ id: 8 }), proposal({ id: 9, title: 'Relatie toevoegen: Jansen' })]
+    await mountAt('/akkoord')
+    await choose(9)
+    buttons(detail(), 'Weigeren')[0]!.click()
+    await flushPromises()
+    expect(decideCalls()).toEqual([['approval_decide', { id: 9, approve: false }]])
+    expect(rowNumbers()).toEqual(['#7', '#8'])
+    expect(selectedRows()).toEqual([row(8)])
+    expect(detailPosition()).toBe('Voorstel #8, 2 van 2 in de wachtrij')
+  })
+
+  it('moves the selection on when the selected one is answered elsewhere', async () => {
+    waiting = [proposal(), proposal({ id: 8 }), proposal({ id: 9 })]
+    await mountAt('/akkoord')
+    await choose(8)
+    // Answered in another window, or lapsed: the app sends a fresh queue.
+    waiting = [proposal(), proposal({ id: 9 })]
+    await refreshApprovals()
+    await flushPromises()
+    expect(selectedRows()).toEqual([row(9)])
+    expect(detailPosition()).toBe('Voorstel #9, 2 van 2 in de wachtrij')
+    waiting = [proposal()]
+    await refreshApprovals()
+    await flushPromises()
+    expect(selectedRows()).toEqual([row(7)])
+    // One that arrives meanwhile leaves the selection where it is.
+    waiting = [proposal(), proposal({ id: 10 })]
+    await refreshApprovals()
+    await flushPromises()
+    expect(selectedRows()).toEqual([row(7)])
+    expect(decideCalls()).toEqual([])
+  })
+
   it('says so when the proposal was already gone', async () => {
     waiting = [proposal()]
     await mountAt('/akkoord')
-    await expand('Mutatie toevoegen: Geld uitgegeven')
     onDecide = async () => {
       waiting = []
       throw 'Dit voorstel wacht niet meer: het is al beantwoord of verlopen.'
     }
-    buttons(card('Mutatie toevoegen: Geld uitgegeven'), 'Goedkeuren')[0]!.click()
+    buttons(detail(), 'Goedkeuren')[0]!.click()
     await flushPromises()
     // The row has left; the reason stays above the list.
-    expect(document.querySelectorAll('.card')).toHaveLength(0)
+    expect(rows()).toHaveLength(0)
     expect(document.querySelector('.feedback[role="alert"]')?.textContent).toContain('wacht niet meer')
   })
 
   it('marks a change that cannot be undone and gives it the destructive button', async () => {
-    waiting = [proposal(), proposal({ id: 8, title: 'Factuur F00012 verwijderen', danger: true })]
+    waiting = [proposal(), proposal({ id: 8, tool: 'factuur_verwijderen', title: 'Factuur verwijderen: F00012', danger: true })]
     await mountAt('/akkoord')
-    const safe = card('Mutatie toevoegen: Geld uitgegeven')
-    const danger = card('Factuur F00012 verwijderen')
-    expect(danger.classList.contains('danger')).toBe(true)
-    expect(danger.querySelector('.danger-chip')?.textContent).toBe('Niet terug te draaien')
-    expect(safe.querySelector('.danger-chip')).toBeNull()
-    await expand('Factuur F00012 verwijderen')
-    await expand('Mutatie toevoegen: Geld uitgegeven')
-    expect(danger.textContent).toContain('niet terug te draaien vanuit EB MCP')
-    expect(buttons(danger, 'Goedkeuren')[0]!.classList.contains('danger-fill')).toBe(true)
-    const plain = buttons(safe, 'Goedkeuren')[0]!
+    expect(row(8).querySelector('.danger-flag')?.textContent).toBe('Niet terug te draaien')
+    expect(row(8).querySelector('.kind')?.classList.contains('danger')).toBe(true)
+    expect(row(7).querySelector('.danger-flag')).toBeNull()
+    expect(row(7).querySelector('.kind')?.classList.contains('danger')).toBe(false)
+    // No red edge on the rows any more.
+    expect(rows().some((r) => r.classList.contains('danger'))).toBe(false)
+
+    expect(detail().querySelector('.danger-note')).toBeNull()
+    const plain = buttons(detail(), 'Goedkeuren')[0]!
     expect(plain.classList.contains('danger-fill')).toBe(false)
-    // One primary button per screen: that is Alles goedkeuren.
-    expect(plain.classList.contains('primary')).toBe(false)
-    expect([...document.querySelectorAll('.page button.primary')].map((b) => b.textContent?.trim())).toEqual(['Alles goedkeuren (2)'])
+    // One filled button per screen: the detail's Goedkeuren, not Alles goedkeuren.
+    expect(plain.classList.contains('primary')).toBe(true)
+    const filled = () => [...document.querySelectorAll('.page button.primary, .page button.danger-fill')]
+    expect(filled()).toEqual([plain])
+    expect(buttons(document, 'Alles goedkeuren (2)')[0]!.classList.contains('primary')).toBe(false)
+
+    await choose(8)
+    expect(detail().querySelector('.danger-note')?.textContent).toBe('Dit is niet terug te draaien vanuit EB MCP.')
+    const destructive = buttons(detail(), 'Goedkeuren')[0]!
+    expect(destructive.classList.contains('danger-fill')).toBe(true)
+    expect(destructive.classList.contains('primary')).toBe(false)
+    expect(filled()).toEqual([destructive])
+  })
+
+  it('splits a title into what happens and its subject', () => {
+    expect(splitTitle('Relatie verwijderen: EB MCP proef wachtrij')).toEqual({ what: 'Relatie verwijderen', subject: 'EB MCP proef wachtrij' })
+    // Only the first ": " splits; the subject keeps the rest.
+    expect(splitTitle('Mutatie toevoegen: Bankkosten: maart')).toEqual({ what: 'Mutatie toevoegen', subject: 'Bankkosten: maart' })
+    expect(splitTitle('Factuur F00012 verwijderen')).toEqual({ what: 'Factuur F00012 verwijderen', subject: null })
+    expect(splitTitle('Tijd 10:30')).toEqual({ what: 'Tijd 10:30', subject: null })
+    expect(splitTitle('Leeg: ')).toEqual({ what: 'Leeg: ', subject: null })
+  })
+
+  it('shows a title without a subject on one line', async () => {
+    waiting = [proposal({ title: 'Abonnementen factureren', tool: 'abonnementen_factureren' })]
+    await mountAt('/akkoord')
+    expect(row(7).querySelector('.q-what')?.textContent).toBe('Abonnementen factureren')
+    expect(row(7).querySelector('.q-subject')).toBeNull()
+  })
+
+  it('picks an icon for the kind of change from the tool name', () => {
+    const kind = (tool: string, danger = false) => proposalKind({ tool, danger })
+    expect(kind('mutatie_toevoegen')).toEqual({ icon: 'plus', tone: 'accent' })
+    expect(kind('archief_uploaden')).toEqual({ icon: 'plus', tone: 'accent' })
+    expect(kind('relatie_wijzigen')).toEqual({ icon: 'pencil', tone: 'neutral' })
+    expect(kind('archief_koppelen')).toEqual({ icon: 'pencil', tone: 'neutral' })
+    expect(kind('relatie_verwijderen')).toEqual({ icon: 'trash', tone: 'neutral' })
+    expect(kind('factuur_mailen')).toEqual({ icon: 'mail', tone: 'neutral' })
+    expect(kind('factuur_crediteren')).toEqual({ icon: 'file-text', tone: 'neutral' })
+    expect(kind('abonnementen_factureren')).toEqual({ icon: 'file-text', tone: 'neutral' })
+    expect(kind('offerte_mailen')).toEqual({ icon: 'mail', tone: 'neutral' })
+    expect(kind('offerte_factureren')).toEqual({ icon: 'file-text', tone: 'neutral' })
+    expect(kind('archief_ontkoppelen')).toEqual({ icon: 'pencil', tone: 'neutral' })
+    expect(kind('iets_anders')).toEqual({ icon: 'square-dot', tone: 'neutral' })
+    // A change that cannot be undone keeps its icon on the red tint.
+    expect(kind('relatie_verwijderen', true)).toEqual({ icon: 'trash', tone: 'danger' })
+    expect(kind('mutatie_toevoegen', true)).toEqual({ icon: 'plus', tone: 'danger' })
+  })
+
+  it('follows the selection through a changed queue as a pure function', () => {
+    expect(followSelection([], [], null)).toBeNull()
+    expect(followSelection([], [7, 8], null)).toBe(7)
+    expect(followSelection([7, 8, 9], [7, 8, 9], 8)).toBe(8)
+    // Gone: the next one takes its place, or the one before when it was the last.
+    expect(followSelection([7, 8, 9], [7, 9], 8)).toBe(9)
+    expect(followSelection([7, 8, 9], [7, 8], 9)).toBe(8)
+    expect(followSelection([7, 8, 9], [9], 7)).toBe(9)
+    // Several gone at once: the first that still waits after it.
+    expect(followSelection([7, 8, 9, 10], [7, 10], 8)).toBe(10)
+    // The last old one gone while a new one came in: the new one is next in the list.
+    expect(followSelection([7, 8], [7, 9], 8)).toBe(9)
+    expect(followSelection([7, 8], [], 8)).toBeNull()
+    // Not in the list before (such as a ?open= id that no longer waits): the first.
+    expect(followSelection([7, 8], [7, 8], 3)).toBe(7)
   })
 })
 
@@ -254,7 +413,8 @@ describe('Alles goedkeuren', () => {
     const note = document.querySelector('.feedback[role="status"]')!
     expect(note.textContent).toContain('2 wijzigingen goedgekeurd')
     expect(note.textContent).toContain('1 wijziging was al beantwoord of vervallen')
-    expect([...document.querySelectorAll('.card .title')].map((e) => e.textContent)).toEqual(['Mutatie toevoegen: Nieuw'])
+    expect(rowNumbers()).toEqual(['#10'])
+    expect(detailTitle()).toBe('Mutatie toevoegen: Nieuw')
   })
 
   it('names at most eight changes and counts the rest', async () => {
@@ -276,11 +436,11 @@ describe('Alles goedkeuren', () => {
     ] as unknown as AccountView[]
     store.loaded = true
     await flushPromises()
-    const cards = [...document.querySelectorAll<HTMLElement>('.card')]
-    expect(cards.map((c) => !!c.querySelector('.signed-out-chip'))).toEqual([true, false])
-    cards[0]!.querySelector<HTMLButtonElement>('.card-head')!.click()
-    await flushPromises()
-    expect(cards[0]!.querySelector('.signed-out')?.textContent).toContain('Studio Noord is niet ingelogd in EB MCP')
+    expect(rows().map((r) => r.querySelector('.signed-out-flag')?.textContent ?? null)).toEqual(['Niet ingelogd', null])
+    // The first is selected: its detail says what happens on Goedkeuren; the other's does not.
+    expect(detail().querySelector('.signed-out')?.textContent).toContain('Studio Noord is niet ingelogd in EB MCP')
+    await choose(8)
+    expect(detail().querySelector('.signed-out')).toBeNull()
     buttons(document, 'Alles goedkeuren (2)')[0]!.click()
     await flushPromises()
     expect(alertDialog()!.textContent).toContain('Studio Noord is niet ingelogd in EB MCP: die wijzigingen mislukken tot je daar weer inlogt.')
@@ -441,14 +601,17 @@ describe('the history', () => {
     expect(document.querySelector('.record.sel .r-title')?.textContent).toBe('Relatie toevoegen: Jansen')
     expect(document.querySelector('aside.detail .detail-title')?.textContent).toBe('Relatie toevoegen: Jansen')
     expect(invoke).toHaveBeenCalledWith('approval_get', { id: 11 })
-    expect(document.querySelectorAll('.card')).toHaveLength(0)
+    expect(rows()).toHaveLength(0)
   })
 
   it('opens a record that still waits in the queue, from ?open=', async () => {
-    waiting = [proposal({ id: 9 })]
+    // Not the first: ?open= wins over the first-one default.
+    waiting = [proposal({ id: 8, title: 'Relatie toevoegen: Jansen' }), proposal({ id: 9 })]
     await mountAt('/akkoord?open=9')
     expect(document.querySelector('#tab-queue')?.getAttribute('aria-selected')).toBe('true')
-    expect(card('Mutatie toevoegen: Geld uitgegeven').querySelector('.card-head')?.getAttribute('aria-expanded')).toBe('true')
+    expect(selectedRows()).toEqual([row(9)])
+    expect(detailTitle()).toBe('Mutatie toevoegen: Geld uitgegeven')
+    expect(detailPosition()).toBe('Voorstel #9, 2 van 2 in de wachtrij')
   })
 
   it('shows the reason when the technical data cannot be loaded', async () => {
@@ -611,7 +774,8 @@ describe('the toast for a new change', () => {
     await flushPromises()
     expect(router.currentRoute.value.fullPath).toBe('/akkoord?open=8')
     expect(toasts()).toHaveLength(0)
-    expect(card('Factuur F00012 verwijderen').querySelector('.card-head')?.getAttribute('aria-expanded')).toBe('true')
+    expect(selectedRows()).toEqual([row(8)])
+    expect(detailTitle()).toBe('Factuur F00012 verwijderen')
   })
 
   it('stays away on Akkoord itself', async () => {
@@ -620,7 +784,7 @@ describe('the toast for a new change', () => {
     await refreshApprovals()
     await flushPromises()
     expect(toasts()).toHaveLength(0)
-    expect(document.querySelectorAll('.card')).toHaveLength(1)
+    expect(rows()).toHaveLength(1)
   })
 })
 

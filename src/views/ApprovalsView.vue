@@ -1,11 +1,11 @@
 <script setup lang="ts">
-// Akkoord: the changes AI clients asked for in accounts set to "met akkoord". Wachtrij holds the ones that wait;
-// the client does not wait for them, and EB MCP makes a change in the background once it is approved. Geschiedenis
-// holds every proposal with what came of it. Only a Goedkeuren click (or a confirmed Alles goedkeuren) approves.
+// Akkoord: the changes AI clients asked for in accounts set to "met akkoord". Wachtrij holds the ones that wait, as
+// a list with the chosen one beside it; the client does not wait for them, and EB MCP makes a change in the
+// background once it is approved. Geschiedenis holds every proposal with what came of it. Only a Goedkeuren click
+// (or a confirmed Alles goedkeuren) approves.
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import Alert from '../components/Alert.vue'
-import Avatar from '../components/Avatar.vue'
 import EmptyState from '../components/EmptyState.vue'
 import ExportNotice from '../components/ExportNotice.vue'
 import Icon from '../components/Icon.vue'
@@ -13,7 +13,7 @@ import JsonView from '../components/JsonView.vue'
 import { store } from '../lib/accounts'
 import {
   ago, approvalDetail, approvalState, connectApprovals, decideAll, decideApproval, decisionLabel, exportApprovals, filterHistory,
-  nameList, refreshApprovals, refreshHistory, stamp, STATUSES, statusOf, waitingText, watchHistory,
+  followSelection, nameList, proposalKind, refreshApprovals, refreshHistory, splitTitle, stamp, STATUSES, statusOf, watchHistory,
   type ApprovalDetail, type ApprovalRecord, type ApprovalStatus, type DecideAllResult, type Proposal,
 } from '../lib/approvals'
 import { useExport } from '../lib/exporting'
@@ -49,33 +49,85 @@ function onTabKey(event: KeyboardEvent) {
 const queue = computed(() => store.approvals)
 /** Accounts that are not signed in now: a change approved for one of them fails, so the page says so first. */
 const signedOut = computed(() => new Set(store.loaded ? store.accounts.filter((a) => !a.session || a.session.expired).map((a) => a.id) : []))
-const expanded = reactive(new Set<number>())
 const busy = reactive(new Map<number, 'approve' | 'refuse'>())
 const bulk = ref<'approve' | 'refuse' | null>(null)
 const feedback = ref<{ tone: 'ok' | 'warn' | 'bad'; text: string } | null>(null)
 
-function toggle(id: number) {
-  if (expanded.has(id)) expanded.delete(id)
-  else expanded.add(id)
+/** The proposal shown beside the list. Kept on a proposal that still waits; see followSelection. */
+const current = ref<number | null>(null)
+const chosen = computed(() => queue.value.find((p) => p.id === current.value) ?? null)
+const position = computed(() => queue.value.findIndex((p) => p.id === current.value) + 1)
+const detailPane = ref<HTMLElement | null>(null)
+
+// The first proposal is selected when the queue arrives; when the selected one leaves (answered here or elsewhere,
+// or lapsed) the one after it takes its place, or the one before it when it was the last. Declared before the
+// `?open=` watchers below, so that on the same change theirs is the last word.
+watch(
+  queue,
+  (next, before) => {
+    current.value = followSelection((before ?? []).map((p) => p.id), next.map((p) => p.id), current.value)
+  },
+  { immediate: true },
+)
+
+const rowId = (id: number) => `q-row-${id}`
+
+function focusRow(id: number) {
+  const row = document.getElementById(rowId(id))
+  row?.focus()
+  row?.scrollIntoView?.({ block: 'nearest' })
+}
+
+function pick(id: number) {
+  current.value = id
+}
+
+/** Arrow keys, Home and End move the selection in the list, which is one tab stop (roving tabindex). */
+function onListKey(event: KeyboardEvent) {
+  const list = queue.value
+  if (!list.length) return
+  const at = Math.max(0, list.findIndex((p) => p.id === current.value))
+  let to: number
+  switch (event.key) {
+    case 'ArrowDown': to = Math.min(at + 1, list.length - 1); break
+    case 'ArrowUp': to = Math.max(at - 1, 0); break
+    case 'Home': to = 0; break
+    case 'End': to = list.length - 1; break
+    default: return
+  }
+  event.preventDefault()
+  const id = list[to]!.id
+  current.value = id
+  void nextTick(() => focusRow(id))
 }
 
 function changes(n: number): string {
   return n === 1 ? '1 wijziging' : `${n} wijzigingen`
 }
 
+/** "Relatie verwijderen" and "EB MCP proef wachtrij" from "Relatie verwijderen: EB MCP proef wachtrij". */
+const parts = (p: Proposal) => splitTitle(p.title)
+
 async function decide(proposal: Proposal, approve: boolean) {
   if (busy.has(proposal.id) || bulk.value) return
+  // Focus on the detail's button would be lost with the detail it sits in: it goes to the proposal selected next.
+  const focused = document.activeElement
+  const fromDetail = !!focused && !!detailPane.value?.contains(focused)
   busy.set(proposal.id, approve ? 'approve' : 'refuse')
   feedback.value = null
   try {
     await decideApproval(proposal.id, approve)
-    expanded.delete(proposal.id)
   } catch (error) {
     // Shown above the list: the row itself leaves when the proposal is gone.
     feedback.value = { tone: 'bad', text: `${proposal.title}: ${String(error)}` }
   } finally {
     busy.delete(proposal.id)
   }
+  await nextTick()
+  if (!fromDetail || current.value === proposal.id) return
+  // The last one answered: the queue's tab keeps the focus while the empty state takes the detail's place.
+  if (current.value === null) document.getElementById('tab-queue')?.focus()
+  else focusRow(current.value)
 }
 
 /** What Alles goedkeuren asks about: the proposals on screen when it was clicked, and only those. */
@@ -110,7 +162,6 @@ async function approveAll() {
   feedback.value = null
   try {
     feedback.value = report(await decideAll(pending.ids, true), true)
-    for (const id of pending.ids) expanded.delete(id)
   } catch (error) {
     feedback.value = { tone: 'bad', text: String(error) }
   } finally {
@@ -126,7 +177,6 @@ async function refuseAll() {
   feedback.value = null
   try {
     feedback.value = report(await decideAll(ids, false), false)
-    for (const id of ids) expanded.delete(id)
   } catch (error) {
     feedback.value = { tone: 'bad', text: String(error) }
   } finally {
@@ -224,10 +274,10 @@ watch(
     if (typeof open !== 'string' || !Number.isInteger(id)) return
     opening.value = id
     openedHistory = false
-    // Expanded right away when it waits, so the card opens as it appears and does not wait for the read.
+    // Selected right away when it waits, so it shows as it appears and does not wait for the read.
     if (!approvalState.loaded || store.approvals.some((p) => p.id === id)) {
       view.value = 'queue'
-      expanded.add(id)
+      current.value = id
     }
   },
   { immediate: true },
@@ -240,16 +290,15 @@ watch(
     if (store.approvals.some((p) => p.id === id)) {
       opening.value = null
       view.value = 'queue'
-      expanded.add(id)
+      current.value = id
       await nextTick()
-      document.getElementById(`proposal-${id}`)?.scrollIntoView?.({ block: 'nearest' })
+      document.getElementById(rowId(id))?.scrollIntoView?.({ block: 'nearest' })
       return
     }
     if (!approvalState.historyLoaded) return
     const record = approvalState.history.find((r) => r.id === id)
     if (!openedHistory) {
       openedHistory = true
-      expanded.delete(id)
       view.value = 'history'
     }
     // A history read before this page opened may not hold it yet: the fresh read that follows does.
@@ -268,7 +317,7 @@ watch(
 
 function showInQueue(id: number) {
   view.value = 'queue'
-  expanded.add(id)
+  if (queue.value.some((p) => p.id === id)) current.value = id
 }
 
 /** The outcome in words, for the detail. */
@@ -317,7 +366,8 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
         </div>
         <div v-else-if="queue.length" key="bulk" class="tools bulk">
           <button type="button" class="btn small refuse-all" :disabled="!!bulk" :aria-busy="bulk === 'refuse'" @click="refuseAll"><span class="btn-label">Alles weigeren</span></button>
-          <button type="button" class="btn small primary approve-all" :disabled="!!bulk" :aria-busy="bulk === 'approve'" @click="askApproveAll">
+          <!-- Plain, not filled: the detail's Goedkeuren is the one filled button on this screen. -->
+          <button type="button" class="btn small approve-all" :disabled="!!bulk" :aria-busy="bulk === 'approve'" @click="askApproveAll">
             <span class="btn-label">Alles goedkeuren ({{ queue.length }})</span>
           </button>
         </div>
@@ -339,7 +389,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
     </Transition>
 
     <Transition name="fade" mode="out-in">
-      <section v-if="view === 'queue'" id="pane-queue" key="queue" class="pane" role="tabpanel" aria-labelledby="tab-queue">
+      <section v-if="view === 'queue'" id="pane-queue" key="queue" class="pane q-pane"role="tabpanel" aria-labelledby="tab-queue">
         <Transition name="fade" mode="out-in">
           <EmptyState v-if="approvalState.error && !approvalState.loaded" key="error" icon="alert" title="De wachtrij kon niet worden geladen">
             {{ approvalState.error }}
@@ -348,51 +398,65 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
           <EmptyState v-else-if="approvalState.loaded && !queue.length" key="empty" icon="clipboard-check" title="Niets wacht op je akkoord">
             Vraagt een AI-client een wijziging in een account met akkoord, dan staat die hier. De client wacht er niet op: zodra je hem goedkeurt, voert EB MCP de wijziging uit.
           </EmptyState>
-          <div v-else key="list" class="queue-wrap">
-            <p class="lead">{{ waitingText(queue.length) }}. Open een wijziging om te zien wat er verandert.</p>
-            <TransitionGroup name="accordion" tag="ul" class="queue" aria-label="Wachtrij">
+          <div v-else key="list" class="q-split">
+            <!-- One tab stop: the selected row takes the focus, the arrow keys move it (roving tabindex). -->
+            <TransitionGroup name="accordion" tag="ul" class="q-list" aria-label="Wachtrij" @keydown="onListKey">
               <li v-for="p in queue" :key="p.id" class="accordion">
                 <div>
-                  <article class="card" :class="{ danger: p.danger, open: expanded.has(p.id) }">
-                    <button type="button" class="card-head" :aria-expanded="expanded.has(p.id)" :aria-controls="`proposal-${p.id}`" @click="toggle(p.id)">
-                      <Icon name="chevron-right" :size="14" class="chev" :class="{ open: expanded.has(p.id) }" />
-                      <Avatar :label="p.account" :size="28" />
-                      <span class="stack">
-                        <span class="title">{{ p.title }}</span>
-                        <span class="sub"><span class="nr">Voorstel {{ p.id }}</span> · {{ p.account }} · {{ p.client }} · <time :datetime="new Date(p.askedAt).toISOString()">{{ ago(p.askedAt, now) }}</time></span>
-                      </span>
-                      <span v-if="signedOut.has(p.accountId)" class="chip warn signed-out-chip">Niet ingelogd</span>
-                      <span v-if="p.danger" class="chip bad danger-chip"><Icon name="alert" :size="12" />Niet terug te draaien</span>
-                    </button>
-                    <Transition name="accordion">
-                      <div v-if="expanded.has(p.id)" :id="`proposal-${p.id}`" class="accordion">
-                        <div>
-                          <div class="card-body">
-                            <dl class="lines selectable">
-                              <template v-for="(line, i) in p.lines" :key="i">
-                                <dt>{{ line.label }}</dt>
-                                <dd>{{ line.value }}</dd>
-                              </template>
-                            </dl>
-                            <p v-if="signedOut.has(p.accountId)" class="note warn signed-out" role="note"><Icon name="alert" :size="14" class="note-icon" />{{ p.account }} is niet ingelogd in EB MCP. Log eerst in bij Accounts, anders mislukt deze wijziging.</p>
-                            <p v-if="p.danger" class="note warn" role="note"><Icon name="alert" :size="14" class="note-icon" />Deze wijziging is niet terug te draaien vanuit EB MCP.</p>
-                            <div class="card-actions">
-                              <button type="button" class="btn small refuse" :disabled="busy.has(p.id) || !!bulk" :aria-busy="busy.get(p.id) === 'refuse'" @click="decide(p, false)">
-                                <span class="btn-label">Weigeren</span>
-                              </button>
-                              <button
-                                type="button" class="btn small approve" :class="{ 'danger-fill': p.danger }" :disabled="busy.has(p.id) || !!bulk"
-                                :aria-busy="busy.get(p.id) === 'approve'" @click="decide(p, true)"
-                              ><span class="btn-label">Goedkeuren</span></button>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    </Transition>
-                  </article>
+                  <button
+                    :id="rowId(p.id)" type="button" class="q-row" :class="{ sel: p.id === current }" :tabindex="p.id === current ? 0 : -1"
+                    :aria-current="p.id === current ? 'true' : undefined" aria-controls="q-detail" @click="pick(p.id)"
+                  >
+                    <span class="kind" :class="proposalKind(p).tone" aria-hidden="true"><Icon :name="proposalKind(p).icon" :size="16" /></span>
+                    <span class="q-stack">
+                      <span class="q-what">{{ parts(p).what }}</span>
+                      <span v-if="parts(p).subject" class="q-subject">{{ parts(p).subject }}</span>
+                      <span class="q-meta">{{ p.account }} · <time :datetime="new Date(p.askedAt).toISOString()">{{ ago(p.askedAt, now) }}</time></span>
+                      <span v-if="p.danger" class="q-flag bad danger-flag">Niet terug te draaien</span>
+                      <span v-if="signedOut.has(p.accountId)" class="q-flag warn signed-out-flag">Niet ingelogd</span>
+                    </span>
+                    <span class="pill">#{{ p.id }}</span>
+                  </button>
                 </div>
               </li>
             </TransitionGroup>
+
+            <section id="q-detail" ref="detailPane" class="q-detail" role="region" aria-labelledby="q-detail-title">
+              <Transition name="fade" mode="out-in">
+                <div v-if="chosen" :key="chosen.id" class="q-detail-in">
+                  <header class="q-head">
+                    <span class="q-of"><span class="pill">#{{ chosen.id }}</span><span>Voorstel {{ chosen.id }} van {{ chosen.client }}</span></span>
+                    <h2 id="q-detail-title" class="q-title selectable">{{ chosen.title }}</h2>
+                    <span class="q-asked">{{ chosen.account }} · gevraagd door {{ chosen.client }} · <time :datetime="new Date(chosen.askedAt).toISOString()">{{ ago(chosen.askedAt, now) }}</time></span>
+                  </header>
+                  <div class="q-body">
+                    <p v-if="chosen.danger" class="note bad danger-note" role="note"><Icon name="alert" :size="14" class="note-icon" />Dit is niet terug te draaien vanuit EB MCP.</p>
+                    <p v-if="signedOut.has(chosen.accountId)" class="note warn signed-out" role="note"><Icon name="alert" :size="14" class="note-icon" />{{ chosen.account }} is niet ingelogd in EB MCP. Log eerst in bij Accounts, anders mislukt deze wijziging.</p>
+                    <div class="q-changes">
+                      <h3 class="section-label">Wat er verandert</h3>
+                      <dl class="q-lines selectable">
+                        <div v-for="(line, i) in chosen.lines" :key="i" class="q-line">
+                          <dt>{{ line.label }}</dt>
+                          <dd>{{ line.value }}</dd>
+                        </div>
+                      </dl>
+                    </div>
+                  </div>
+                  <footer class="q-foot">
+                    <span class="q-pos">Voorstel #{{ chosen.id }}, {{ position }} van {{ queue.length }} in de wachtrij</span>
+                    <span class="q-actions">
+                      <button type="button" class="btn refuse" :disabled="busy.has(chosen.id) || !!bulk" :aria-busy="busy.get(chosen.id) === 'refuse'" @click="decide(chosen, false)">
+                        <span class="btn-label">Weigeren</span>
+                      </button>
+                      <button
+                        type="button" class="btn approve" :class="chosen.danger ? 'danger-fill' : 'primary'" :disabled="busy.has(chosen.id) || !!bulk"
+                        :aria-busy="busy.get(chosen.id) === 'approve'" @click="decide(chosen, true)"
+                      ><span class="btn-label">Goedkeuren</span></button>
+                    </span>
+                  </footer>
+                </div>
+              </Transition>
+            </section>
           </div>
         </Transition>
       </section>
@@ -556,38 +620,88 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
 .feedback .btn { flex: none; color: inherit; }
 
 .pane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.queue-wrap { flex: 1; min-height: 0; overflow: auto; padding: 0 16px 16px; }
-.lead { margin: 0 2px 10px; font-size: 12px; color: var(--muted); }
-.queue { margin: 0; padding: 0; list-style: none; }
-/* The gap sits inside each collapsing item, so a row that leaves takes its gap with it. */
-.card { margin-bottom: 8px; border-radius: 12px; background: var(--group); box-shadow: var(--group-edge); transition: box-shadow 150ms ease; }
-.card.danger { box-shadow: var(--group-edge), inset 3px 0 0 var(--danger); }
-.card-head {
-  box-sizing: border-box; width: 100%; display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 0; border-radius: 12px;
-  background: transparent; text-align: left; transition: background-color 150ms ease;
+/* Wachtrij: the list on the left, the chosen proposal beside it. The pane is the container, so a narrow content
+   area (a small main window) stacks the two instead of squeezing them. */
+.q-pane { container: queue / inline-size; }
+.q-split { flex: 1; min-height: 0; display: flex; gap: 12px; padding: 0 16px 16px; }
+.q-list {
+  box-sizing: border-box; width: 372px; flex: none; margin: 0; padding: 6px; list-style: none; overflow: auto;
+  border-radius: 14px; background: var(--group); box-shadow: var(--group-edge);
 }
-.card-head:hover { background: var(--hover); }
-.card-head:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.42); }
-.chev { color: var(--muted); transition: transform 180ms var(--ease); }
-.chev.open { transform: rotate(90deg); }
-.stack { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* The gap sits inside each collapsing item, so a row that leaves takes its gap with it. */
+.q-row {
+  box-sizing: border-box; width: 100%; display: flex; align-items: flex-start; gap: 10px; margin-bottom: 2px; padding: 10px; border: 0;
+  border-radius: 10px; background: transparent; text-align: left; transition: background-color 150ms ease, box-shadow 150ms ease;
+}
+.q-row:hover { background: var(--hover); }
+.q-row.sel, .q-row.sel:hover { background: var(--info-soft); }
+.q-row:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.42); }
+.kind {
+  flex: none; width: 30px; height: 30px; border-radius: 9px; display: flex; align-items: center; justify-content: center;
+  background: var(--subtle); color: var(--label); transition: background-color 150ms ease, color 150ms ease;
+}
+.kind.accent { background: var(--info-soft); color: var(--info); }
+.kind.danger { background: var(--danger-soft); color: var(--danger); }
+.q-stack { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.q-what { font-weight: 600; overflow-wrap: anywhere; }
+.q-subject { color: var(--label); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.q-meta { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.q-flag { font-size: 11px; font-weight: 600; }
+.q-flag.bad { color: var(--danger); }
+.q-flag.warn { color: var(--warn); }
+.pill {
+  flex: none; box-sizing: border-box; height: 20px; display: inline-flex; align-items: center; padding: 0 7px; border-radius: 6px;
+  background: var(--subtle); color: var(--text); font-family: var(--mono); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums;
+}
+
+.q-detail { flex: 1; min-width: 0; min-height: 0; gap: 0; border-radius: 14px; overflow: hidden; background: var(--group); box-shadow: var(--group-edge); }
+.q-detail-in { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+/* The old proposal fades out under the new one: it takes no clicks meanwhile. */
+.q-detail-in.fade-leave-active { pointer-events: none; }
+.q-head { flex: none; padding: 20px 24px 16px; display: flex; flex-direction: column; gap: 8px; }
+.q-of { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 12px; color: var(--muted); }
+.q-title { font-size: 20px; line-height: 25px; font-weight: 700; overflow-wrap: anywhere; }
+.q-asked { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+/* Only the body scrolls: the header says what it is, the footer keeps the buttons in reach. */
+.q-body { flex: 1; min-height: 0; overflow: auto; padding: 0 24px 18px; display: flex; flex-direction: column; gap: 16px; }
+.q-body .note { display: flex; align-items: flex-start; gap: 8px; line-height: 17px; }
+.q-changes { display: flex; flex-direction: column; }
+.q-changes .section-label { padding-bottom: 6px; }
+.q-lines { margin: 0; border-bottom: 0.5px solid var(--line); }
+.q-line { display: grid; grid-template-columns: 150px minmax(0, 1fr); column-gap: 16px; padding: 9px 0; border-top: 0.5px solid var(--line); }
+.q-line dt { color: var(--muted); overflow-wrap: anywhere; }
+/* pre-line: a message or a list of links keeps the line breaks it was given. */
+.q-line dd { margin: 0; overflow-wrap: anywhere; white-space: pre-line; }
+.q-foot { flex: none; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 24px; border-top: 0.5px solid var(--line-soft); }
+.q-pos { font-size: 12px; color: var(--muted); }
+.q-actions { margin-left: auto; display: flex; gap: 8px; }
+.q-actions .btn { min-width: 100px; }
+
+@container queue (max-width: 759px) {
+  /* Stacked: the list on top, limited and scrolling; the detail under it. When even that does not fit, the pane
+     scrolls as a whole, so nothing is cut off. */
+  .q-split { flex-direction: column; overflow: auto; }
+  .q-list { width: auto; max-height: 216px; }
+  .q-detail { flex: 1 0 300px; }
+  .q-head { padding: 16px 16px 12px; }
+  .q-body { padding: 0 16px 16px; }
+  .q-foot { padding: 10px 16px; }
+}
+@container queue (max-width: 459px) {
+  .q-line { grid-template-columns: minmax(0, 1fr); row-gap: 2px; }
+}
+
 .nr { font-variant-numeric: tabular-nums; }
-.sub { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.card-body { padding: 0 12px 12px 62px; display: flex; flex-direction: column; gap: 10px; }
 .lines { display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); column-gap: 14px; row-gap: 6px; margin: 0; padding: 12px; border-radius: 10px; background: var(--sunken); }
 .lines dt { color: var(--label); font-size: 12px; line-height: 18px; white-space: nowrap; }
 /* pre-line: a message or a list of links keeps the line breaks it was given. */
 .lines dd { margin: 0; line-height: 18px; overflow-wrap: anywhere; white-space: pre-line; }
-.card-body .note.warn { display: flex; align-items: center; gap: 8px; }
-.card-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 .chip { display: inline-flex; align-items: center; gap: 4px; height: 18px; padding: 0 7px; border-radius: 999px; background: var(--subtle); color: var(--label); font-size: 11px; font-weight: 500; white-space: nowrap; flex: none; }
 .chip.ok { background: var(--success-soft); color: var(--success); }
 .chip.bad { background: var(--danger-soft); color: var(--danger); }
 .chip.run { background: var(--info-soft); color: var(--info); }
 .chip.off { background: var(--subtle); color: var(--muted); }
-.chip.warn { background: var(--warn-soft); color: var(--warn); }
 .chip.auto { background: transparent; color: var(--muted); box-shadow: inset 0 0 0 0.5px var(--line); }
 
 .split { flex: 1; min-height: 0; display: flex; }
@@ -654,7 +768,6 @@ h3 { margin: 0; }
 @media (prefers-reduced-motion: reduce) {
   .detail { animation: fade-in 150ms ease both; }
   .detail.detail-leave-active { animation: fade-out 140ms cubic-bezier(0.4, 0, 1, 1) both; }
-  .chev { transition: none; }
   .icon-btn:active, .row-enter-from { transform: none; }
 }
 </style>

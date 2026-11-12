@@ -177,6 +177,63 @@ export function filterHistory(records: ApprovalRecord[], status: ApprovalStatus 
   })
 }
 
+/** How a proposal's tint reads in the queue: a new thing, a plain change, or one that cannot be undone. */
+export type KindTone = 'accent' | 'neutral' | 'danger'
+
+/** The icon and tint the queue shows for a proposal, from its tool name. */
+export interface ProposalKind {
+  icon: string
+  tone: KindTone
+}
+
+/**
+ * What kind of change a proposal makes, for the icon in the queue: adding or uploading gets a plus on the accent tint,
+ * changing or linking a pencil, removing a trash can, mailing an invoice an envelope, crediting or invoicing a
+ * document, anything else a generic mark. A change that cannot be undone is always on the red tint.
+ */
+export function proposalKind(proposal: Pick<Proposal, 'tool' | 'danger'>): ProposalKind {
+  const kind = kindOfTool(proposal.tool)
+  return proposal.danger ? { icon: kind.icon, tone: 'danger' } : kind
+}
+
+function kindOfTool(tool: string): ProposalKind {
+  // By what the name ends in, so a tool added later (offerte_mailen, archief_ontkoppelen) gets its icon by itself.
+  if (tool.endsWith('_mailen') || tool.endsWith('_versturen')) return { icon: 'mail', tone: 'neutral' }
+  if (tool.endsWith('_crediteren') || tool.endsWith('_factureren')) return { icon: 'file-text', tone: 'neutral' }
+  if (tool.endsWith('_toevoegen') || tool.endsWith('_uploaden')) return { icon: 'plus', tone: 'accent' }
+  if (tool.endsWith('_wijzigen') || tool.endsWith('_koppelen') || tool.endsWith('_ontkoppelen')) return { icon: 'pencil', tone: 'neutral' }
+  if (tool.endsWith('_verwijderen')) return { icon: 'trash', tone: 'neutral' }
+  return { icon: 'square-dot', tone: 'neutral' }
+}
+
+/**
+ * A title as "what happens: subject" in two parts, split on the first ": ", as most tools write it
+ * ("Relatie verwijderen: EB MCP proef wachtrij"). Without one, or with an empty side, the whole title is what happens.
+ */
+export function splitTitle(title: string): { what: string; subject: string | null } {
+  const at = title.indexOf(': ')
+  if (at < 0) return { what: title, subject: null }
+  const what = title.slice(0, at).trim()
+  const subject = title.slice(at + 2).trim()
+  return what && subject ? { what, subject } : { what: title, subject: null }
+}
+
+/**
+ * Which proposal is selected after the queue changed from `before` to `next` (ids in list order). The selected one
+ * stays when it still waits. When it left, the one that now takes its place is selected, or the one before it when it
+ * was the last; when nothing was selected, or it was not in the list, the first.
+ */
+export function followSelection(before: number[], next: number[], current: number | null): number | null {
+  if (!next.length) return null
+  if (current !== null && next.includes(current)) return current
+  const at = current === null ? -1 : before.indexOf(current)
+  if (at < 0) return next[0]!
+  const still = new Set(next)
+  // The ones above it that still wait keep their places, so its successor sits right after them.
+  const above = before.slice(0, at).filter((id) => still.has(id)).length
+  return next[Math.min(above, next.length - 1)]!
+}
+
 /** "1 wijziging wacht op je akkoord", "3 wijzigingen wachten op je akkoord". */
 export function waitingText(n: number): string {
   return n === 1 ? '1 wijziging wacht op je akkoord' : `${n} wijzigingen wachten op je akkoord`
