@@ -167,12 +167,12 @@ export function decisionLabel(decision: ApprovalDecision | null, bulk = false): 
   }
 }
 
-/** Records with this status (all when empty) whose title or account holds every word of the query. */
+/** Records with this status (all when empty) whose title, account or proposal number holds every word of the query. */
 export function filterHistory(records: ApprovalRecord[], status: ApprovalStatus | '', query: string): ApprovalRecord[] {
   const words = query.toLowerCase().split(/\s+/).filter(Boolean)
   return records.filter((record) => {
     if (status && record.status !== status) return false
-    const text = `${record.title} ${record.account}`.toLowerCase()
+    const text = `${record.title} ${record.account} ${record.id}`.toLowerCase()
     return words.every((word) => text.includes(word))
   })
 }

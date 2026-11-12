@@ -309,7 +309,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
       </div>
       <Transition name="fade" mode="out-in">
         <div v-if="view === 'history'" key="filters" class="tools">
-          <input v-model="search" class="search" type="search" placeholder="Zoek op titel of account" aria-label="Zoek op titel of account" />
+          <input v-model="search" class="search" type="search" placeholder="Zoek op titel, account of nummer" aria-label="Zoek op titel, account of nummer" />
           <select v-model="status" class="pick" :class="{ on: status }" aria-label="Status">
             <option value="">Alle statussen</option>
             <option v-for="s in STATUSES" :key="s.value" :value="s.value">{{ s.label }}</option>
@@ -359,7 +359,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
                       <Avatar :label="p.account" :size="28" />
                       <span class="stack">
                         <span class="title">{{ p.title }}</span>
-                        <span class="sub">{{ p.account }} · {{ p.client }} · <time :datetime="new Date(p.askedAt).toISOString()">{{ ago(p.askedAt, now) }}</time></span>
+                        <span class="sub"><span class="nr">Voorstel {{ p.id }}</span> · {{ p.account }} · {{ p.client }} · <time :datetime="new Date(p.askedAt).toISOString()">{{ ago(p.askedAt, now) }}</time></span>
                       </span>
                       <span v-if="signedOut.has(p.accountId)" class="chip warn signed-out-chip">Niet ingelogd</span>
                       <span v-if="p.danger" class="chip bad danger-chip"><Icon name="alert" :size="12" />Niet terug te draaien</span>
@@ -417,7 +417,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
                   <span class="r-time">{{ stamp(r.askedAt) }}</span>
                   <span class="r-main">
                     <span class="r-title">{{ r.title }}</span>
-                    <span class="r-sub">{{ r.account }} · {{ r.client }}</span>
+                    <span class="r-sub"><span class="nr">Voorstel {{ r.id }}</span> · {{ r.account }} · {{ r.client }}</span>
                   </span>
                   <span class="r-status">
                     <span v-if="r.decision === 'auto'" class="chip auto">Zonder akkoord</span>
@@ -463,6 +463,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
                       <section>
                         <h3 class="section-label">Wie en wanneer</h3>
                         <dl class="kv">
+                          <dt>Voorstel</dt><dd class="nr">{{ selected.id }}</dd>
                           <dt>Gevraagd door</dt><dd>{{ selected.client }}</dd>
                           <dt>Account</dt><dd>{{ selected.account }}</dd>
                           <dt>Gevraagd</dt><dd>{{ stamp(selected.askedAt, true) }}</dd>
@@ -507,7 +508,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
     <Alert v-if="confirming" :title="`${changes(confirming.ids.length)} goedkeuren?`" :tone="confirming.danger ? 'danger' : undefined" @close="confirming = null">
       <p>Voor {{ nameList(confirming.accounts) }}. EB MCP voert ze daarna een voor een uit in e-Boekhouden.</p>
       <ul class="confirm-list selectable">
-        <li v-for="item in confirming.items.slice(0, NAMED)" :key="item.id" :class="{ danger: item.danger }">{{ item.title }}<span class="confirm-account"> · {{ item.account }}</span></li>
+        <li v-for="item in confirming.items.slice(0, NAMED)" :key="item.id" :class="{ danger: item.danger }"><span class="confirm-account">{{ item.id }} · </span>{{ item.title }}<span class="confirm-account"> · {{ item.account }}</span></li>
         <li v-if="confirming.items.length > NAMED" class="more">en nog {{ confirming.items.length - NAMED }}</li>
       </ul>
       <p v-if="confirming.danger" class="alert-danger">
@@ -571,6 +572,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
 .chev.open { transform: rotate(90deg); }
 .stack { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nr { font-variant-numeric: tabular-nums; }
 .sub { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card-body { padding: 0 12px 12px 62px; display: flex; flex-direction: column; gap: 10px; }
 .lines { display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); column-gap: 14px; row-gap: 6px; margin: 0; padding: 12px; border-radius: 10px; background: var(--sunken); }

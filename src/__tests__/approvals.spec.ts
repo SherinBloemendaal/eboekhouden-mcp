@@ -126,7 +126,7 @@ describe('the queue', () => {
     await mountAt('/akkoord')
     const cards = [...document.querySelectorAll('.card')]
     expect(cards.map((c) => c.querySelector('.title')?.textContent)).toEqual(['Mutatie toevoegen: Geld uitgegeven', 'Relatie wijzigen: Jansen'])
-    expect(cards[0]!.querySelector('.sub')?.textContent).toBe('Studio Noord · Claude · 5 min geleden')
+    expect(cards[0]!.querySelector('.sub')?.textContent).toBe('Voorstel 7 · Studio Noord · Claude · 5 min geleden')
     expect(cards[1]!.querySelector('.sub')?.textContent).toContain('Bakkerij Zuid · Cursor')
 
     const head = cards[0]!.querySelector<HTMLButtonElement>('.card-head')!
@@ -233,7 +233,7 @@ describe('Alles goedkeuren', () => {
     // It names what it approves, so nothing is approved unread.
     const named = [...dialog.querySelectorAll('.confirm-list li')]
     expect(named.map((li) => li.textContent)).toEqual([
-      'Mutatie toevoegen: Geld uitgegeven · Studio Noord', 'Factuur F00012 verwijderen · Bakkerij Zuid', 'Relatie toevoegen: Jansen · Studio Noord',
+      '7 · Mutatie toevoegen: Geld uitgegeven · Studio Noord', '8 · Factuur F00012 verwijderen · Bakkerij Zuid', '9 · Relatie toevoegen: Jansen · Studio Noord',
     ])
     expect(named.map((li) => li.classList.contains('danger'))).toEqual([false, true, false])
 
@@ -378,7 +378,7 @@ describe('the history', () => {
     expect(detail.querySelector('.outcome')?.textContent).toContain('Mislukt: e-Boekhouden: factuur is al betaald')
     const facts = [...detail.querySelectorAll('.kv dt')].map((dt) => [dt.textContent, dt.nextElementSibling?.textContent])
     expect(facts).toEqual([
-      ['Gevraagd door', 'Claude'], ['Account', 'Bakkerij Zuid'], ['Gevraagd', expect.any(String)], ['Beantwoord', expect.any(String)],
+      ['Voorstel', '12'], ['Gevraagd door', 'Claude'], ['Account', 'Bakkerij Zuid'], ['Gevraagd', expect.any(String)], ['Beantwoord', expect.any(String)],
       ['Antwoord', 'Goedgekeurd'], ['App-versie', '0.4.0'],
     ])
     expect([...detail.querySelectorAll('dl.lines dt')].map((e) => e.textContent)).toEqual(['Rekening', 'Omschrijving'])
@@ -561,6 +561,7 @@ describe('the toast for a new change', () => {
     expect(toasts()).toHaveLength(1)
     expect(toasts()[0]!.querySelector('.toast-title')?.textContent).toBe('Factuur F00012 verwijderen')
     expect(toasts()[0]!.querySelector('.toast-text')?.textContent).toContain('Bakkerij Zuid')
+    expect(toasts()[0]!.querySelector('.toast-text')?.textContent).toContain('Voorstel ')
     expect(buttons(toasts()[0]!, 'Bekijken')).toHaveLength(1)
 
     // Hovering stops the clock; leaving starts it again with the time that was left.
