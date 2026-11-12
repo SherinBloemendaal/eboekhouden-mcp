@@ -95,6 +95,9 @@ const fn field(
     }
 }
 
+/// The BIC field of the company details, also used to check a BIC that e-Boekhouden looks up.
+const BIC: Field = field("bic", &["bic"], "BIC", 20, false, Check::Bic);
+
 /// The edit form of Beheer > Mijn gegevens (Dutch administrations), in its order. Lengths and required fields are
 /// the form's own.
 const BEDRIJF: &[Field] = &[
@@ -161,7 +164,7 @@ const BEDRIJF: &[Field] = &[
         Check::Kvk,
     ),
     field("iban", &["iban"], "IBAN", 50, false, Check::Iban),
-    field("bic", &["bic"], "BIC", 20, false, Check::Bic),
+    BIC,
 ];
 
 /// Fields of the edit form that no tool argument sets: they go back exactly as read.
@@ -296,7 +299,7 @@ pub struct BedrijfsgegevensWijzigenArgs {
     pub website: Option<String>,
     /// KvK-nummer, alleen cijfers.
     pub kvk: Option<String>,
-    /// Btw-nummer (OB-nummer), zoals NL123456789B01.
+    /// Btw-nummer (OB-nummer), zoals NL123456782B01.
     pub ob_nummer: Option<String>,
     /// Btw-identificatienummer van een eenmanszaak, zoals NL000099998B57. Leeg voor een onderneming die geen eenmanszaak is.
     pub btw_id: Option<String>,
@@ -500,7 +503,9 @@ fn clean(field: &Field, raw: &str) -> Result<String, String> {
     let value = match field.check {
         Check::Text | Check::Geslacht => raw.to_owned(),
         Check::Email if raw.is_empty() => String::new(),
-        Check::Email => email(raw, label)?,
+        Check::Email => {
+            email(raw, label).map_err(|_| format!("{raw} is geen geldig e-mailadres"))?
+        }
         Check::Postcode => postcode(raw),
         Check::Kvk => {
             let value = without_spaces_and_dots(raw);
@@ -518,7 +523,7 @@ fn clean(field: &Field, raw: &str) -> Result<String, String> {
             }
             if !value.is_empty() && field.check == Check::ObNummer && !ob_nummer_ok(&value) {
                 return Err(
-                    "Het btw-nummer (OB-nummer) klopt niet. Een OB-nummer ziet er zo uit: NL123456789B01."
+                    "Het btw-nummer (OB-nummer) klopt niet. Een OB-nummer ziet er zo uit: NL123456782B01."
                         .into(),
                 );
             }
@@ -595,30 +600,7 @@ fn merge(
     keep: &[&str],
     given: Vec<(&'static str, String)>,
 ) -> Result<Merged, String> {
-    let empty = serde_json::Map::new();
-    let model = match read {
-        Value::Object(model) => model,
-        Value::Null => &empty,
-        _ => return Err("e-Boekhouden gaf deze gegevens in een onbekende vorm terug".into()),
-    };
-    let mut body = serde_json::Map::new();
-    for field in fields {
-        match field.read.iter().find_map(|key| model.get(*key)) {
-            Some(value) => {
-                body.insert(field.key.into(), value.clone());
-            }
-            None => {
-                if let Some(default) = field.default {
-                    body.insert(field.key.into(), json!(default));
-                }
-            }
-        }
-    }
-    for key in keep {
-        if let Some(value) = model.get(*key) {
-            body.insert((*key).into(), value.clone());
-        }
-    }
+    let mut body = form_of(read, fields, keep)?;
     let mut lines = Vec::new();
     let mut changed = Vec::new();
     for (key, raw) in given {
@@ -665,15 +647,91 @@ fn merge(
     })
 }
 
+/// The form as e-Boekhouden's screen fills it from what was read, before any change: each field from the first of
+/// its read keys that has a value (a key with null does not hide a filled one under another name), else null when
+/// a key is there, else the form's default, else left out. Then the fields that go back untouched (`keep`).
+fn form_of(
+    read: &Value,
+    fields: &[Field],
+    keep: &[&str],
+) -> Result<serde_json::Map<String, Value>, String> {
+    let empty = serde_json::Map::new();
+    let model = match read {
+        Value::Object(model) => model,
+        Value::Null => &empty,
+        _ => return Err("e-Boekhouden gaf deze gegevens in een onbekende vorm terug".into()),
+    };
+    let mut body = serde_json::Map::new();
+    for field in fields {
+        let filled = field
+            .read
+            .iter()
+            .find_map(|key| model.get(*key).filter(|v| !v.is_null()));
+        let present = field.read.iter().find_map(|key| model.get(*key));
+        match filled.or(present) {
+            Some(value) => {
+                body.insert(field.key.into(), value.clone());
+            }
+            None => {
+                if let Some(default) = field.default {
+                    body.insert(field.key.into(), json!(default));
+                }
+            }
+        }
+    }
+    for key in keep {
+        if let Some(value) = model.get(*key) {
+            body.insert((*key).into(), value.clone());
+        }
+    }
+    Ok(body)
+}
+
+/// The body to send after the approval, built from a fresh read. The approval may have waited for hours: when any
+/// field outside the requested change now differs from what the user approved, nothing is sent.
+fn rebuild(
+    fresh: &Value,
+    fields: &[Field],
+    keep: &[&str],
+    approved: &Value,
+    changed: &[&'static str],
+    what: &str,
+) -> Result<Value, Halt> {
+    let stale = || {
+        Halt::Error(format!(
+            "De {what} zijn intussen gewijzigd in e-Boekhouden, na het voorstel. Er is niets opgeslagen; vraag de wijziging opnieuw aan."
+        ))
+    };
+    let approved = approved.as_object().ok_or_else(stale)?;
+    let mut body = form_of(fresh, fields, keep).map_err(|_| stale())?;
+    let keys: std::collections::BTreeSet<&String> = approved.keys().chain(body.keys()).collect();
+    for key in keys {
+        if changed.contains(&key.as_str()) {
+            continue;
+        }
+        if approved.get(key) != body.get(key) {
+            return Err(stale());
+        }
+    }
+    for key in changed {
+        if let Some(value) = approved.get(*key) {
+            body.insert((*key).into(), value.clone());
+        }
+    }
+    Ok(Value::Object(body))
+}
+
 /// The answer of a save that e-Boekhouden's screen counts as done only when it is something (`true`).
 fn saved(answer: Value) -> Result<Value, Halt> {
+    let unknown = || {
+        Halt::Error(
+            "e-Boekhouden bevestigde het opslaan niet. Of de wijziging is doorgevoerd is niet bekend: kijk in e-Boekhouden onder Beheer > Mijn gegevens."
+                .into(),
+        )
+    };
     match &answer {
-        Value::Null | Value::Bool(false) => Err(Halt::Error(
-            "e-Boekhouden meldt dat het opslaan niet gelukt is; er is niets gewijzigd".into(),
-        )),
-        Value::String(s) if s.is_empty() => Err(Halt::Error(
-            "e-Boekhouden meldt dat het opslaan niet gelukt is; er is niets gewijzigd".into(),
-        )),
+        Value::Null | Value::Bool(false) => Err(unknown()),
+        Value::String(s) if s.is_empty() => Err(unknown()),
         _ => Ok(answer),
     }
 }
@@ -749,29 +807,40 @@ impl EbMcp {
                     let iban = merged.body.get("iban").map(text).unwrap_or_default();
                     let before = merged.body.get("bic").cloned();
                     if !iban.is_empty() {
-                        let found = this
-                            .fetch(&run, "bic", vec![("iban".into(), iban)])
-                            .await
-                            .ok()
-                            .and_then(|bic| bic.as_str().map(|b| b.trim().to_ascii_uppercase()))
-                            .filter(|bic| !bic.is_empty());
-                        match found {
-                            Some(bic) if Some(bic.as_str()) != before.as_ref().and_then(Value::as_str) => {
-                                let bic_field = BEDRIJF.iter().find(|f| f.key == "bic");
-                                if let Some(bic_field) = bic_field {
-                                    merged.lines.push(line("BIC was", shown(bic_field, before.as_ref())));
-                                    merged.lines.push(line("BIC wordt", format!("{bic} (opgezocht bij het nieuwe IBAN)")));
-                                }
-                                merged.body.insert("bic".into(), json!(bic));
-                            }
-                            Some(_) => {}
-                            None => merged.lines.push(line(
+                        let bic_field = &BIC;
+                        let stays = format!(
+                            "de BIC blijft {}; geef de BIC zelf mee als die niet bij het nieuwe IBAN past",
+                            before.as_ref().map(text).filter(|b| !b.is_empty()).unwrap_or_else(|| "leeg".into())
+                        );
+                        let looked_up = this.fetch(&run, "bic", vec![("iban".into(), iban)]).await;
+                        match looked_up {
+                            Err(_) => merged.lines.push(line(
                                 "BIC",
-                                format!(
-                                    "e-Boekhouden vond geen BIC bij het nieuwe IBAN; de BIC blijft {}",
-                                    before.as_ref().map(text).filter(|b| !b.is_empty()).unwrap_or_else(|| "leeg".into())
-                                ),
+                                format!("EB MCP kon de BIC bij het nieuwe IBAN niet opzoeken; {stays}"),
                             )),
+                            Ok(answer) => {
+                                let found = answer.as_str().map(str::trim).unwrap_or_default().to_owned();
+                                if found.is_empty() {
+                                    merged.lines.push(line(
+                                        "BIC",
+                                        format!("e-Boekhouden vond geen BIC bij het nieuwe IBAN; {stays}"),
+                                    ));
+                                } else {
+                                    match clean(bic_field, &found) {
+                                        Err(_) => merged.lines.push(line(
+                                            "BIC",
+                                            format!("e-Boekhouden gaf bij het nieuwe IBAN geen geldige BIC ({found}); {stays}"),
+                                        )),
+                                        Ok(bic) if Some(bic.as_str()) != before.as_ref().and_then(Value::as_str) => {
+                                            merged.lines.push(line("BIC was", shown(bic_field, before.as_ref())));
+                                            merged.lines.push(line("BIC wordt", format!("{bic} (opgezocht bij het nieuwe IBAN)")));
+                                            merged.body.insert("bic".into(), json!(bic));
+                                            merged.changed.push("bic");
+                                        }
+                                        Ok(_) => {}
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -793,8 +862,23 @@ impl EbMcp {
                     lines,
                 };
                 this.approve(&run, TOOL, &built, true).await?;
+                let fresh = this.fetch(&run, MIJN_GEGEVENS, adm()).await?;
+                if !fresh.is_object() {
+                    return Err(Halt::Error(
+                        "e-Boekhouden gaf de bedrijfsgegevens na het akkoord niet terug; er is niets opgeslagen. Vraag de wijziging opnieuw aan."
+                            .into(),
+                    ));
+                }
+                let body = rebuild(
+                    &fresh,
+                    BEDRIJF,
+                    BEDRIJF_KEEP,
+                    &built.body,
+                    &merged.changed,
+                    "bedrijfsgegevens",
+                )?;
                 let answer = saved(
-                    this.change_query(&run, "PUT", MIJN_GEGEVENS, &adm(), Some(&built.body))
+                    this.change_query(&run, "PUT", MIJN_GEGEVENS, &adm(), Some(&body))
                         .await?,
                 )?;
                 let now = this.fetch(&run, MIJN_GEGEVENS, adm()).await.ok();
@@ -879,8 +963,17 @@ impl EbMcp {
                     lines,
                 };
                 this.approve(&run, TOOL, &built, true).await?;
+                let fresh = this.fetch(&run, FACTUURADRES, Vec::new()).await?;
+                let body = rebuild(
+                    &fresh,
+                    FACTUUR,
+                    &[],
+                    &built.body,
+                    &merged.changed,
+                    "gegevens van het factuuradres",
+                )?;
                 let answer = this
-                    .change(&run, "PUT", FACTUURADRES, Some(&built.body))
+                    .change(&run, "PUT", FACTUURADRES, Some(&body))
                     .await?;
                 let now = this.fetch(&run, FACTUURADRES, Vec::new()).await.ok();
                 Ok(json!({"opgeslagen": answer, "factuuradres": now}))
