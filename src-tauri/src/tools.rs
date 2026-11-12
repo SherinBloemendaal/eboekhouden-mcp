@@ -1357,6 +1357,38 @@ impl EbMcp {
     }
 
     /// The rekeningschema and btw codes of the account's administration.
+    /// The unprocessed bank line with this id, read fresh from `import/gridtable`. A line that is not there is
+    /// refused: it does not exist, belongs to another administration, or was processed already, and booking
+    /// it again would put the same money in the books twice.
+    async fn bankregel(&self, run: &Run, id: u64) -> Result<write::Bankregel, String> {
+        // The size e-Boekhouden's own page asks for; checked against a real administration on 2026-11-11.
+        const PAGE: u64 = 2000;
+        let mut offset = 0;
+        loop {
+            let query = vec![
+                ("offset".to_owned(), offset.to_string()),
+                ("limit".to_owned(), PAGE.to_string()),
+                ("orderBy".to_owned(), String::new()),
+                ("sortDirection".to_owned(), String::new()),
+            ];
+            let page = named_rows(self.fetch(run, "import/gridtable", query).await?);
+            if let Some(found) = write::Bankregel::find(&page, id) {
+                return found;
+            }
+            let rows = page
+                .get("data")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len) as u64;
+            let total = page.get("rowCount").and_then(Value::as_u64).unwrap_or(0);
+            offset += rows;
+            if rows == 0 || offset >= total {
+                return Err(format!(
+                    "Bankregel {id} staat niet bij de onverwerkte bankregels van deze administratie: het id klopt niet, of de regel is al verwerkt. Er is niets geboekt; vraag de regels op met bankregels."
+                ));
+            }
+        }
+    }
+
     async fn books(&self, run: &Run) -> Result<Books, String> {
         let all = vec![
             ("offset".to_owned(), "0".to_owned()),
@@ -2734,7 +2766,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een mutatie boeken, zoals op de schermen Invoeren > Facturen, Afschrift/bonnetjes en Memoriaal: factuur ontvangen of verstuurd, factuurbetaling ontvangen of verstuurd, geld ontvangen of uitgegeven, of memoriaal. Met bankregel_id wordt een onverwerkte bankregel daarmee verwerkt. Rekeningen gaan op code (zie grootboek), btw op code (GEEN, HOOG_VERK_21, HOOG_INK_21, LAAG_VERK_9, ...); e-Boekhouden rekent de btw zelf uit. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de boeking eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een mutatie boeken, zoals op de schermen Invoeren > Facturen, Afschrift/bonnetjes en Memoriaal: factuur ontvangen of verstuurd, factuurbetaling ontvangen of verstuurd, geld ontvangen of uitgegeven, of memoriaal. Met bankregel_id wordt een onverwerkte bankregel daarmee verwerkt, bij elke soort, ook een factuurbetaling: geef de bankrekening, de datum en het bedrag van de regel, zodat hij niet nog eens geboekt hoeft te worden. Het voorstel toont de bankregel en zegt het als rekening, richting of totaal ervan afwijken. Zonder bankregel_id blijft de bankregel open staan. Rekeningen gaan op code (zie grootboek), btw op code (GEEN, HOOG_VERK_21, HOOG_INK_21, LAAG_VERK_9, ...); e-Boekhouden rekent de btw zelf uit. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de boeking eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Mutatie toevoegen",
             read_only_hint = false,
@@ -2764,7 +2796,11 @@ impl EbMcp {
                         false,
                     )
                     .await?;
-                let built = write::mutatie_nieuw(&args, &books)?;
+                let bankregel = match args.bankregel_id {
+                    Some(id) => Some(this.bankregel(&run, id).await?),
+                    None => None,
+                };
+                let built = write::mutatie_nieuw(&args, &books, bankregel.as_ref())?;
                 this.approve(&run, TOOL, &built, false).await?;
                 this.change(&run, "POST", "mutatie", Some(&built.body))
                     .await

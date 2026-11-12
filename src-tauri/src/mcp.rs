@@ -399,6 +399,17 @@ mod tests {
                 get(|| async { axum::Json(serde_json::json!([{"code": "GEEN", "omschrijving": "Geen btw", "percentage": 0, "soort": ""}])) }),
             )
             .route(
+                // The unprocessed bank lines: the one the tests book, in the shape the real grid has.
+                "/v1/api/import/gridtable",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "colMetadata": [{"name": "id"}, {"name": "datum"}, {"name": "rekening"}, {"name": "mutDatum"}, {"name": "mutBedrag"}, {"name": "mutOmschrijving"}, {"name": "mutFactuur"}, {"name": "grootboekId"}, {"name": "opmerking"}, {"name": "hasFiles"}, {"name": "verwerkFailureReason"}],
+                        "data": [[465233844u64, "2026-11-10T08:00:00", "NL00BANK0123456789", "2026-11-06T00:00:00", -2.0, "BCK*Parkeergarage Dams Groningen", "", 11, null, null, null]],
+                        "rowCount": 1, "offset": 0, "limit": 2000
+                    }))
+                }),
+            )
+            .route(
                 "/v1/api/mutatie",
                 post(move |axum::Json(body): axum::Json<serde_json::Value>| {
                     let seen = seen.clone();
@@ -542,6 +553,18 @@ mod tests {
                 "{:?}",
                 proposal.lines
             );
+            // The bank line was read from e-Boekhouden and is shown as the statement has it; it matches the booking.
+            assert!(
+                proposal.lines.iter().any(|l| l.label == "Bankregel"
+                    && l.value == "06-11-2026, -2,00: BCK*Parkeergarage Dams Groningen (id 465233844); deze boeking verwerkt hem"),
+                "{:?}",
+                proposal.lines
+            );
+            assert!(
+                !proposal.lines.iter().any(|l| l.label == "Let op"),
+                "{:?}",
+                proposal.lines
+            );
             proposal
         };
         let request = serde_json::json!({
@@ -561,6 +584,32 @@ mod tests {
 
         // With approval the call answers at once that the change waits; the user says no: nothing goes out.
         set_write(WriteMode::Ask);
+        // A bank line that is not among the unprocessed ones (a wrong id, or one that was processed already) is
+        // refused before the user is asked anything: booking it would put the same money in the books twice.
+        let unknown = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 30, "method": "tools/call", "params": {"name": "mutatie_toevoegen", "arguments": {
+                "soort": "geld_uitgegeven", "datum": "2026-11-06", "rekening": "1010", "omschrijving": "Parkeergarage",
+                "regels": [{"tegenrekening": "4550", "bedrag": 2}], "bankregel_id": 1
+            }}}),
+            session.clone(),
+        )
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+        let (is_error, text) = answer_of(unknown);
+        assert!(
+            is_error && text.contains("Bankregel 1 staat niet bij de onverwerkte bankregels"),
+            "{text}"
+        );
+        assert_eq!(state.approvals.count(), 0);
+        assert!(
+            state.approvals.history(None).is_empty(),
+            "nothing was asked"
+        );
+        assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+
         let (is_error, text) = book(3).await;
         assert!(!is_error, "waiting is not an error: {text}");
         let id = waiting_id(&text);

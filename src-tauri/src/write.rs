@@ -494,7 +494,7 @@ pub struct MutatieToevoegenArgs {
     pub betalingen: Option<Vec<BetalingArg>>,
     /// Boekstuknummer.
     pub boekstuk: Option<String>,
-    /// Id van een onverwerkte bankregel (uit bankregels): die is daarmee verwerkt.
+    /// Id van een onverwerkte bankregel (uit bankregels): die is daarmee verwerkt. EB MCP zoekt de regel eerst op en weigert een id dat niet (meer) bij de onverwerkte regels staat. Zonder omschrijving krijgt de boeking de tekst van de bankregel.
     pub bankregel_id: Option<u64>,
     /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
@@ -542,6 +542,71 @@ struct Betaling {
     relatie_id: u64,
     factuur: String,
     bedrag: f64,
+}
+
+/// An unprocessed bank line, as one named row of `import/gridtable`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Bankregel {
+    pub id: u64,
+    /// The booking date on the statement (`mutDatum`).
+    pub datum: Option<Date>,
+    /// Negative is money that went out.
+    pub bedrag: f64,
+    pub omschrijving: String,
+    /// The ledger account of the bank account the line came from, when e-Boekhouden knows it.
+    pub grootboek_id: Option<u64>,
+}
+
+impl Bankregel {
+    /// The line with this id in a page of `import/gridtable` whose rows carry their column names. `None` when
+    /// the page does not have it; an error when it has the line in a shape EB MCP cannot read.
+    pub fn find(page: &Value, id: u64) -> Option<Result<Self, String>> {
+        let row = page
+            .get("data")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|row| row.get("id").and_then(Value::as_u64) == Some(id))?;
+        let bedrag = row.get("mutBedrag").and_then(Value::as_f64);
+        Some(match bedrag {
+            Some(bedrag) => Ok(Self {
+                id,
+                datum: row
+                    .get("mutDatum")
+                    .and_then(Value::as_str)
+                    .and_then(|d| d.get(..10))
+                    .and_then(|d| parse_date(d).ok()),
+                bedrag,
+                omschrijving: row
+                    .get("mutOmschrijving")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned(),
+                grootboek_id: row.get("grootboekId").and_then(Value::as_u64),
+            }),
+            None => Err(format!(
+                "e-Boekhouden gaf bankregel {id} in een onbekende vorm terug"
+            )),
+        })
+    }
+
+    /// The line as the proposal shows it: enough to know it from the statement.
+    fn shown(&self) -> String {
+        const MAX: usize = 120;
+        let datum = self
+            .datum
+            .map(dutch)
+            .unwrap_or_else(|| "zonder datum".into());
+        let mut text: String = self.omschrijving.chars().take(MAX).collect();
+        if self.omschrijving.chars().count() > MAX {
+            text.push('…');
+        }
+        format!(
+            "{datum}, {}: {text} (id {}); deze boeking verwerkt hem",
+            euro(self.bedrag),
+            self.id
+        )
+    }
 }
 
 /// A mutatie in between the tool's arguments (or the mutatie as it is now) and the request body.
@@ -722,7 +787,7 @@ impl Mutatie {
         Value::Object(body)
     }
 
-    fn lines(&self, books: &Books, bankregel: Option<u64>) -> Vec<Line> {
+    fn lines(&self, books: &Books, bankregel: Option<&Bankregel>) -> Vec<Line> {
         let mut lines = vec![
             line("Soort", self.soort.naam()),
             line("Datum", dutch(self.datum)),
@@ -777,12 +842,75 @@ impl Mutatie {
             }
         }
         if let Some(bankregel) = bankregel {
-            lines.push(line(
-                "Bankregel",
-                format!("id {bankregel}, daarmee verwerkt"),
-            ));
+            lines.push(line("Bankregel", bankregel.shown()));
+            for warning in self.differs_from(bankregel, books) {
+                lines.push(line("Let op", warning));
+            }
         }
         lines
+    }
+
+    /// What this booking takes off or puts on the bank, as far as that can be told without e-Boekhouden's own
+    /// btw sum: the payments, or the lines when their amounts include btw or carry none.
+    fn bank_total(&self) -> Option<f64> {
+        if self.soort.is_betaling() {
+            return Some(round2(self.betalingen.iter().map(|b| b.bedrag).sum()));
+        }
+        if !matches!(self.soort, Soort::GeldOntvangen | Soort::GeldUitgegeven) {
+            return None;
+        }
+        let known = self.in_ex == InEx::Incl || self.regels.iter().all(|r| r.btw == "GEEN");
+        known.then(|| round2(self.regels.iter().map(|r| r.bedrag).sum()))
+    }
+
+    /// Where this booking is not what the bank line says. e-Boekhouden's own form starts from the line (its
+    /// account, its amount) and asks before it saves a payment that leaves a difference; here the user reads
+    /// the same in the proposal. Nothing is refused: a line may be split or booked in another way on purpose.
+    fn differs_from(&self, bankregel: &Bankregel, books: &Books) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Some(account) = bankregel
+            .grootboek_id
+            .filter(|id| *id > 0 && *id != self.rekening)
+        {
+            warnings.push(format!(
+                "de bankregel hoort bij {}, deze boeking staat op {}",
+                books.label(account),
+                books.label(self.rekening)
+            ));
+        }
+        let incoming = match self.soort {
+            Soort::GeldOntvangen | Soort::FactuurbetalingOntvangen => Some(true),
+            Soort::GeldUitgegeven | Soort::FactuurbetalingVerstuurd => Some(false),
+            _ => None,
+        };
+        let Some(incoming) = incoming else {
+            return warnings;
+        };
+        // The line's amount as this kind of booking counts it: an afschrijving is positive for money that goes out.
+        let expected = round2(if incoming {
+            bankregel.bedrag
+        } else {
+            -bankregel.bedrag
+        });
+        match self.bank_total() {
+            Some(total) if total == expected => {}
+            Some(total) if total == -expected && total != 0.0 => warnings.push(format!(
+                "de bankregel is een {}, deze boeking is {}",
+                if bankregel.bedrag < 0.0 { "afschrijving" } else { "bijschrijving" },
+                self.soort.naam()
+            )),
+            Some(total) => warnings.push(format!(
+                "het totaal van deze boeking ({}) is niet het bedrag van de bankregel ({}): er ontstaat een bankverschil van {}",
+                euro(total),
+                euro(expected),
+                euro(expected - total)
+            )),
+            None => warnings.push(format!(
+                "de bedragen zijn excl. btw, dus EB MCP kan het totaal niet naast de bankregel ({}) leggen",
+                euro(expected)
+            )),
+        }
+        warnings
     }
 
     /// The mutatie as `GET mutatie/nr/{nr}/model` gives it.
@@ -873,8 +1001,17 @@ impl Mutatie {
     }
 }
 
-pub fn mutatie_nieuw(args: &MutatieToevoegenArgs, books: &Books) -> Result<Built, String> {
+pub fn mutatie_nieuw(
+    args: &MutatieToevoegenArgs,
+    books: &Books,
+    bankregel: Option<&Bankregel>,
+) -> Result<Built, String> {
     let soort = args.soort;
+    // The bank line is looked up before anything is built: a booking must never go out with the id of a line
+    // nobody has seen, and never without the id it was asked to process.
+    if args.bankregel_id != bankregel.map(|b| b.id) {
+        return Err("De bankregel is niet opgezocht: de boeking gaat niet door".into());
+    }
     let rekening = match (&args.rekening, soort) {
         (Some(code), _) => books.rekening(code)?.id,
         (None, Soort::FactuurOntvangen) => books.crediteuren()?.id,
@@ -907,7 +1044,10 @@ pub fn mutatie_nieuw(args: &MutatieToevoegenArgs, books: &Books) -> Result<Built
         soort,
         datum: parse_date(&args.datum)?,
         rekening,
-        omschrijving: text(&args.omschrijving).unwrap_or_default(),
+        // e-Boekhouden's own form fills in the bank line's text; the same here when no other is given.
+        omschrijving: text(&args.omschrijving)
+            .or_else(|| bankregel.and_then(|b| text(&Some(b.omschrijving.clone()))))
+            .unwrap_or_default(),
         relatie_id: args.relatie_id,
         factuur: text(&args.factuur),
         termijn: args.termijn,
@@ -926,7 +1066,7 @@ pub fn mutatie_nieuw(args: &MutatieToevoegenArgs, books: &Books) -> Result<Built
     Ok(Built {
         body: mutatie.body(None, args.bankregel_id),
         title: format!("Mutatie toevoegen: {}", soort.naam()),
-        lines: mutatie.lines(books, args.bankregel_id),
+        lines: mutatie.lines(books, bankregel),
     })
 }
 
@@ -2547,7 +2687,7 @@ mod tests {
         line.kostenplaats_id = Some(502);
         args.regels = Some(vec![line, regel("4700", 1.0, None)]);
         assert!(names_kostenplaats(args.regels.as_deref()));
-        let built = mutatie_nieuw(&args, &met_kostenplaatsen()).unwrap();
+        let built = mutatie_nieuw(&args, &met_kostenplaatsen(), None).unwrap();
         assert_eq!(
             built.body["mutatieRegels"],
             json!([
@@ -2580,13 +2720,13 @@ mod tests {
         let mut line = regel("4550", 2.0, None);
         line.kostenplaats_id = Some(503);
         args.regels = Some(vec![line.clone()]);
-        let inactive = mutatie_nieuw(&args, &met_kostenplaatsen()).unwrap_err();
+        let inactive = mutatie_nieuw(&args, &met_kostenplaatsen(), None).unwrap_err();
         assert!(inactive.contains("Oud is inactief"), "{inactive}");
         line.kostenplaats_id = Some(999);
         args.regels = Some(vec![line.clone()]);
-        let unknown = mutatie_nieuw(&args, &met_kostenplaatsen()).unwrap_err();
+        let unknown = mutatie_nieuw(&args, &met_kostenplaatsen(), None).unwrap_err();
         assert!(unknown.contains("999"), "{unknown}");
-        let none = mutatie_nieuw(&args, &books()).unwrap_err();
+        let none = mutatie_nieuw(&args, &books(), None).unwrap_err();
         assert!(none.contains("geen kostenplaatsen"), "{none}");
         assert!(!names_kostenplaats(Some(&[regel("4550", 1.0, None)])));
         assert!(!names_kostenplaats(None));
@@ -2658,7 +2798,7 @@ mod tests {
         args.regels = Some(vec![line]);
         assert!(!names_kostenplaats(args.regels.as_deref()));
         // No kostenplaatsen read (an empty list) and still fine: 0 asks for none.
-        let built = mutatie_nieuw(&args, &books()).unwrap();
+        let built = mutatie_nieuw(&args, &books(), None).unwrap();
         assert!(built.body["mutatieRegels"][0].get("kostenplaats").is_none());
     }
 
@@ -2682,7 +2822,7 @@ mod tests {
         args.omschrijving = Some(" Parkeergarage ".into());
         args.regels = Some(vec![regel("4550", 2.0, None)]);
         args.bankregel_id = Some(465233844);
-        let built = mutatie_nieuw(&args, &books()).unwrap();
+        let built = mutatie_nieuw(&args, &books(), Some(&parkeergarage())).unwrap();
         assert_eq!(
             built.body,
             json!({
@@ -2705,7 +2845,214 @@ mod tests {
             shown.contains(&"Regel 1: 4550 Bankkosten: 2,00 (Geen btw)".to_owned()),
             "{shown:?}"
         );
-        assert!(shown.iter().any(|l| l.contains("465233844")), "{shown:?}");
+        assert!(
+            shown.contains(
+                &"Bankregel: 06-11-2026, -2,00: BCK*Parkeergarage Dams Groningen (id 465233844); deze boeking verwerkt hem"
+                    .to_owned()
+            ),
+            "{shown:?}"
+        );
+        // The booking is what the line says: nothing to warn about.
+        assert!(!shown.iter().any(|l| l.starts_with("Let op")), "{shown:?}");
+    }
+
+    /// The bank line of the live trial, as `import/gridtable` gives it once its rows carry their names.
+    fn parkeergarage() -> Bankregel {
+        let page = json!({"rowCount": 2, "data": [
+            {"id": 464391612u64, "datum": "2026-11-10T08:00:00", "rekening": "NL00BANK0123456789", "mutDatum": "2026-11-03T00:00:00",
+             "mutBedrag": -77.58, "mutOmschrijving": "Iets anders", "mutFactuur": "", "grootboekId": 26852133},
+            {"id": 465233844u64, "datum": "2026-11-10T08:00:00", "rekening": "NL00BANK0123456789", "mutDatum": "2026-11-06T00:00:00",
+             "mutBedrag": -2.0, "mutOmschrijving": " BCK*Parkeergarage Dams Groningen ", "mutFactuur": "", "grootboekId": 26852133}
+        ]});
+        Bankregel::find(&page, 465233844).unwrap().unwrap()
+    }
+
+    fn warnings(built: &Built) -> Vec<String> {
+        built
+            .lines
+            .iter()
+            .filter(|l| l.label == "Let op")
+            .map(|l| l.value.clone())
+            .collect()
+    }
+
+    #[test]
+    fn reads_a_bank_line_from_the_grid_and_tells_a_missing_one_from_an_unreadable_one() {
+        let line = parkeergarage();
+        assert_eq!(
+            line,
+            Bankregel {
+                id: 465233844,
+                datum: Some((2026, 11, 6)),
+                bedrag: -2.0,
+                omschrijving: "BCK*Parkeergarage Dams Groningen".into(),
+                grootboek_id: Some(26852133),
+            }
+        );
+        let page = json!({"data": [{"id": 7, "mutBedrag": "veel"}]});
+        assert!(Bankregel::find(&page, 8).is_none());
+        assert!(
+            Bankregel::find(&page, 7)
+                .unwrap()
+                .unwrap_err()
+                .contains("onbekende vorm")
+        );
+        // Rows that kept their bare values (no column names) have no id to find.
+        assert!(Bankregel::find(&json!({"data": [[7, "x"]]}), 7).is_none());
+        assert!(Bankregel::find(&json!({}), 7).is_none());
+    }
+
+    #[test]
+    fn a_bank_line_is_never_booked_unseen_and_never_dropped() {
+        let mut args = toevoegen(Soort::GeldUitgegeven);
+        args.rekening = Some("1010".into());
+        args.regels = Some(vec![regel("4550", 2.0, None)]);
+        // Asked to process a line that was not looked up.
+        args.bankregel_id = Some(465233844);
+        assert!(
+            mutatie_nieuw(&args, &books(), None)
+                .unwrap_err()
+                .contains("niet opgezocht")
+        );
+        // Another line than the one asked for.
+        args.bankregel_id = Some(1);
+        assert!(
+            mutatie_nieuw(&args, &books(), Some(&parkeergarage()))
+                .unwrap_err()
+                .contains("niet opgezocht")
+        );
+        // A line nobody asked for.
+        args.bankregel_id = None;
+        assert!(
+            mutatie_nieuw(&args, &books(), Some(&parkeergarage()))
+                .unwrap_err()
+                .contains("niet opgezocht")
+        );
+    }
+
+    #[test]
+    fn a_booking_without_its_own_text_takes_the_bank_lines() {
+        let mut args = toevoegen(Soort::GeldUitgegeven);
+        args.rekening = Some("1010".into());
+        args.regels = Some(vec![regel("4550", 2.0, None)]);
+        args.bankregel_id = Some(465233844);
+        let built = mutatie_nieuw(&args, &books(), Some(&parkeergarage())).unwrap();
+        assert_eq!(
+            built.body["mutatie"]["omschrijving"],
+            "BCK*Parkeergarage Dams Groningen"
+        );
+        args.omschrijving = Some("  ".into());
+        let built = mutatie_nieuw(&args, &books(), Some(&parkeergarage())).unwrap();
+        assert_eq!(
+            built.body["mutatie"]["omschrijving"],
+            "BCK*Parkeergarage Dams Groningen"
+        );
+    }
+
+    #[test]
+    fn the_proposal_says_where_a_booking_is_not_what_the_bank_line_says() {
+        let line = parkeergarage();
+        let mut args = toevoegen(Soort::GeldUitgegeven);
+        args.rekening = Some("1010".into());
+        args.bankregel_id = Some(465233844);
+
+        // Split over two lines that add up: fine. Float sums must not raise a false alarm.
+        args.regels = Some(vec![regel("4550", 1.1, None), regel("4700", 0.9, None)]);
+        assert!(warnings(&mutatie_nieuw(&args, &books(), Some(&line)).unwrap()).is_empty());
+
+        // Another amount.
+        args.regels = Some(vec![regel("4550", 1.5, None)]);
+        assert_eq!(
+            warnings(&mutatie_nieuw(&args, &books(), Some(&line)).unwrap()),
+            [
+                "het totaal van deze boeking (1,50) is niet het bedrag van de bankregel (2,00): er ontstaat een bankverschil van 0,50"
+            ]
+        );
+
+        // Money that went out, booked as money that came in.
+        let mut wrong_way = toevoegen(Soort::GeldOntvangen);
+        wrong_way.rekening = Some("1010".into());
+        wrong_way.bankregel_id = Some(465233844);
+        wrong_way.regels = Some(vec![regel("8000", 2.0, None)]);
+        assert_eq!(
+            warnings(&mutatie_nieuw(&wrong_way, &books(), Some(&line)).unwrap()),
+            ["de bankregel is een afschrijving, deze boeking is Geld ontvangen"]
+        );
+
+        // Booked on another account than the one the statement came from.
+        args.regels = Some(vec![regel("4550", 2.0, None)]);
+        args.rekening = Some("2000".into());
+        assert_eq!(
+            warnings(&mutatie_nieuw(&args, &books(), Some(&line)).unwrap()),
+            ["de bankregel hoort bij 1010 Bank, deze boeking staat op 2000 Kruisposten"]
+        );
+
+        // Amounts without btw that carry btw: e-Boekhouden does that sum, so EB MCP says it cannot compare.
+        args.rekening = Some("1010".into());
+        args.bedragen = Some(InEx::Excl);
+        args.regels = Some(vec![regel("4700", 1.65, Some("HOOG_INK_21"))]);
+        assert_eq!(
+            warnings(&mutatie_nieuw(&args, &books(), Some(&line)).unwrap()),
+            [
+                "de bedragen zijn excl. btw, dus EB MCP kan het totaal niet naast de bankregel (2,00) leggen"
+            ]
+        );
+        // Without btw the excl. amounts are the bank's amounts.
+        args.regels = Some(vec![regel("4550", 2.0, None)]);
+        assert!(warnings(&mutatie_nieuw(&args, &books(), Some(&line)).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn a_payment_from_a_bank_line_sends_the_line_and_warns_about_a_difference() {
+        // The web app's payment form sends the same importId with the payments (app-mutatie-factuurbetaling,
+        // getMutatieModelFromForm) and asks before saving when the open posts do not add up to the line.
+        let line = parkeergarage();
+        let mut args = toevoegen(Soort::FactuurbetalingVerstuurd);
+        args.rekening = Some("1010".into());
+        args.bankregel_id = Some(465233844);
+        args.betalingen = Some(vec![
+            BetalingArg {
+                relatie_id: 46484769,
+                factuur: "INK-1".into(),
+                bedrag: 1.21,
+            },
+            BetalingArg {
+                relatie_id: 46484769,
+                factuur: "INK-2".into(),
+                bedrag: 0.79,
+            },
+        ]);
+        let built = mutatie_nieuw(&args, &books(), Some(&line)).unwrap();
+        assert_eq!(built.body["importId"], 465233844u64);
+        assert_eq!(built.body["mutatie"]["soort"], 4);
+        assert_eq!(built.body["mutatieRegels"][1]["factuur"], "INK-2");
+        assert!(warnings(&built).is_empty(), "{:?}", built.lines);
+
+        args.betalingen = Some(vec![BetalingArg {
+            relatie_id: 46484769,
+            factuur: "INK-1".into(),
+            bedrag: 1.21,
+        }]);
+        assert_eq!(
+            warnings(&mutatie_nieuw(&args, &books(), Some(&line)).unwrap()),
+            [
+                "het totaal van deze boeking (1,21) is niet het bedrag van de bankregel (2,00): er ontstaat een bankverschil van 0,79"
+            ]
+        );
+
+        // Money that went out cannot be an invoice payment that came in.
+        let mut received = toevoegen(Soort::FactuurbetalingOntvangen);
+        received.rekening = Some("1010".into());
+        received.bankregel_id = Some(465233844);
+        received.betalingen = Some(vec![BetalingArg {
+            relatie_id: 46484769,
+            factuur: "F00002".into(),
+            bedrag: 2.0,
+        }]);
+        assert_eq!(
+            warnings(&mutatie_nieuw(&received, &books(), Some(&line)).unwrap()),
+            ["de bankregel is een afschrijving, deze boeking is Factuurbetaling ontvangen"]
+        );
     }
 
     #[test]
@@ -2713,19 +3060,19 @@ mod tests {
         let mut args = toevoegen(Soort::FactuurOntvangen);
         args.regels = Some(vec![regel("4700", 1.21, Some("HOOG_INK_21"))]);
         assert!(
-            mutatie_nieuw(&args, &books())
+            mutatie_nieuw(&args, &books(), None)
                 .unwrap_err()
                 .contains("relatie")
         );
         args.relatie_id = Some(46484769);
         assert!(
-            mutatie_nieuw(&args, &books())
+            mutatie_nieuw(&args, &books(), None)
                 .unwrap_err()
                 .contains("factuurnummer")
         );
         args.factuur = Some("INK-1".into());
         args.termijn = Some(30);
-        let body = mutatie_nieuw(&args, &books()).unwrap().body;
+        let body = mutatie_nieuw(&args, &books(), None).unwrap().body;
         assert_eq!(
             body["mutatie"],
             json!({"rekening": 26852140, "datum": "2026-11-06", "soort": 1, "inEx": "IN", "omschrijving": "", "relatieId": 46484769, "factuur": "INK-1", "termijn": 30})
@@ -2735,7 +3082,7 @@ mod tests {
         let mut geld = toevoegen(Soort::GeldOntvangen);
         geld.regels = Some(vec![regel("8000", 1.0, None)]);
         assert!(
-            mutatie_nieuw(&geld, &books())
+            mutatie_nieuw(&geld, &books(), None)
                 .unwrap_err()
                 .contains("rekening")
         );
@@ -2750,7 +3097,7 @@ mod tests {
             factuur: " F00002 ".into(),
             bedrag: 1.21,
         }]);
-        let body = mutatie_nieuw(&args, &books()).unwrap().body;
+        let body = mutatie_nieuw(&args, &books(), None).unwrap().body;
         assert_eq!(
             body["mutatie"],
             json!({"rekening": 26852133, "datum": "2026-11-06", "soort": 3, "omschrijving": ""})
@@ -2761,7 +3108,7 @@ mod tests {
         );
         args.regels = Some(vec![regel("8000", 1.0, None)]);
         assert!(
-            mutatie_nieuw(&args, &books()).is_err(),
+            mutatie_nieuw(&args, &books(), None).is_err(),
             "lines do not belong to a payment"
         );
     }
@@ -2771,21 +3118,25 @@ mod tests {
         let mut args = toevoegen(Soort::Memoriaal);
         args.rekening = Some("2000".into());
         assert!(
-            mutatie_nieuw(&args, &books())
+            mutatie_nieuw(&args, &books(), None)
                 .unwrap_err()
                 .contains("regel")
         );
         args.regels = Some(vec![regel("4900", 0.0, None)]);
-        assert!(mutatie_nieuw(&args, &books()).unwrap_err().contains("nul"));
+        assert!(
+            mutatie_nieuw(&args, &books(), None)
+                .unwrap_err()
+                .contains("nul")
+        );
         args.regels = Some(vec![regel("4900", f64::NAN, None)]);
-        assert!(mutatie_nieuw(&args, &books()).is_err());
+        assert!(mutatie_nieuw(&args, &books(), None).is_err());
         args.regels = Some(vec![regel("4900", 1.0, None)]);
         args.datum = "06-11-2026".into();
-        assert!(mutatie_nieuw(&args, &books()).is_err());
+        assert!(mutatie_nieuw(&args, &books(), None).is_err());
         args.datum = "2026-11-06".into();
         args.bedragen = Some(InEx::Incl);
         assert_eq!(
-            mutatie_nieuw(&args, &books()).unwrap().body["mutatie"]["inEx"],
+            mutatie_nieuw(&args, &books(), None).unwrap().body["mutatie"]["inEx"],
             "EX",
             "memoriaal is always EX"
         );
