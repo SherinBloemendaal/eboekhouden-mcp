@@ -4,7 +4,8 @@ import { useRoute, useRouter } from 'vue-router'
 import Alert from './Alert.vue'
 import { store } from '../lib/accounts'
 import { approvalState, connectApprovals, quitWarning, waitingText, type Proposal } from '../lib/approvals'
-import { hostPort, inApp, modKey, quitApp, server, startupNotice, watchServer } from '../lib/server'
+import { COLLAPSE_FOLLOW_MS, createGlassSync, type GlassSync } from '../lib/glass'
+import { hostPort, inApp, isMac, modKey, quitApp, server, startupNotice, watchServer } from '../lib/server'
 import {
   clampWidth, isSidebarShortcut, loadSidebar, saveSidebar, setSidebarCollapsed, setSidebarWidth, sidebar, sidebarShortcut, sidebarShortcutAria,
   SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SIDEBAR_STEP,
@@ -97,6 +98,38 @@ function onHandleKey(event: KeyboardEvent) {
 }
 onMounted(() => window.addEventListener('keydown', onKey))
 
+// macOS 26: real Liquid Glass behind the card (lib/glass.ts, src-tauri/src/glass.rs). The card drops its own CSS glass
+// only after the app answers that the glass is there, and takes it back when a later call fails.
+const nativeGlass = ref(false)
+let glass: GlassSync | null = null
+let cardObserver: ResizeObserver | null = null
+const syncGlass = () => glass?.sync()
+onMounted(async () => {
+  if (!isMac || !inApp()) return
+  await nextTick()
+  if (unmounted) return
+  glass = createGlassSync({ card: () => sideEl.value, collapsed: () => sidebar.collapsed, onSupported: (on) => (nativeGlass.value = on) })
+  window.addEventListener('resize', syncGlass)
+  // The card's size: the stored width, a drag of the handle, the width animating while the sidebar opens or closes.
+  if (typeof ResizeObserver !== 'undefined' && sideEl.value) {
+    cardObserver = new ResizeObserver(syncGlass)
+    cardObserver.observe(sideEl.value)
+  }
+  glass.sync()
+})
+watch(() => sidebar.width, syncGlass, { flush: 'post' })
+// Opening and closing also slides the card (its margin), which no ResizeObserver sees: every frame until it settles.
+watch(() => sidebar.collapsed, () => glass?.follow(COLLAPSE_FOLLOW_MS), { flush: 'post' })
+
+// The window is not the key window (another app or window has the focus): the selected row turns grey.
+const windowInactive = ref(typeof document !== 'undefined' && !document.hasFocus())
+const onWindowFocus = () => (windowInactive.value = false)
+const onWindowBlur = () => (windowInactive.value = true)
+onMounted(() => {
+  window.addEventListener('focus', onWindowFocus)
+  window.addEventListener('blur', onWindowBlur)
+})
+
 // Stop EB MCP (Cmd+Q) from the menu bar while AI calls still run: the app asks here first (lib.rs, QUIT_REQUESTED).
 const quitCalls = ref(0)
 const quitAsked = ref(false)
@@ -184,6 +217,11 @@ function openToast(id: Toast['id']) {
 onBeforeUnmount(() => {
   unmounted = true
   window.removeEventListener('keydown', onKey)
+  window.removeEventListener('resize', syncGlass)
+  window.removeEventListener('focus', onWindowFocus)
+  window.removeEventListener('blur', onWindowBlur)
+  cardObserver?.disconnect()
+  glass?.stop()
   clearTimeout(toggleTimer)
   unlistenQuit?.()
   stopServer?.()
@@ -192,7 +230,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div
-    class="shell" :class="{ collapsed: sidebar.collapsed, toggling, resizing }"
+    class="shell" :class="{ collapsed: sidebar.collapsed, toggling, resizing, 'native-glass': nativeGlass, inactive: windowInactive }"
     :style="{ '--side-w': `${sidebar.width}px` }"
   >
     <!-- Collapsed, the sidebar is inert: its links leave the tab order and assistive tech skips them. Open, the attribute
@@ -351,6 +389,11 @@ onBeforeUnmount(() => {
 .sidebar:focus-within .nav.active .nav-icon,
 .sidebar:focus-within .nav.active .shortcut { color: #fff; }
 .sidebar:focus-within .nav.active .nav-badge { background: #fff; color: var(--accent); }
+/* The window is not the key window: the grey fill again, whichever part had the focus (the shared window spec). */
+.shell.inactive .sidebar:focus-within .nav.active { background: var(--selected); color: var(--text); }
+.shell.inactive .sidebar:focus-within .nav.active .nav-icon { color: var(--accent); }
+.shell.inactive .sidebar:focus-within .nav.active .shortcut { color: var(--muted); }
+.shell.inactive .sidebar:focus-within .nav.active .nav-badge { background: var(--accent); color: #fff; }
 /* A narrow sidebar shortens the label, never the badge or the shortcut beside it. */
 .nav-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .settings { margin: 0 -4px 4px; }
@@ -401,7 +444,18 @@ onBeforeUnmount(() => {
   background: var(--accent); color: #fff; font-size: 11px; font-weight: 600; line-height: 18px; text-align: center;
   font-variant-numeric: tabular-nums; flex: none;
 }
+/* macOS 26 with native glass (lib/glass.ts): macOS draws the card's glass under the page, so the card itself is clear
+   and the shell leaves the window's own opaque background around it. The content and the toolbar paint an opaque
+   background of their own, from 10 right of the card as on a macOS 26 window; collapsed, from the window's edge. */
+.shell.native-glass { background: transparent; }
+.shell.native-glass .sidebar { background: none; box-shadow: none; -webkit-backdrop-filter: none; backdrop-filter: none; }
+.shell.native-glass .main { position: relative; isolation: isolate; }
+.shell.native-glass .main::before {
+  content: ''; position: absolute; top: 0; right: 0; bottom: 0; left: 10px; z-index: -1; background: var(--content-solid);
+  transition: left 220ms var(--ease);
+}
+.shell.native-glass.collapsed .main::before { left: 0; }
 @media (prefers-reduced-motion: reduce) {
-  .sidebar, .shell.toggling .sidebar, .toolbar { transition: none; }
+  .sidebar, .shell.toggling .sidebar, .toolbar, .shell.native-glass .main::before { transition: none; }
 }
 </style>

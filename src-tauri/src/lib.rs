@@ -3,6 +3,7 @@ mod approvals;
 mod connect;
 mod creds;
 mod ebapi;
+mod glass;
 mod hub;
 mod logstore;
 mod mcp;
@@ -1193,6 +1194,10 @@ pub fn run() {
             if webview.label() == MAIN && payload.event() == tauri::webview::PageLoadEvent::Started
             {
                 webview.state::<updates::UpdateListener>().page_loading();
+                // The page that loads reports its own glass shapes; the old page's go.
+                if let Some(main) = webview.app_handle().get_webview_window(MAIN) {
+                    glass::page_loading(&main);
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1243,6 +1248,7 @@ pub fn run() {
             updates::update_listening,
             updates::update_relaunch,
             open_main,
+            glass::set_glass,
             quit
         ])
         .setup(|app| {
@@ -1265,6 +1271,8 @@ pub fn run() {
             apply_dock(app.handle(), settings.get().show_in_dock);
             #[cfg(target_os = "macos")]
             build_menu(app)?;
+            // macOS 26: real Liquid Glass behind the sidebar card (glass.rs), set up before the window first shows.
+            glass::setup(app);
             // The main window starts hidden (tauri.conf.json), so a start by the login item stays
             // in the menu bar without a window flashing up; any other start shows it.
             if !std::env::args().any(|a| a == AUTOSTART_ARG)
@@ -1465,6 +1473,10 @@ pub fn run() {
             {
                 api.prevent_close();
                 let _ = window.hide();
+            }
+            // Gone for good (the app quits): its glass views are forgotten without touching the window.
+            if let WindowEvent::Destroyed = event {
+                glass::window_destroyed(window.app_handle(), window.label());
             }
         })
         .build(tauri::generate_context!())

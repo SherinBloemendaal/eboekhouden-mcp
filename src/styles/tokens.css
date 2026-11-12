@@ -90,6 +90,12 @@
     --glass-side-edge: inset 0 0.5px 0 rgba(255, 255, 255, 0.16), 0 0 0 0.5px rgba(255, 255, 255, 0.08), 0 6px 20px rgba(0, 0, 0, 0.3);
   }
 }
+/* The opaque content behind the toolbar and the pages when macOS draws the sidebar's glass itself (AppShell.vue,
+   native-glass): white as a macOS 26 window's content (measured on Chatkeep), and its dark counterpart. */
+:root { --content-solid: #ffffff; }
+@media (prefers-color-scheme: dark) {
+  :root { --content-solid: #1e1e1e; }
+}
 @media (prefers-reduced-transparency: reduce) {
   :root { --glass-window: #f5f5f7; --glass-side: #ececf0; }
 }
