@@ -30,6 +30,15 @@ use crate::reqlog::Outcome;
 use crate::state::{AppEvent, AppState};
 use crate::write::{self, Books, Built};
 
+mod artikelen;
+mod btw_aangifte;
+mod inrichting;
+mod mijn_gegevens;
+mod open_posten_acties;
+mod rekeningschema;
+mod uren_beheer;
+mod verkoop;
+
 const MAX_ROWS: u32 = 200;
 const GET_PATHS: &str = include_str!("../data/get-paths.txt");
 
@@ -1849,7 +1858,68 @@ const STATUS_WORDS: &str = "wacht: de gebruiker heeft nog niet geantwoord; bezig
 
 /// How many tools the server offers, counted on its tool router.
 pub fn tool_count() -> usize {
-    EbMcp::tool_router().list_all().len()
+    EbMcp::routers().list_all().len()
+}
+
+/// The tools of the parts that live in their own module (tools/*.rs): the ones that read, the ones that
+/// change the books, and of those the ones that cannot be undone.
+#[cfg(test)]
+pub fn part_tools() -> [Vec<&'static str>; 3] {
+    let parts: [[&[&str]; 3]; 8] = [
+        [
+            mijn_gegevens::READS,
+            mijn_gegevens::WRITES,
+            mijn_gegevens::DESTRUCTIVE,
+        ],
+        [
+            uren_beheer::READS,
+            uren_beheer::WRITES,
+            uren_beheer::DESTRUCTIVE,
+        ],
+        [artikelen::READS, artikelen::WRITES, artikelen::DESTRUCTIVE],
+        [
+            rekeningschema::READS,
+            rekeningschema::WRITES,
+            rekeningschema::DESTRUCTIVE,
+        ],
+        [
+            open_posten_acties::READS,
+            open_posten_acties::WRITES,
+            open_posten_acties::DESTRUCTIVE,
+        ],
+        [
+            inrichting::READS,
+            inrichting::WRITES,
+            inrichting::DESTRUCTIVE,
+        ],
+        [
+            btw_aangifte::READS,
+            btw_aangifte::WRITES,
+            btw_aangifte::DESTRUCTIVE,
+        ],
+        [verkoop::READS, verkoop::WRITES, verkoop::DESTRUCTIVE],
+    ];
+    [0, 1, 2].map(|kind| {
+        parts
+            .iter()
+            .flat_map(|part| part[kind].iter().copied())
+            .collect()
+    })
+}
+
+impl EbMcp {
+    /// The router of tools.rs itself plus the one of every part.
+    fn routers() -> ToolRouter<Self> {
+        Self::tool_router()
+            + Self::mijn_gegevens_router()
+            + Self::uren_beheer_router()
+            + Self::artikelen_router()
+            + Self::rekeningschema_router()
+            + Self::open_posten_acties_router()
+            + Self::inrichting_router()
+            + Self::btw_aangifte_router()
+            + Self::verkoop_router()
+    }
 }
 
 #[tool_router]
@@ -1857,7 +1927,7 @@ impl EbMcp {
     pub fn new(state: Arc<AppState>) -> Self {
         Self {
             state,
-            tool_router: Self::tool_router(),
+            tool_router: Self::routers(),
         }
     }
 

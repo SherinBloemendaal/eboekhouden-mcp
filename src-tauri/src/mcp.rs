@@ -280,6 +280,17 @@ mod tests {
         ] {
             assert!(names.contains(&want), "{want} missing from {names:?}");
         }
+        // The parts that live in their own module name their tools themselves (tools/*.rs).
+        let [part_reads, part_writes, part_destructive] = crate::tools::part_tools();
+        for want in part_reads.iter().chain(&part_writes) {
+            assert!(names.contains(want), "{want} missing from {names:?}");
+        }
+        for name in &part_destructive {
+            assert!(
+                part_writes.contains(name),
+                "{name} cannot be undone but is not listed as a write"
+            );
+        }
         // The tools that change the books say so; the three that cannot be undone say that too.
         let writes = [
             "mutatie_toevoegen",
@@ -325,17 +336,20 @@ mod tests {
         ];
         for tool in tools {
             let name = tool["name"].as_str().unwrap();
-            let writes_it = writes.contains(&name);
+            let writes_it = writes.contains(&name) || part_writes.contains(&name);
             assert_eq!(tool["annotations"]["readOnlyHint"], !writes_it, "{name}");
             if writes_it {
                 assert_eq!(
                     tool["annotations"]["destructiveHint"],
-                    destructive.contains(&name),
+                    destructive.contains(&name) || part_destructive.contains(&name),
                     "{name}"
                 );
             }
         }
-        assert_eq!(names.len(), 28 + writes.len());
+        assert_eq!(
+            names.len(),
+            28 + writes.len() + part_reads.len() + part_writes.len()
+        );
         assert_eq!(crate::tools::tool_count(), names.len());
 
         let call = message(
