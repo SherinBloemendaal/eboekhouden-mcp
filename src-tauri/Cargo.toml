@@ -1,6 +1,6 @@
 [package]
 name = "eb-mcp"
-version = "0.5.6"
+version = "0.5.7"
 description = "e-Boekhouden as a local, read-only MCP server"
 edition = "2024"
 rust-version = "1.90"
