@@ -128,6 +128,7 @@ jobs:
         env:
           NAME: ${{ matrix.name }}
           TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.version.outputs.version }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           TAG: ${{ github.ref_type == 'tag' }}
         run: |
@@ -143,6 +144,9 @@ jobs:
           case "${NAME}" in
             macos-*)
               cp "$(one "${bundle}"/dmg/*.dmg)" "dist/eb-mcp-${NAME}.dmg"
+              # The same disk image under the name people download: <AppNaam>-<versie>.dmg, as the other apps of
+              # sherin.dev name theirs. The fixed name above stays, so a link to it keeps working.
+              cp "dist/eb-mcp-${NAME}.dmg" "dist/EB-MCP-${VERSION}.dmg"
               app="${bundle}/macos/EB MCP.app"
               # Sparkle updates the app and the bridge links Claude Desktop: a bundle without either is broken.
               test -x "${app}/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate" || { echo "No Sparkle.framework" >&2; exit 1; }
@@ -220,10 +224,11 @@ jobs:
         shell: bash
         env:
           PRERELEASE: ${{ needs.version.outputs.prerelease }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           cd artifacts
-          expected=(eb-mcp-macos-universal.dmg eb-mcp-macos-universal.app.tar.gz)
+          expected=(eb-mcp-macos-universal.dmg "EB-MCP-${VERSION}.dmg" eb-mcp-macos-universal.app.tar.gz)
           if [ -f eb-mcp-windows-x64-setup.exe ]; then
             expected+=(eb-mcp-windows-x64-setup.exe)
             [ "${PRERELEASE}" != "true" ] && expected+=(eb-mcp-windows-x64.msi)
