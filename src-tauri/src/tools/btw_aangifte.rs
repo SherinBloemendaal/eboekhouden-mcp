@@ -1,6 +1,6 @@
 //! Btw-aangifte, ICP-opgave and suppletie: drawing up, reading and correcting. Never filing.
 //!
-//! The tools of this part live in two submodules, each with its own router, joined here into
+//! The tools of this part live in three submodules, each with its own router, joined here into
 //! `btw_aangifte_router`, which tools.rs adds to the server's. Each tool is named in one of the lists below,
 //! which the tool-list test in mcp.rs reads.
 //!
@@ -8,13 +8,17 @@
 //!   boxes, the mutaties behind a box, the corrections of earlier periods, and drawing a return or a
 //!   suppletie up in the books ("verwerken in de boekhouding").
 //! - `icp`: the ICP-opgave: the opgaven sent, one opgave with its lines, its details and its own lines.
+//! - `betaallink`: the iDEAL link of a sent return, looked up for the user to open; never opened by EB MCP.
 //!
 //! Filing with the Belastingdienst is never built, not even behind approval. Every request of this part goes
 //! through `btwaangifte_get` or `btwaangifte_send`, which refuse the paths in `FILING` before anything goes out;
-//! the tests prove that no other call is made and that none of those paths is ever reached.
+//! the tests prove that no other call is made and that none of those paths is ever reached. The one exception,
+//! asked for by the user, is `btwaangifte_betaling_starten`: it asks e-Boekhouden for a payment link of one
+//! sent return, only after the user approved, and pays nothing.
 
 use super::*;
 
+mod betaallink;
 mod icp;
 mod omzet;
 #[cfg(test)]
@@ -43,6 +47,7 @@ pub(super) const WRITES: &[&str] = &[
     "icp_regel_toevoegen",
     "icp_regel_wijzigen",
     "icp_regel_verwijderen",
+    "btwaangifte_betaallink",
 ];
 /// The ones in `WRITES` that cannot be undone.
 #[cfg(test)]
@@ -55,7 +60,9 @@ pub(super) const DESTRUCTIVE: &[&str] = &[
 impl EbMcp {
     /// The tools of this part: the btw-aangifte and the suppletie, and the ICP-opgave.
     pub(super) fn btw_aangifte_router() -> ToolRouter<Self> {
-        Self::btwaangifte_omzet_router() + Self::btwaangifte_icp_router()
+        Self::btwaangifte_omzet_router()
+            + Self::btwaangifte_icp_router()
+            + Self::btwaangifte_betaal_router()
     }
 }
 
@@ -138,6 +145,18 @@ impl EbMcp {
         refuse_filing(path)?;
         self.change_done(run, method, path, body).await
     }
+
+    // pay-link:start
+    /// The one exception to `refuse_filing`, asked for by the user: `GET aangifte/pay/{id}`, which makes
+    /// e-Boekhouden start an iDEAL payment for a sent return and answer with its link (`startPaymentUrl`). It
+    /// pays nothing: the user pays only by opening the link in their own bank. The id is a number, so the path
+    /// is exactly this one and no other. Used only by `btwaangifte_betaallink`, after the user approved.
+    async fn btwaangifte_betaling_starten(&self, run: &Run, id: u64) -> Result<Value, Halt> {
+        self.fetch(run, &format!("aangifte/pay/{id}"), Vec::new())
+            .await
+            .map_err(Halt::Error)
+    }
+    // pay-link:end
 }
 // requests:end
 
