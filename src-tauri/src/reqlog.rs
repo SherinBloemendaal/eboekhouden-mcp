@@ -250,6 +250,31 @@ pub struct StatsView {
     pub statuses: Vec<Named>,
 }
 
+/// Whether a call to e-Boekhouden failed, for the statistics. A redirect is a failure (the login page),
+/// except the one that opens the template editor: that call answers 302 with the editor's session in its
+/// `Location`, and `editor_open` leaves it without an error when it found one.
+fn failed(call: &ApiCall) -> bool {
+    let editor_opened = call.error.is_none()
+        && (300..400).contains(&call.status)
+        && call.path.contains(EDITOR_OPEN);
+    !(call.ok() || editor_opened)
+}
+
+/// The part of a path that opens the template editor (`factuursjabloon/editor/{id}/NL`).
+const EDITOR_OPEN: &str = "sjabloon/editor/";
+
+/// Up to 0.5.0 every opening of the template editor was counted as a failure, so the Dashboard said that
+/// path "faalt vaak". A log saved by such a version carries those counts.
+fn counted_editor_redirects(saved_by: &str) -> bool {
+    let mut parts = saved_by.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let version = (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    );
+    version <= (0, 5, 0)
+}
+
 /// What the log file holds (logstore.rs): the entries, oldest first, and the statistics.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -364,8 +389,12 @@ impl RequestLog {
             saved_at,
             entries: saved,
             stats: mut saved_stats,
+            app_version,
             ..
         } = snapshot;
+        if counted_editor_redirects(&app_version) {
+            saved_stats.forget_editor_redirect_errors();
+        }
         let mut interrupted = Vec::new();
         let mut restored: VecDeque<Entry> = saved
             .into_iter()
@@ -681,7 +710,7 @@ impl RequestLog {
             let mut s = self.stats.lock().unwrap();
             s.eb += 1;
             s.bytes_in += call.bytes as u64;
-            let failed = !call.ok();
+            let failed = failed(call);
             if failed {
                 s.errors += 1;
             }
@@ -819,6 +848,17 @@ impl RequestLog {
 }
 
 impl Stats {
+    /// Takes back the failures that were counted for opening the template editor (see
+    /// `counted_editor_redirects`): none of them was one.
+    fn forget_editor_redirect_errors(&mut self) {
+        for (path, endpoint) in self.endpoints.iter_mut() {
+            if path.contains(EDITOR_OPEN) {
+                self.errors = self.errors.saturating_sub(endpoint.errors);
+                endpoint.errors = 0;
+            }
+        }
+    }
+
     fn minute(&mut self, at_ms: u64) -> &mut Minute {
         self.prune(at_ms);
         self.minutes.entry(at_ms / 60_000).or_default()
@@ -1327,6 +1367,58 @@ mod tests {
             47_600,
             "without a recorded wait the whole span counts"
         );
+    }
+
+    #[test]
+    fn opening_the_template_editor_is_not_a_failure_but_a_login_redirect_is() {
+        let log = RequestLog::default();
+        // The editor opens with a 302 that carries its session: no error on the call.
+        log.add_eb(
+            &call("factuursjabloon/editor/878203/NL", 302, 40),
+            None,
+            "Claude",
+            None,
+            true,
+        );
+        assert_eq!(log.stats().errors, 0);
+        // Any other redirect is the login page, and a redirect with an error stays a failure.
+        log.add_eb(
+            &call("relatie/gridtable", 302, 40),
+            None,
+            "Claude",
+            None,
+            true,
+        );
+        let mut lost = call("offertesjabloon/editor/5/NL", 302, 40);
+        lost.error = Some("Niet (meer) ingelogd bij e-Boekhouden".into());
+        log.add_eb(&lost, None, "Claude", None, true);
+        assert_eq!(log.stats().errors, 2);
+    }
+
+    #[test]
+    fn a_log_saved_up_to_0_5_0_loses_its_false_editor_failures() {
+        assert!(counted_editor_redirects("0.3.1"));
+        assert!(counted_editor_redirects("0.5.0"));
+        assert!(!counted_editor_redirects("0.5.1"));
+        assert!(!counted_editor_redirects("1.0.0"));
+        let mut stats = Stats {
+            errors: 9,
+            ..Default::default()
+        };
+        stats
+            .endpoints
+            .entry("factuursjabloon/editor/{id}/NL".into())
+            .or_default()
+            .errors = 7;
+        stats
+            .endpoints
+            .entry("relatie/gridtable".into())
+            .or_default()
+            .errors = 2;
+        stats.forget_editor_redirect_errors();
+        assert_eq!(stats.errors, 2);
+        assert_eq!(stats.endpoints["factuursjabloon/editor/{id}/NL"].errors, 0);
+        assert_eq!(stats.endpoints["relatie/gridtable"].errors, 2);
     }
 
     #[test]

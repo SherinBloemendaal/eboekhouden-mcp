@@ -84,7 +84,7 @@ function bar(part: number, of: number): string {
     <div class="tiles">
       <div class="group tile">
         <span class="tile-label">Nu</span>
-        <span class="tile-value">{{ current.eb + current.mcp }} /min<svg class="spark" width="96" height="30" viewBox="0 0 96 30" aria-hidden="true"><polyline :points="spark" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" /></svg></span>
+        <span class="tile-value"><span class="tile-number">{{ current.eb + current.mcp }}<span class="tile-unit">/min</span></span><svg class="spark" viewBox="0 0 96 30" preserveAspectRatio="none" aria-hidden="true"><polyline :points="spark" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" /></svg></span>
         <span class="tile-sub">e-Boekhouden {{ current.eb }} · MCP {{ current.mcp }}</span>
       </div>
       <div class="group tile">
@@ -197,17 +197,22 @@ function bar(part: number, of: number): string {
 </template>
 
 <style scoped>
-.page { padding: 8px 28px 28px; display: flex; flex-direction: column; gap: 16px; }
-.banner { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 12px; background: var(--danger-soft); color: var(--danger); font-size: 12px; }
+/* The page is the container: the window can be made narrow, and tiles and cards follow its width, not the screen's. */
+.page { padding: 8px 28px 28px; display: flex; flex-direction: column; gap: 16px; container: dash / inline-size; }
+.banner { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; padding: 10px 14px; border-radius: 12px; background: var(--danger-soft); color: var(--danger); font-size: 12px; }
 .banner .btn { margin-left: auto; text-decoration: none; color: var(--text); }
-.tiles { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+/* As many tiles in a row as fit at 150px each: five in a wide window, fewer rows of equal tiles in a narrow one. */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
 .tile { padding: 12px 14px; display: flex; flex-direction: column; gap: 3px; min-width: 0; transition: background-color 150ms ease; }
 .tile.bad { background: var(--danger-soft); }
 .tile.bad .tile-label, .tile.bad .tile-sub, .tile.bad .tile-value { color: var(--danger); }
 .tile-label { font-size: 11px; color: var(--muted); }
-.tile-value { display: flex; align-items: flex-end; justify-content: space-between; font-size: 24px; line-height: 30px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.spark { flex: none; color: var(--accent); }
-.tile-sub { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile-value { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; min-width: 0; font-size: 24px; line-height: 30px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tile-number { flex: none; display: inline-flex; align-items: baseline; gap: 4px; }
+.tile-unit { font-size: 13px; line-height: 18px; font-weight: 500; color: var(--muted); }
+/* The line takes what the number leaves, up to its drawn width, and never pushes the number onto two lines. */
+.spark { flex: 0 1 96px; min-width: 0; height: 30px; color: var(--accent); }
+.tile-sub { font-size: 11px; line-height: 15px; color: var(--muted); overflow-wrap: anywhere; }
 .grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 16px; align-items: start; }
 .side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
 .card { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
@@ -268,5 +273,8 @@ function bar(part: number, of: number): string {
 .status-bar .bad { background: #d93025; }
 .status-bar .off { background: var(--off); }
 .status-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--label); }
+@container dash (max-width: 760px) {
+  .grid { grid-template-columns: minmax(0, 1fr); }
+}
 @media (prefers-reduced-motion: reduce) { .tip { animation: fade-in 150ms ease 300ms both; } }
 </style>
