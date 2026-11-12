@@ -231,7 +231,8 @@ function bar(part: number, of: number): string {
 .chart { position: relative; height: 180px; margin-left: 24px; }
 .grid-line { position: absolute; left: 0; right: 0; height: 1px; background: var(--line-soft); }
 .grid-line span { position: absolute; left: -24px; top: -7px; width: 18px; text-align: right; font-size: 10px; color: var(--muted); }
-.limit { position: absolute; left: 0; right: 0; border-top: 2px dashed #ff9f0a; opacity: 0.8; }
+/* Only the line in the chart: the legend's swatch has the same class and must stay in its row. */
+.chart > .limit { position: absolute; left: 0; right: 0; border-top: 2px dashed #ff9f0a; opacity: 0.8; }
 .bars { position: absolute; inset: 0; display: flex; align-items: flex-end; gap: 2px; }
 .col { flex: 1; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; transition: opacity 150ms ease; }
 .col.dim { opacity: 0.5; }
