@@ -10,8 +10,11 @@
 //!   INK (6) plus GEEN, and tegenrekeningen from `grootboekrekening/search?rekeningCategorie=VW,BAL,BTWRC`. It wants
 //!   at least one criterion: a text, or an amount that is not 0. Texts take 50 characters.
 //! - "Alle regels opnieuw automatisch verwerken" (`app-import-list`, `processLines`): `POST import/verwerk` without
-//!   a body -> `{countImport, countMutatie, countErrors}`. It books every unprocessed bank line that matches a
-//!   rule or an open post, in one go.
+//!   a body -> `{countImport, countMutatie, countErrors}`. It processes the unprocessed bank lines again and books
+//!   what it can in one go; the bundle does not show which lines that will be, so the approval does not claim it.
+//! - Btw codes: the form takes `btwinfo/info`, keeps the codes valid today (`filterInfo(info, {date: today})`) and
+//!   only those with `simpleExtended == 'S'` unless `setting/administratie.use-extended-btwcodes` is true or the user
+//!   is an accountant (which EB MCP cannot see; it keeps to the setting).
 
 use super::*;
 
@@ -132,7 +135,7 @@ pub struct ImportregelWijzigenArgs {
     pub omschrijving2: Option<String>,
     /// bijschrijving of afschrijving.
     pub bij_af: Option<BijAf>,
-    /// Nieuw ondergrens van het bedrag.
+    /// Nieuwe ondergrens van het bedrag.
     pub bedrag_van: Option<f64>,
     /// Nieuwe bovengrens van het bedrag.
     pub bedrag_tot: Option<f64>,
@@ -153,7 +156,10 @@ pub struct ImportregelWijzigenArgs {
 /// What a rule is checked against: the tegenrekeningen and btw codes the form offers.
 struct RegelContext {
     rekeningen: Vec<Keuze>,
+    /// The codes the form offers today (`btw_aangeboden`).
     btw: Vec<BtwCode>,
+    /// Whether the administration uses the extended btw codes; without them the form offers only the plain ones.
+    uitgebreid: bool,
 }
 
 impl RegelContext {
@@ -167,8 +173,13 @@ impl RegelContext {
             .find(|b| b.code.eq_ignore_ascii_case(code))
             .ok_or_else(|| {
                 format!(
-                    "Btw-code {code:?} past niet bij {}. Kies uit: {}",
+                    "Btw-code {code:?} biedt het formulier vandaag niet aan bij {}{}. Kies uit: {}",
                     soort.naam(),
+                    if self.uitgebreid {
+                        ""
+                    } else {
+                        " (uitgebreide btw-codes staan uit in deze administratie)"
+                    },
                     allowed
                         .iter()
                         .map(|b| b.code.as_str())
@@ -327,32 +338,36 @@ impl Regel {
 
     /// From `GET importregel/{id}`.
     fn from_api(value: &Value) -> Result<Self, String> {
-        let bad = || "e-Boekhouden gaf deze importregel in een onbekende vorm terug".to_owned();
-        let text = |key: &str| tekst(value.get(key).and_then(Value::as_str));
-        let amount = |key: &str| value.get(key).and_then(Value::as_f64);
-        let number = |key: &str| {
-            value.get(key).and_then(|v| {
-                v.as_u64()
-                    .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
-            })
+        // Every value here goes back to e-Boekhouden on an edit: one that cannot be read stops the edit.
+        let bad = |veld: &str| onleesbaar("deze importregel", veld);
+        let text = |key: &str| -> Result<Option<String>, String> {
+            optional(value.get(key), |v| v.as_str().map(str::to_owned))
+                .map(|t| tekst(t.as_deref()))
+                .map_err(|()| bad(key))
         };
+        let amount = |key: &str| optional(value.get(key), read_f64).map_err(|()| bad(key));
+        let number = |key: &str| value.get(key).and_then(read_u64).ok_or_else(|| bad(key));
         Ok(Self {
-            omschrijving: text("omschrijving"),
-            omschrijving2: text("omschrijving2"),
+            omschrijving: text("omschrijving")?,
+            omschrijving2: text("omschrijving2")?,
             bij_af: value
                 .get("bijAf")
                 .and_then(Value::as_str)
                 .and_then(BijAf::from_api)
-                .ok_or_else(bad)?,
-            bedrag_van: amount("bedragVan"),
-            bedrag_tot: amount("bedragTot"),
-            soort: number("mutatieSoortId")
-                .and_then(RegelSoort::from_nr)
-                .ok_or_else(bad)?,
-            tegenrekening: number("mutatieTegenrekeningId").ok_or_else(bad)?,
-            btw_code: text("mutatieBtwCode").unwrap_or_else(|| "GEEN".to_owned()),
-            actief: value.get("actief").and_then(Value::as_bool).unwrap_or(true),
-            kostenplaats: number("kostenplaatsId").filter(|id| *id > 0),
+                .ok_or_else(|| bad("bijAf"))?,
+            bedrag_van: amount("bedragVan")?,
+            bedrag_tot: amount("bedragTot")?,
+            soort: RegelSoort::from_nr(number("mutatieSoortId")?)
+                .ok_or_else(|| bad("mutatieSoortId"))?,
+            tegenrekening: number("mutatieTegenrekeningId")?,
+            btw_code: text("mutatieBtwCode")?.ok_or_else(|| bad("mutatieBtwCode"))?,
+            actief: value
+                .get("actief")
+                .and_then(read_bool)
+                .ok_or_else(|| bad("actief"))?,
+            kostenplaats: optional(value.get("kostenplaatsId"), read_u64)
+                .map_err(|()| bad("kostenplaatsId"))?
+                .filter(|id| *id > 0),
         })
     }
 }
@@ -519,13 +534,17 @@ fn importregels_verwerken_built(niet_verwerkt: u64, regels: Option<u64>) -> Resu
             "Er zijn geen niet verwerkte bankregels: er valt niets opnieuw te verwerken".into(),
         );
     }
-    let mut lines = vec![line("Niet verwerkte bankregels", niet_verwerkt)];
+    let mut lines = vec![line("Niet verwerkte bankregels nu", niet_verwerkt)];
     if let Some(count) = regels {
         lines.push(line("Automatische importregels", count));
     }
     lines.push(line(
         "Gevolg",
-        "e-Boekhouden loopt alle niet verwerkte bankregels opnieuw langs. Elke regel die past bij een open post (factuurbetaling) of bij een automatische importregel wordt meteen als mutatie geboekt, allemaal in één keer. Bekijk ze eerst met bankregels en importregels.",
+        "e-Boekhouden verwerkt de niet verwerkte bankregels opnieuw automatisch, met onder meer de automatische importregels, en boekt wat het zo kan verwerken meteen als mutatie, allemaal in één keer",
+    ));
+    lines.push(line(
+        "Vooraf te zien",
+        "nee: EB MCP kan niet laten zien welke bankregels e-Boekhouden boekt, op welke rekening of voor welk bedrag. Na afloop staat het aantal geboekte mutaties in het resultaat. Bekijk de bankregels en importregels eerst met bankregels en importregels.",
     ));
     lines.push(line(
         "Terugdraaien",
@@ -533,19 +552,37 @@ fn importregels_verwerken_built(niet_verwerkt: u64, regels: Option<u64>) -> Resu
     ));
     Ok(Built {
         body: Value::Null,
-        title: format!(
-            "Alle {niet_verwerkt} niet verwerkte bankregels opnieuw automatisch verwerken"
-        ),
+        title: "Niet verwerkte bankregels opnieuw automatisch verwerken".into(),
         lines,
     })
 }
 
+/// The setting e-Boekhouden's importregel form reads to offer the extended btw codes.
+const UITGEBREIDE_BTW: &str = "setting/administratie.use-extended-btwcodes";
+
 impl EbMcp {
-    /// The tegenrekeningen and btw codes the importregel form offers.
+    /// The tegenrekeningen and btw codes the importregel form offers: `btwinfo/info`, kept for today and to the
+    /// plain codes unless the administration uses the extended ones (the form's `filterInfo` and `simpleExtended`).
     async fn regel_context(&self, run: &Run) -> Result<RegelContext, String> {
         let rekeningen = self.rekeningen_van(run, "VW,BAL,BTWRC").await?;
-        let btw = btw_codes(&self.fetch(run, "btwinfo/all", Vec::new()).await?);
-        Ok(RegelContext { rekeningen, btw })
+        let info = self.fetch(run, "btwinfo/info", Vec::new()).await?;
+        let setting = self
+            .fetch(
+                run,
+                UITGEBREIDE_BTW,
+                vec![("acc".to_owned(), "false".to_owned())],
+            )
+            .await?;
+        // The form: `ue && ue.value.toLocaleLowerCase() === 'true'`; no setting means off.
+        let uitgebreid = setting
+            .get("value")
+            .and_then(Value::as_str)
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        Ok(RegelContext {
+            rekeningen,
+            btw: btw_aangeboden(btw_codes(&info), today(), uitgebreid),
+            uitgebreid,
+        })
     }
 }
 
@@ -726,7 +763,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Alle niet verwerkte bankregels opnieuw automatisch verwerken, zoals de link Alle regels opnieuw automatisch verwerken in e-Boekhouden: elke bankregel die past bij een open post (factuurbetaling) of bij een actieve automatische importregel wordt meteen als mutatie geboekt, allemaal in één keer. Eén regel kiezen kan niet. Bekijk eerst bankregels en importregels. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Alle niet verwerkte bankregels opnieuw automatisch verwerken, zoals de link Alle regels opnieuw automatisch verwerken in e-Boekhouden: e-Boekhouden verwerkt alle niet verwerkte bankregels opnieuw automatisch, met onder meer de automatische importregels, en boekt wat het zo kan verwerken meteen als mutatie, allemaal in één keer. Eén regel kiezen kan niet, en EB MCP kan vooraf niet laten zien welke mutaties het worden; het resultaat zegt hoeveel er geboekt zijn. Bekijk eerst bankregels en importregels. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Importregels opnieuw verwerken",
             read_only_hint = false,
@@ -788,6 +825,7 @@ mod tests {
                 {"code": "HOOG_VERK_21", "omschrijving": "Btw hoog 21%", "percentage": 21, "soort": "VERK"},
                 {"code": "GEEN", "omschrijving": "Geen btw", "percentage": 0, "soort": ""}
             ])),
+            uitgebreid: true,
         }
     }
 
@@ -1001,11 +1039,100 @@ mod tests {
 
     #[test]
     fn a_rule_is_read_with_string_numbers_too() {
-        let regel = Regel::from_api(&json!({"bijAf": "bijschrijving", "mutatieSoortId": "5", "mutatieTegenrekeningId": 80, "mutatieBtwCode": "HOOG_VERK_21", "omschrijving": "", "kostenplaatsId": 0})).unwrap();
+        let read = json!({"bijAf": "bijschrijving", "mutatieSoortId": "5", "mutatieTegenrekeningId": "80", "mutatieBtwCode": "HOOG_VERK_21",
+                          "omschrijving": "", "bedragVan": "12.50", "kostenplaatsId": 0, "actief": 0});
+        let regel = Regel::from_api(&read).unwrap();
         assert_eq!(regel.soort, RegelSoort::GeldOntvangen);
+        assert_eq!(regel.tegenrekening, 80);
         assert_eq!(regel.omschrijving, None);
+        assert_eq!(regel.bedrag_van, Some(12.5));
         assert_eq!(regel.kostenplaats, None);
-        assert!(regel.actief);
+        // A rule that is switched off stays off when it is edited.
+        assert!(!regel.actief);
+        let mut aan = read.clone();
+        aan["actief"] = json!(1);
+        assert!(Regel::from_api(&aan).unwrap().actief);
+        aan["actief"] = json!("true");
+        assert!(Regel::from_api(&aan).unwrap().actief);
+    }
+
+    #[test]
+    fn a_rule_with_a_value_it_cannot_read_is_not_edited() {
+        let good = now();
+        assert!(Regel::from_api(&good).is_ok());
+        for (key, value) in [
+            ("actief", Value::Null),
+            ("actief", json!(2)),
+            ("actief", json!("ja")),
+            ("mutatieBtwCode", Value::Null),
+            ("mutatieBtwCode", json!("")),
+            ("bedragVan", json!("vijf")),
+            ("bedragTot", json!({"x": 1})),
+            ("omschrijving", json!(12)),
+            ("kostenplaatsId", json!("geen")),
+            ("mutatieTegenrekeningId", Value::Null),
+        ] {
+            let mut read = good.clone();
+            read[key] = value.clone();
+            let error = Regel::from_api(&read).unwrap_err();
+            assert!(
+                error.contains(key) && error.contains("onbekende vorm"),
+                "{key} {value}: {error}"
+            );
+            // And so the edit is refused before anything is asked.
+            let mut args = wijzigen();
+            args.omschrijving = Some("nieuw".into());
+            assert!(importregel_gewijzigd(&args, &read, &ctx()).is_err());
+        }
+        let mut read = good.clone();
+        read.as_object_mut().unwrap().remove("actief");
+        assert!(Regel::from_api(&read).unwrap_err().contains("actief"));
+    }
+
+    #[test]
+    fn an_edit_keeps_a_switched_off_rule_off() {
+        let mut now = now();
+        now["actief"] = json!(0);
+        let mut args = wijzigen();
+        args.omschrijving = Some("Triodos Bank".into());
+        let built = importregel_gewijzigd(&args, &now, &ctx()).unwrap();
+        assert_eq!(built.body["actief"], false);
+        assert!(
+            !label_values(&built)
+                .iter()
+                .any(|(l, _)| l.starts_with("Actief"))
+        );
+    }
+
+    #[test]
+    fn offers_the_btw_codes_the_form_offers_today() {
+        let info = btw_codes(&json!([
+            {"code": "HOOG_INK_21", "omschrijving": "Btw hoog 21%", "soort": "INK", "simpleExtended": "S", "begindatum": {"day": 1, "month": 1, "year": 2019}, "einddatum": null},
+            {"code": "LAAG_INK_6", "omschrijving": "Btw laag 6%", "soort": "INK", "simpleExtended": "S", "begindatum": null, "einddatum": {"day": 1, "month": 1, "year": 2019}},
+            {"code": "VERL_INK", "omschrijving": "Verlegd", "soort": "INK", "simpleExtended": "E", "begindatum": null, "einddatum": null},
+            {"code": "NIEUW_INK", "omschrijving": "Nieuw", "soort": "INK", "simpleExtended": "S", "begindatum": {"day": 12, "month": 11, "year": 2026}, "einddatum": null},
+            {"code": "GEEN", "omschrijving": "Geen btw", "soort": "", "simpleExtended": "S"}
+        ]));
+        let today = (2026, 11, 12);
+        let codes = |uitgebreid: bool| -> Vec<String> {
+            btw_aangeboden(info.clone(), today, uitgebreid)
+                .into_iter()
+                .map(|c| c.code)
+                .collect()
+        };
+        assert_eq!(codes(false), vec!["HOOG_INK_21", "GEEN"]);
+        assert_eq!(codes(true), vec!["HOOG_INK_21", "VERL_INK", "GEEN"]);
+        let ctx = RegelContext {
+            rekeningen: ctx().rekeningen,
+            btw: btw_aangeboden(info, today, false),
+            uitgebreid: false,
+        };
+        let mut args = toevoegen();
+        args.btw_code = "VERL_INK".into();
+        let error = importregel_nieuw(&args, &ctx).unwrap_err();
+        assert!(error.contains("uitgebreide btw-codes staan uit"), "{error}");
+        args.btw_code = "HOOG_INK_21".into();
+        assert!(importregel_nieuw(&args, &ctx).is_ok());
     }
 
     #[test]
@@ -1027,10 +1154,16 @@ mod tests {
         assert_eq!(built.body, Value::Null);
         assert_eq!(
             built.title,
-            "Alle 13 niet verwerkte bankregels opnieuw automatisch verwerken"
+            "Niet verwerkte bankregels opnieuw automatisch verwerken"
         );
         let lines = label_values(&built);
-        assert!(lines.contains(&("Niet verwerkte bankregels".into(), "13".into())));
+        assert!(lines.contains(&("Niet verwerkte bankregels nu".into(), "13".into())));
+        assert!(
+            lines
+                .iter()
+                .any(|(l, v)| l == "Vooraf te zien" && v.starts_with("nee"))
+        );
+        assert!(!lines.iter().any(|(_, v)| v.contains("open post")));
         assert!(lines.contains(&("Automatische importregels".into(), "4".into())));
         assert!(
             lines

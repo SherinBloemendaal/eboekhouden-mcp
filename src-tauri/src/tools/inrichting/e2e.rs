@@ -4,7 +4,7 @@
 use std::sync::{Arc, RwLock};
 
 use axum::body::Bytes;
-use axum::extract::Query;
+use axum::extract::{Query, RawQuery};
 use axum::http::{Method, Uri};
 use axum::routing::get;
 use serde_json::{Value, json};
@@ -52,9 +52,38 @@ async fn eboekhouden(seen: Seen) -> String {
             }),
         )
         .route(
-            "/v1/api/btwinfo/all",
-            get(|| async { axum::Json(json!([{"code": "GEEN", "omschrijving": "Geen btw", "percentage": 0, "soort": ""}])) }),
+            "/v1/api/btwinfo/info",
+            get(|| async {
+                axum::Json(json!([
+                    {"code": "GEEN", "omschrijving": "Geen btw", "soort": "", "simpleExtended": "S", "begindatum": null, "einddatum": null},
+                    {"code": "VERL_INK", "omschrijving": "Verlegd", "soort": "INK", "simpleExtended": "E", "begindatum": null, "einddatum": null}
+                ]))
+            }),
         )
+        .route(
+            "/v1/api/setting/administratie.use-extended-btwcodes",
+            get(|RawQuery(query): RawQuery| async move {
+                assert_eq!(query.as_deref(), Some("acc=false"));
+                axum::Json(json!({"value": "False"}))
+            }),
+        )
+        .route(
+            "/v1/api/importregel/31",
+            get(|| async {
+                // A rule that is switched off, with its fields as numbers and texts.
+                axum::Json(json!({"id": 31, "omschrijving": "Triodos", "omschrijving2": null, "bijAf": "Afschrijving", "bedragVan": null,
+                                  "bedragTot": "250", "mutatieSoortId": 6, "mutatieBtwCode": "GEEN", "mutatieTegenrekeningId": 45,
+                                  "actief": 0, "kostenplaatsId": null}))
+            })
+            .delete(record.clone()),
+        )
+        .route(
+            "/v1/api/vasteactiva/gridtable",
+            get(|| async {
+                axum::Json(json!({"colMetadata": [{"name": "id"}, {"name": "omschrijving"}], "data": [[12, "MacBook Pro"]], "rowCount": 1}))
+            }),
+        )
+        .route("/v1/api/vasteactivamutatie/boekingencount", get(|| async { axum::Json(json!(1)) }))
         .route("/v1/api/import/countImport", get(|| async { axum::Json(json!(13)) }))
         .route(
             "/v1/api/importregel/gridtable",
@@ -86,7 +115,12 @@ async fn eboekhouden(seen: Seen) -> String {
         .route(
             "/v1/api/vasteactivamutatie/gridtable/12",
             get(|| async {
-                axum::Json(json!({"colMetadata": [{"name": "id"}, {"name": "bedrag"}, {"name": "mutatieNr"}], "data": [[1, 833, 4012], [2, 833, null]], "rowCount": 2}))
+                // One line booked, one due (a date long past, not carried out), one in the future.
+                axum::Json(json!({"colMetadata": [{"name": "id"}, {"name": "datum"}, {"name": "bedrag"}, {"name": "datumUitgevoerd"}, {"name": "mutatieNr"}],
+                                  "data": [[1, "2020-01-31T00:00:00", 833, "2020-01-31T00:00:00", 4012],
+                                           [2, "2020-12-31T00:00:00", 833, null, null],
+                                           [3, "2099-12-31T00:00:00", 833, null, null]],
+                                  "rowCount": 3}))
             }),
         )
         .route(
@@ -305,7 +339,14 @@ async fn an_importregel_goes_out_only_when_approved_and_running_them_always_asks
     let id = waiting_id(&text);
     let proposal = h.proposal_up();
     assert!(proposal.danger);
-    assert!(proposal.title.contains("13"), "{}", proposal.title);
+    assert!(
+        proposal
+            .lines
+            .iter()
+            .any(|l| l.label == "Niet verwerkte bankregels nu" && l.value == "13"),
+        "{:?}",
+        proposal.lines
+    );
     assert!(h.state.approvals.decide(id, false, 2));
     assert_eq!(h.settled(id).await.status, Status::Refused);
     assert_eq!(h.seen().len(), 1, "a refused run sends nothing");
@@ -324,7 +365,7 @@ async fn an_importregel_goes_out_only_when_approved_and_running_them_always_asks
 }
 
 #[tokio::test]
-async fn a_vast_activum_is_added_after_approval_and_deleting_always_asks() {
+async fn a_vast_actief_is_added_after_approval_and_deleting_always_asks() {
     let h = Harness::new().await;
     h.set_write(WriteMode::Ask);
 
@@ -370,22 +411,63 @@ async fn a_vast_activum_is_added_after_approval_and_deleting_always_asks() {
         ]
     );
 
-    // An edit carries the recalc flag in the query.
-    h.set_write(WriteMode::Auto);
+    // An edit on an account that asks waits; refused, nothing goes out.
+    let (is_error, text) = h
+        .call("vastactief_wijzigen", json!({"id": 12, "restwaarde": 100}))
+        .await;
+    assert!(!is_error, "{text}");
+    let id = waiting_id(&text);
+    assert!(!h.proposal_up().danger);
+    assert!(h.state.approvals.decide(id, false, 2));
+    assert_eq!(h.settled(id).await.status, Status::Refused);
+    assert_eq!(h.seen().len(), 1, "a refused edit sends nothing");
+    // Bad input is refused before anything is asked.
     let (is_error, text) = h
         .call(
             "vastactief_wijzigen",
-            json!({"id": 12, "restwaarde": 100, "schema_opnieuw": true}),
+            json!({"id": 12, "aanschafdatum": "1899-01-01"}),
         )
+        .await;
+    assert!(is_error && text.contains("1900"), "{text}");
+    assert_eq!(h.state.approvals.count(), 0);
+
+    // Without approval otherwise, a plain edit runs and says recalc=false.
+    h.set_write(WriteMode::Auto);
+    let (is_error, text) = h
+        .call("vastactief_wijzigen", json!({"id": 12, "restwaarde": 100}))
         .await;
     assert!(!is_error, "{text}");
     let edit = &h.seen()[1];
     assert_eq!(edit["method"], "PUT");
     assert_eq!(edit["path"], "vasteactiva");
-    assert_eq!(edit["query"], "recalc=true");
+    assert_eq!(edit["query"], "recalc=false");
     assert_eq!(edit["body"]["restwaarde"], json!(100.0));
 
-    // Deleting asks even without approval otherwise, and says what was booked.
+    // A new schedule always asks and shows the current one.
+    let (is_error, text) = h
+        .call(
+            "vastactief_wijzigen",
+            json!({"id": 12, "schema_opnieuw": true}),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    let id = waiting_id(&text);
+    let proposal = h.proposal_up();
+    assert!(proposal.danger);
+    assert!(
+        proposal
+            .lines
+            .iter()
+            .any(|l| l.label == "Afschrijfschema nu"
+                && l.value == "3 regels, waarvan 1 al geboekt als mutatie 4012"),
+        "{:?}",
+        proposal.lines
+    );
+    assert!(h.state.approvals.decide(id, true, 3));
+    assert_eq!(h.settled(id).await.status, Status::Done);
+    assert_eq!(h.seen()[2]["query"], "recalc=true");
+
+    // Deleting asks even without approval otherwise, and says what was booked; refused, nothing goes out.
     let (is_error, text) = h.call("vastactief_verwijderen", json!({"id": 12})).await;
     assert!(!is_error, "{text}");
     let id = waiting_id(&text);
@@ -399,15 +481,111 @@ async fn a_vast_activum_is_added_after_approval_and_deleting_always_asks() {
         "{:?}",
         proposal.lines
     );
-    assert_eq!(h.seen().len(), 2);
-    assert!(h.state.approvals.decide(id, true, 2));
-    {
-        let r = h.settled(id).await;
-        assert_eq!(r.status, Status::Done, "{r:?}");
-    }
+    assert!(h.state.approvals.decide(id, false, 4));
+    assert_eq!(h.settled(id).await.status, Status::Refused);
+    assert_eq!(h.seen().len(), 3);
+    let (_, text) = h.call("vastactief_verwijderen", json!({"id": 12})).await;
+    let id = waiting_id(&text);
+    assert!(h.state.approvals.decide(id, true, 5));
+    assert_eq!(h.settled(id).await.status, Status::Done);
     assert_eq!(
-        h.seen()[2],
+        h.seen()[3],
         json!({"method": "DELETE", "path": "vasteactiva/12", "query": null, "body": null})
+    );
+}
+
+#[tokio::test]
+async fn booking_depreciations_shows_the_due_lines_and_always_asks() {
+    let h = Harness::new().await;
+    h.set_write(WriteMode::Auto);
+    let (is_error, text) = h.call("afschrijvingen_boeken", json!({})).await;
+    assert!(!is_error, "{text}");
+    let id = waiting_id(&text);
+    let proposal = h.proposal_up();
+    assert!(proposal.danger);
+    assert_eq!(proposal.title, "1 afschrijvingen boeken");
+    let lines: Vec<(&str, &str)> = proposal
+        .lines
+        .iter()
+        .map(|l| (l.label.as_str(), l.value.as_str()))
+        .collect();
+    assert!(
+        lines.contains(&("MacBook Pro", "31-12-2020: 833,00 (samen 833,00)")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&("Totaal", "1 afschrijvingen, samen 833,00")),
+        "{lines:?}"
+    );
+    assert!(!lines.iter().any(|(l, _)| *l == "Let op"), "{lines:?}");
+    assert!(h.seen().is_empty());
+    assert!(h.state.approvals.decide(id, false, 1));
+    assert_eq!(h.settled(id).await.status, Status::Refused);
+    assert!(h.seen().is_empty(), "a refused booking sends nothing");
+
+    let (_, text) = h.call("afschrijvingen_boeken", json!({})).await;
+    let id = waiting_id(&text);
+    assert!(h.state.approvals.decide(id, true, 2));
+    assert_eq!(h.settled(id).await.status, Status::Done);
+    assert_eq!(
+        h.seen(),
+        vec![json!({"method": "POST", "path": "vasteactiva/boeken", "query": null, "body": null})]
+    );
+}
+
+#[tokio::test]
+async fn an_importregel_edit_keeps_it_off_and_deleting_always_asks() {
+    let h = Harness::new().await;
+    h.set_write(WriteMode::Ask);
+
+    // An extended btw code is not offered while the setting is off.
+    let (is_error, text) = h
+        .call(
+            "importregel_wijzigen",
+            json!({"id": 31, "btw_code": "VERL_INK"}),
+        )
+        .await;
+    assert!(
+        is_error && text.contains("uitgebreide btw-codes staan uit"),
+        "{text}"
+    );
+    assert_eq!(h.state.approvals.count(), 0);
+
+    let (is_error, text) = h
+        .call(
+            "importregel_wijzigen",
+            json!({"id": 31, "omschrijving": "Triodos Bank"}),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    let id = waiting_id(&text);
+    assert!(!h.proposal_up().danger);
+    assert!(h.seen().is_empty());
+    assert!(h.state.approvals.decide(id, true, 1));
+    assert_eq!(h.settled(id).await.status, Status::Done);
+    assert_eq!(
+        h.seen(),
+        vec![
+            json!({"method": "PUT", "path": "importregel", "query": null, "body": {
+            "id": 31, "omschrijving": "Triodos Bank", "bijAf": "Afschrijving", "bedragTot": 250.0, "mutatieSoortId": 6,
+            "mutatieBtwCode": "GEEN", "mutatieTegenrekeningId": 45, "actief": false}})
+        ]
+    );
+
+    let (is_error, text) = h.call("importregel_verwijderen", json!({"id": 31})).await;
+    assert!(!is_error, "{text}");
+    let id = waiting_id(&text);
+    assert!(h.proposal_up().danger);
+    assert!(h.state.approvals.decide(id, false, 2));
+    assert_eq!(h.settled(id).await.status, Status::Refused);
+    assert_eq!(h.seen().len(), 1, "a refused delete sends nothing");
+    let (_, text) = h.call("importregel_verwijderen", json!({"id": 31})).await;
+    let id = waiting_id(&text);
+    assert!(h.state.approvals.decide(id, true, 3));
+    assert_eq!(h.settled(id).await.status, Status::Done);
+    assert_eq!(
+        h.seen()[1],
+        json!({"method": "DELETE", "path": "importregel/31", "query": null, "body": null})
     );
 }
 
@@ -449,7 +627,17 @@ async fn the_beginbalans_changes_only_in_balance_and_always_asks() {
         proposal.lines
     );
     assert!(h.seen().is_empty());
-    assert!(h.state.approvals.decide(id, true, 1));
+    assert!(h.state.approvals.decide(id, false, 1));
+    assert_eq!(h.settled(id).await.status, Status::Refused);
+    assert!(h.seen().is_empty(), "a refused beginbalans sends nothing");
+    let (_, text) = h
+        .call(
+            "beginbalans_wijzigen",
+            json!({"regels": [{"rekening": "1010", "activa": 1200}, {"rekening": "1700", "passiva": 200}]}),
+        )
+        .await;
+    let id = waiting_id(&text);
+    assert!(h.state.approvals.decide(id, true, 2));
     {
         let r = h.settled(id).await;
         assert_eq!(r.status, Status::Done, "{r:?}");
