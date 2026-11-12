@@ -777,7 +777,6 @@ pub struct GetArgs {
 #[derive(Clone)]
 pub struct EbMcp {
     state: Arc<AppState>,
-    #[expect(dead_code, reason = "read by the tool_handler macro")]
     tool_router: ToolRouter<Self>,
 }
 
@@ -4351,7 +4350,8 @@ fn server_info() -> Implementation {
         .with_icons(vec![icon])
 }
 
-#[tool_handler]
+// The router is named: without it the macro serves `Self::tool_router()`, the tools of this file alone.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for EbMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
@@ -4514,7 +4514,9 @@ mod tests {
 
     #[test]
     fn counts_its_tools_on_the_router() {
-        assert_eq!(tool_count(), 55);
+        // The tools of this file, plus what each part names in its own module.
+        let [reads, writes, _] = part_tools();
+        assert_eq!(tool_count(), 55 + reads.len() + writes.len());
     }
 
     #[test]
