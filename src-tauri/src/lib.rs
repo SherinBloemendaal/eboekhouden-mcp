@@ -950,16 +950,19 @@ async fn quit_now(app: &AppHandle, app_state: &Arc<AppState>) {
 #[cfg(target_os = "macos")]
 const QUIT_REQUESTED: &str = "quit-requested";
 
-/// The macOS menu bar, as every Mac app has it: Instellingen and Zoek naar updates in the app menu,
-/// the usual Edit menu (copy and paste in fields need it) and a Window menu.
+/// The macOS menu bar, as every Mac app has it, with the app's own parts in it: the pages under Weergave
+/// (Cmd+1 to Cmd+5), the accounts' actions under Archief, the usual Edit menu (copy and paste in fields need
+/// it), a Window menu and Help. Every item does what a button in the app does; none is the only way to it.
 #[cfg(target_os = "macos")]
 fn build_menu(app: &tauri::App) -> tauri::Result<()> {
     use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
     let sep = || PredefinedMenuItem::separator(app);
+    let item =
+        |id: &str, text: &str, keys: Option<&str>| MenuItem::with_id(app, id, text, true, keys);
     let about = AboutMetadata {
         name: Some("EB MCP".into()),
-        comments: Some("e-Boekhouden MCP: je boekhouding voor AI-clients, alleen lezen.".into()),
-        website: Some("https://sherin.dev/eb-mcp/".into()),
+        comments: Some("e-Boekhouden MCP: je boekhouding voor AI-clients.".into()),
+        website: Some(WEBSITE.into()),
         ..Default::default()
     };
     let app_menu = Submenu::with_items(
@@ -968,15 +971,9 @@ fn build_menu(app: &tauri::App) -> tauri::Result<()> {
         true,
         &[
             &PredefinedMenuItem::about(app, Some("Over EB MCP"), Some(about))?,
-            &MenuItem::with_id(app, MENU_UPDATES, "Zoek naar updates…", true, None::<&str>)?,
+            &item(MENU_UPDATES, "Zoek naar updates…", None)?,
             &sep()?,
-            &MenuItem::with_id(
-                app,
-                MENU_SETTINGS,
-                "Instellingen…",
-                true,
-                Some("CmdOrCtrl+,"),
-            )?,
+            &item(MENU_SETTINGS, "Instellingen…", Some("CmdOrCtrl+,"))?,
             &sep()?,
             &PredefinedMenuItem::services(app, Some("Voorzieningen"))?,
             &sep()?,
@@ -984,7 +981,7 @@ fn build_menu(app: &tauri::App) -> tauri::Result<()> {
             &PredefinedMenuItem::hide_others(app, Some("Verberg andere"))?,
             &PredefinedMenuItem::show_all(app, Some("Toon alles"))?,
             &sep()?,
-            &MenuItem::with_id(app, MENU_QUIT, "Stop EB MCP", true, Some("CmdOrCtrl+Q"))?,
+            &item(MENU_QUIT, "Stop EB MCP", Some("CmdOrCtrl+Q"))?,
         ],
     )?;
     let file_menu = Submenu::with_items(
@@ -992,14 +989,23 @@ fn build_menu(app: &tauri::App) -> tauri::Result<()> {
         "Archief",
         true,
         &[
-            &MenuItem::with_id(app, MENU_SETTINGS_FILE, "Instellingen…", true, None::<&str>)?,
-            &MenuItem::with_id(
-                app,
-                MENU_UPDATES_FILE,
-                "Zoek naar updates…",
-                true,
-                None::<&str>,
+            &item(MENU_ADD_ACCOUNT, "Account toevoegen…", Some("CmdOrCtrl+N"))?,
+            &sep()?,
+            &item(
+                MENU_SIGN_IN_ALL,
+                "Alles inloggen",
+                Some("CmdOrCtrl+Shift+I"),
             )?,
+            &item(
+                MENU_SIGN_OUT_ALL,
+                "Alles uitloggen",
+                Some("CmdOrCtrl+Shift+U"),
+            )?,
+            &sep()?,
+            &item(MENU_OPEN_EB, "Open e-Boekhouden", Some("CmdOrCtrl+Shift+O"))?,
+            &sep()?,
+            &item(MENU_SETTINGS_FILE, "Instellingen…", None)?,
+            &item(MENU_UPDATES_FILE, "Zoek naar updates…", None)?,
             &sep()?,
             &PredefinedMenuItem::close_window(app, Some("Sluit venster"))?,
         ],
@@ -1018,6 +1024,25 @@ fn build_menu(app: &tauri::App) -> tauri::Result<()> {
             &PredefinedMenuItem::select_all(app, Some("Selecteer alles"))?,
         ],
     )?;
+    let pages: Vec<MenuItem<tauri::Wry>> = MENU_PAGES
+        .iter()
+        .enumerate()
+        .map(|(i, (id, text, _))| item(id, text, Some(&format!("CmdOrCtrl+{}", i + 1))))
+        .collect::<tauri::Result<_>>()?;
+    let view_menu = Submenu::with_id(app, "view", "Weergave", true)?;
+    for page in &pages {
+        view_menu.append(page)?;
+    }
+    view_menu.append_items(&[
+        &sep()?,
+        &item(
+            MENU_SIDEBAR,
+            "Zijbalk tonen of verbergen",
+            Some("Ctrl+Cmd+S"),
+        )?,
+        &sep()?,
+        &PredefinedMenuItem::fullscreen(app, Some("Schermvullende weergave"))?,
+    ])?;
     let window_menu = Submenu::with_items(
         app,
         "Venster",
@@ -1025,31 +1050,145 @@ fn build_menu(app: &tauri::App) -> tauri::Result<()> {
         &[
             &PredefinedMenuItem::minimize(app, Some("Minimaliseer"))?,
             &PredefinedMenuItem::maximize(app, Some("Zoom"))?,
+            &sep()?,
+            &item(MENU_MAIN_WINDOW, "EB MCP", Some("CmdOrCtrl+0"))?,
+            &sep()?,
+            &PredefinedMenuItem::bring_all_to_front(app, Some("Alles op voorgrond"))?,
         ],
     )?;
+    let help_menu = Submenu::with_items(
+        app,
+        "Help",
+        true,
+        &[
+            &item(MENU_HELP_SITE, "Website van EB MCP", None)?,
+            &item(MENU_HELP_SOURCE, "EB MCP op GitHub", None)?,
+            &sep()?,
+            &item(MENU_HELP_CONNECT, "Een AI-client koppelen…", None)?,
+            &item(MENU_HELP_DIAGNOSE, "Diagnose van het inloggen…", None)?,
+            &sep()?,
+            &item(MENU_HELP_ISSUE, "Meld een probleem…", None)?,
+        ],
+    )?;
+    // macOS adds its own items to these two: the open windows under Venster, the search field under Help.
+    window_menu.set_as_windows_menu_for_nsapp()?;
+    help_menu.set_as_help_menu_for_nsapp()?;
     app.set_menu(Menu::with_items(
         app,
-        &[&app_menu, &file_menu, &edit_menu, &window_menu],
+        &[
+            &app_menu,
+            &file_menu,
+            &edit_menu,
+            &view_menu,
+            &window_menu,
+            &help_menu,
+        ],
     )?)?;
-    app.on_menu_event(|app, event| match event.id().as_ref() {
-        MENU_SETTINGS | MENU_SETTINGS_FILE => open_main(app.clone(), Some("/instellingen".into())),
-        MENU_UPDATES | MENU_UPDATES_FILE => updates::check_for_updates_natively(app.clone()),
-        MENU_QUIT => {
-            let state = app.state::<Arc<AppState>>();
-            // Calls that still run would fail, and changes that wait for approval would lapse: ask first.
-            if state.log.running() > 0 || state.approvals.count() > 0 {
-                open_main(app.clone(), None);
-                let _ = app.emit_to(MAIN, QUIT_REQUESTED, state.log.running());
-            } else {
-                let (app, state) = (app.clone(), Arc::clone(&state));
-                tauri::async_runtime::spawn(async move { quit_now(&app, &state).await });
+    app.on_menu_event(|app, event| {
+        let id = event.id().as_ref();
+        let open_url = |url: &str| {
+            use tauri_plugin_opener::OpenerExt;
+            let _ = app.opener().open_url(url, None::<&str>);
+        };
+        match menu_action(id) {
+            MenuAction::Page(route) => open_main(app.clone(), Some(route.into())),
+            MenuAction::MainWindow => open_main(app.clone(), None),
+            MenuAction::Updates => updates::check_for_updates_natively(app.clone()),
+            MenuAction::SignInAll => {
+                // On the Accounts page, where each sign-in shows how it goes.
+                open_main(app.clone(), Some("/accounts".into()));
+                let state = app.state::<Arc<AppState>>();
+                for id in state.signed_out_accounts() {
+                    start_sign_in(app, id);
+                }
             }
+            MenuAction::SignOutAll => {
+                app.state::<Arc<AppState>>()
+                    .sign_out_all("Alles uitloggen gekozen (menu)");
+            }
+            MenuAction::ToggleSidebar => {
+                open_main(app.clone(), None);
+                let _ = app.emit_to(MAIN, MENU_EVENT, MENU_SIDEBAR);
+            }
+            MenuAction::Url(url) => open_url(url),
+            MenuAction::Quit => {
+                let state = app.state::<Arc<AppState>>();
+                // Calls that still run would fail, and changes that wait for approval would lapse: ask first.
+                if state.log.running() > 0 || state.approvals.count() > 0 {
+                    open_main(app.clone(), None);
+                    let _ = app.emit_to(MAIN, QUIT_REQUESTED, state.log.running());
+                } else {
+                    let (app, state) = (app.clone(), Arc::clone(&state));
+                    tauri::async_runtime::spawn(async move { quit_now(&app, &state).await });
+                }
+            }
+            MenuAction::None => {}
         }
-        _ => {}
     });
     Ok(())
 }
 
+/// What a menu item does. Apart from the menu itself so it can be checked without a running app.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum MenuAction {
+    /// Shows the main window on this route.
+    Page(&'static str),
+    MainWindow,
+    Updates,
+    SignInAll,
+    SignOutAll,
+    ToggleSidebar,
+    /// Opens this address in the browser.
+    Url(&'static str),
+    Quit,
+    None,
+}
+
+#[cfg(target_os = "macos")]
+fn menu_action(id: &str) -> MenuAction {
+    if let Some((_, _, route)) = MENU_PAGES.iter().find(|(page, _, _)| *page == id) {
+        return MenuAction::Page(route);
+    }
+    match id {
+        MENU_SETTINGS | MENU_SETTINGS_FILE | MENU_HELP_DIAGNOSE => {
+            MenuAction::Page("/instellingen")
+        }
+        // The page opens its Account toevoegen sheet for this query (AccountsView).
+        MENU_ADD_ACCOUNT => MenuAction::Page("/accounts?nieuw=1"),
+        MENU_HELP_CONNECT => MenuAction::Page("/koppelen"),
+        MENU_MAIN_WINDOW => MenuAction::MainWindow,
+        MENU_UPDATES | MENU_UPDATES_FILE => MenuAction::Updates,
+        MENU_SIGN_IN_ALL => MenuAction::SignInAll,
+        MENU_SIGN_OUT_ALL => MenuAction::SignOutAll,
+        MENU_SIDEBAR => MenuAction::ToggleSidebar,
+        MENU_OPEN_EB => MenuAction::Url(signin::LOGIN_URL),
+        MENU_HELP_SITE => MenuAction::Url(WEBSITE),
+        MENU_HELP_SOURCE => MenuAction::Url(SOURCE),
+        MENU_HELP_ISSUE => MenuAction::Url(ISSUES),
+        MENU_QUIT => MenuAction::Quit,
+        _ => MenuAction::None,
+    }
+}
+
+/// The pages under Weergave, in the sidebar's order: menu id, name and route. Cmd+1 is the first.
+#[cfg(target_os = "macos")]
+const MENU_PAGES: [(&str, &str, &str); 5] = [
+    ("page-dashboard", "Dashboard", "/dashboard"),
+    ("page-accounts", "Accounts", "/accounts"),
+    ("page-akkoord", "Akkoord", "/akkoord"),
+    ("page-verzoeken", "Verzoeken", "/verzoeken"),
+    ("page-koppelen", "Koppelen", "/koppelen"),
+];
+#[cfg(target_os = "macos")]
+const WEBSITE: &str = "https://sherin.dev/eb-mcp/";
+#[cfg(target_os = "macos")]
+const SOURCE: &str = "https://github.com/SherinBloemendaal/eboekhouden-mcp";
+#[cfg(target_os = "macos")]
+const ISSUES: &str = "https://github.com/SherinBloemendaal/eboekhouden-mcp/issues/new";
+/// Sent to the main window for a menu item the page itself has to carry out; the payload is the item's id.
+#[cfg(target_os = "macos")]
+const MENU_EVENT: &str = "menu";
 #[cfg(target_os = "macos")]
 const MENU_SETTINGS: &str = "settings";
 #[cfg(target_os = "macos")]
@@ -1060,6 +1199,28 @@ const MENU_UPDATES: &str = "check-updates";
 const MENU_UPDATES_FILE: &str = "check-updates-file";
 #[cfg(target_os = "macos")]
 const MENU_QUIT: &str = "quit";
+#[cfg(target_os = "macos")]
+const MENU_ADD_ACCOUNT: &str = "add-account";
+#[cfg(target_os = "macos")]
+const MENU_SIGN_IN_ALL: &str = "sign-in-all";
+#[cfg(target_os = "macos")]
+const MENU_SIGN_OUT_ALL: &str = "sign-out-all";
+#[cfg(target_os = "macos")]
+const MENU_OPEN_EB: &str = "open-eboekhouden";
+#[cfg(target_os = "macos")]
+const MENU_SIDEBAR: &str = "toggle-sidebar";
+#[cfg(target_os = "macos")]
+const MENU_MAIN_WINDOW: &str = "main-window";
+#[cfg(target_os = "macos")]
+const MENU_HELP_SITE: &str = "help-site";
+#[cfg(target_os = "macos")]
+const MENU_HELP_SOURCE: &str = "help-source";
+#[cfg(target_os = "macos")]
+const MENU_HELP_CONNECT: &str = "help-connect";
+#[cfg(target_os = "macos")]
+const MENU_HELP_DIAGNOSE: &str = "help-diagnose";
+#[cfg(target_os = "macos")]
+const MENU_HELP_ISSUE: &str = "help-issue";
 
 /// The panel takes the height of its content (PanelView measures it), between limits that keep it
 /// on screen. On Windows it opens above the tray, so the bottom edge stays where it is.
@@ -1549,6 +1710,82 @@ mod tests {
             danger: false,
             asked_at: 1,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_menu_item_leads_somewhere_and_the_pages_follow_the_sidebar() {
+        // The pages in the sidebar's order, each on its own route.
+        let routes: Vec<&str> = MENU_PAGES.iter().map(|(_, _, route)| *route).collect();
+        assert_eq!(
+            routes,
+            [
+                "/dashboard",
+                "/accounts",
+                "/akkoord",
+                "/verzoeken",
+                "/koppelen"
+            ]
+        );
+        for (id, _, route) in MENU_PAGES {
+            assert_eq!(menu_action(id), MenuAction::Page(route));
+        }
+        // Every item of our own has an action, and no two share an id.
+        let ours = [
+            MENU_SETTINGS,
+            MENU_SETTINGS_FILE,
+            MENU_UPDATES,
+            MENU_UPDATES_FILE,
+            MENU_QUIT,
+            MENU_ADD_ACCOUNT,
+            MENU_SIGN_IN_ALL,
+            MENU_SIGN_OUT_ALL,
+            MENU_OPEN_EB,
+            MENU_SIDEBAR,
+            MENU_MAIN_WINDOW,
+            MENU_HELP_SITE,
+            MENU_HELP_SOURCE,
+            MENU_HELP_CONNECT,
+            MENU_HELP_DIAGNOSE,
+            MENU_HELP_ISSUE,
+        ];
+        let mut ids: Vec<&str> = ours
+            .iter()
+            .copied()
+            .chain(MENU_PAGES.iter().map(|(id, _, _)| *id))
+            .collect();
+        for id in &ids {
+            assert_ne!(menu_action(id), MenuAction::None, "{id}");
+        }
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count);
+        // What matters most: the right thing behind the items that act.
+        assert_eq!(menu_action(MENU_SIGN_IN_ALL), MenuAction::SignInAll);
+        assert_eq!(menu_action(MENU_SIGN_OUT_ALL), MenuAction::SignOutAll);
+        assert_eq!(menu_action(MENU_QUIT), MenuAction::Quit);
+        assert_eq!(
+            menu_action(MENU_ADD_ACCOUNT),
+            MenuAction::Page("/accounts?nieuw=1")
+        );
+        assert_eq!(
+            menu_action(MENU_OPEN_EB),
+            MenuAction::Url(signin::LOGIN_URL)
+        );
+        // Only our own site, the project and e-Boekhouden's sign-in page are ever opened.
+        for id in ours {
+            if let MenuAction::Url(url) = menu_action(id) {
+                assert!(
+                    url.starts_with("https://sherin.dev/")
+                        || url.starts_with("https://github.com/SherinBloemendaal/eboekhouden-mcp")
+                        || url == signin::LOGIN_URL,
+                    "{url}"
+                );
+            }
+        }
+        // An id the menu does not know (a predefined item) does nothing here.
+        assert_eq!(menu_action("copy"), MenuAction::None);
     }
 
     #[test]

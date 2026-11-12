@@ -236,6 +236,44 @@ describe('sidebar collapse', () => {
     expect(stored()).toEqual({ width: 220, collapsed: false })
   })
 
+  it('toggles from the menu bar item, and takes one press heard by both the keys and the menu as one', async () => {
+    const { listen } = await import('@tauri-apps/api/event')
+    vi.mocked(listen).mockClear()
+    await mountApp()
+    await flushPromises()
+    const heard = vi.mocked(listen).mock.calls.find((call) => call[0] === 'menu')
+    expect(heard).toBeDefined()
+    const menu = (item: string) => (heard![1] as (event: { payload: string }) => void)({ payload: item })
+
+    // Weergave > Zijbalk tonen of verbergen.
+    menu('toggle-sidebar')
+    await flushPromises()
+    expect(shell().classList).toContain('collapsed')
+    // Another item of the menu is not this page's business.
+    menu('iets-anders')
+    await flushPromises()
+    expect(shell().classList).toContain('collapsed')
+
+    // One press of Cmd+Ctrl+S that reaches the page as keys and as the menu item: the sidebar moves once.
+    vi.spyOn(performance, 'now').mockReturnValue(10_000)
+    key(window, { key: 's', metaKey: true, ctrlKey: true })
+    vi.mocked(performance.now).mockReturnValue(10_040)
+    menu('toggle-sidebar')
+    await flushPromises()
+    expect(shell().classList).not.toContain('collapsed')
+    // A press a moment later is a new wish, however it is heard.
+    vi.mocked(performance.now).mockReturnValue(10_600)
+    menu('toggle-sidebar')
+    await flushPromises()
+    expect(shell().classList).toContain('collapsed')
+    // Two quick clicks on the button are two wishes too.
+    vi.mocked(performance.now).mockReturnValue(10_610)
+    barButton()!.click()
+    await flushPromises()
+    expect(shell().classList).not.toContain('collapsed')
+    vi.mocked(performance.now).mockRestore()
+  })
+
   it('toggles with Cmd+Ctrl+S on macOS, also from a text field, and not with Cmd+S or Ctrl+S', async () => {
     await mountApp()
     key(window, { key: 's', metaKey: true })

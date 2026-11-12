@@ -91,6 +91,17 @@ describe('accounts page', () => {
     wrapper.unmount()
   })
 
+  it('opens the Account toevoegen sheet when the menu bar asks for it, once', async () => {
+    store.accounts = [account({})]
+    const wrapper = await mountAt('/accounts?nieuw=1')
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true)
+    expect(wrapper.find('[role="dialog"]').attributes('aria-label')).toMatch(/Account toevoegen/i)
+    // The mark is gone from the address: a reload does not open the sheet again.
+    expect(router.currentRoute.value.fullPath).toBe('/accounts')
+    wrapper.unmount()
+  })
+
   it('offers Alles inloggen for several accounts, and only while one of them is signed out', async () => {
     const wrapper = await mountAt('/accounts')
     const all = () => wrapper.findAll('#toolbar-actions .btn').find((b) => b.text() === 'Alles inloggen')

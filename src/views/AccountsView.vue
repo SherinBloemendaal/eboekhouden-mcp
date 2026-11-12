@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import AccountForm from '../components/AccountForm.vue'
 import Alert from '../components/Alert.vue'
 import Avatar from '../components/Avatar.vue'
@@ -15,6 +16,20 @@ import { unlockName } from '../lib/server'
 
 const editing = ref<AccountView | null>(null)
 const adding = ref(false)
+
+// Archief > Account toevoegen (the menu bar) opens this page with ?nieuw=1: the sheet opens, and the mark goes
+// from the address so going back or reloading does not open it again.
+const route = useRoute()
+const router = useRouter()
+watch(
+  () => route.query.nieuw,
+  (asked) => {
+    if (asked === undefined) return
+    adding.value = true
+    void router.replace({ path: route.path })
+  },
+  { immediate: true },
+)
 const removing = ref<AccountView | null>(null)
 const removeError = ref<string | null>(null)
 const watching = ref<string | null>(null)

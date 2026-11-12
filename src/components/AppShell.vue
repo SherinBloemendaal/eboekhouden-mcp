@@ -38,7 +38,7 @@ function onKey(event: KeyboardEvent) {
   if (isSidebarShortcut(event)) {
     event.preventDefault()
     // Not behind an open dialog: it would hand the focus back to a sidebar that is no longer there.
-    if (!document.querySelector('[aria-modal="true"]')) void toggleSidebar()
+    if (!document.querySelector('[aria-modal="true"]')) void toggleSidebar('key')
   }
 }
 
@@ -51,7 +51,16 @@ const toggleLabel = computed(() => (sidebar.collapsed ? 'Zijbalk tonen' : 'Zijba
 // The width animates only while the sidebar opens or closes; dragging and the arrow keys follow the hand at once.
 const toggling = ref(false)
 let toggleTimer: ReturnType<typeof setTimeout> | undefined
-async function toggleSidebar() {
+// The shortcut is also the menu item's (Weergave, macOS). Whichever of the two hears the keys first acts; should
+// both hear one press, the other comes within this time and is not a second wish. Two clicks, or two presses
+// heard the same way, are two wishes.
+const SAME_PRESS_MS = 250
+let lastToggle: { by: 'key' | 'menu' | 'button'; at: number } | null = null
+async function toggleSidebar(by: 'key' | 'menu' | 'button' = 'button') {
+  const now = performance.now()
+  const samePress = !!lastToggle && by !== 'button' && lastToggle.by !== 'button' && lastToggle.by !== by && now - lastToggle.at < SAME_PRESS_MS
+  if (samePress) return
+  lastToggle = { by, at: now }
   const active = document.activeElement
   const moveFocus = active === sideToggle.value || active === barToggle.value || (active instanceof Node && !!sideEl.value?.contains(active))
   toggling.value = true
@@ -135,6 +144,7 @@ const quitCalls = ref(0)
 const quitAsked = ref(false)
 const quitting = ref(false)
 let unlistenQuit: (() => void) | null = null
+let unlistenMenu: (() => void) | null = null
 let unmounted = false
 onMounted(async () => {
   if (!inApp()) return
@@ -145,7 +155,16 @@ onMounted(async () => {
   })
   if (unmounted) stop()
   else unlistenQuit = stop
+  // A menu-bar item the page itself carries out (macOS): the payload is the item's id.
+  const stopMenu = await listen<string>('menu', (event) => onMenu(event.payload))
+  if (unmounted) stopMenu()
+  else unlistenMenu = stopMenu
 })
+function onMenu(item: string) {
+  // As with the keys: not behind an open dialog.
+  if (item === 'toggle-sidebar' && !document.querySelector('[aria-modal="true"]')) void toggleSidebar('menu')
+}
+defineExpose({ onMenu })
 async function confirmQuit() {
   quitting.value = true
   await quitApp()
@@ -224,6 +243,7 @@ onBeforeUnmount(() => {
   glass?.stop()
   clearTimeout(toggleTimer)
   unlistenQuit?.()
+  unlistenMenu?.()
   stopServer?.()
 })
 </script>
@@ -242,7 +262,7 @@ onBeforeUnmount(() => {
           <button
             ref="sideToggle" type="button" class="side-toggle" aria-controls="app-sidebar" :aria-expanded="!sidebar.collapsed"
             :aria-label="toggleLabel" :aria-keyshortcuts="sidebarShortcutAria" :title="`${toggleLabel} (${sidebarShortcut})`"
-            @click="toggleSidebar"
+            @click="toggleSidebar('button')"
           >
             <Icon name="sidebar-left" :size="18" />
           </button>
@@ -289,7 +309,7 @@ onBeforeUnmount(() => {
           <button
             v-if="sidebar.collapsed" ref="barToggle" type="button" class="side-toggle bar-toggle" aria-controls="app-sidebar"
             :aria-expanded="!sidebar.collapsed" :aria-label="toggleLabel" :aria-keyshortcuts="sidebarShortcutAria"
-            :title="`${toggleLabel} (${sidebarShortcut})`" @click="toggleSidebar"
+            :title="`${toggleLabel} (${sidebarShortcut})`" @click="toggleSidebar('button')"
           >
             <Icon name="sidebar-left" :size="18" />
           </button>
