@@ -1168,26 +1168,53 @@ pub struct FactuurRegelArg {
     pub tegenrekening: String,
     /// Productcode (optioneel).
     pub code: Option<String>,
+    /// Id van het artikel waar de regel bij hoort (uit artikelen). Zonder: een losse regel.
+    pub artikel_id: Option<u64>,
+    /// Id van de eenheid, bijvoorbeeld stuk of uur (uit eenheden, of eenheidId van het artikel).
+    pub eenheid_id: Option<u64>,
 }
 
-/// A line of an invoice or subscription as `factuur/model` and `abonnement/model` take it in `factuurItems.insert`.
-fn factuur_item(
-    regel: &FactuurRegelArg,
-    index: usize,
-    in_ex: InEx,
-    books: &Books,
-) -> Result<(Value, Line), String> {
-    let n = index + 1;
-    let omschrijving = regel.omschrijving.trim();
-    if omschrijving.is_empty() {
-        return Err(format!("Regel {n} heeft geen omschrijving"));
+/// Wat er aan één bestaande regel verandert; wat je niet noemt blijft zoals het is.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct FactuurRegelWijzigArg {
+    /// Id van de regel (uit factuur of abonnement, bij regels).
+    pub id: u64,
+    /// Nieuw aantal.
+    pub aantal: Option<f64>,
+    /// Nieuwe omschrijving.
+    pub omschrijving: Option<String>,
+    /// Nieuwe prijs per eenheid, incl. of excl. btw zoals de factuur of het abonnement nu staat.
+    pub prijs: Option<f64>,
+    /// Nieuwe btw-code voor verkoop.
+    pub btw_code: Option<String>,
+    /// Code van de nieuwe omzetrekening.
+    pub tegenrekening: Option<String>,
+    /// Nieuwe productcode.
+    pub code: Option<String>,
+    /// Id van het artikel waar de regel bij gaat horen (uit artikelen).
+    pub artikel_id: Option<u64>,
+    /// Id van de nieuwe eenheid (uit eenheden).
+    pub eenheid_id: Option<u64>,
+}
+
+/// Whether a line may have aantal 0. A subscription keeps such a line as a place that bills nothing for now.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Zero {
+    Refused,
+    Allowed,
+}
+
+/// The aantal of a line: a number, and not 0 where that has no use.
+fn aantal_of(aantal: f64, what: &str, zero: Zero) -> Result<f64, String> {
+    if !aantal.is_finite() || (aantal == 0.0 && zero == Zero::Refused) {
+        return Err(format!("Het aantal van {what} is geen geldig getal"));
     }
-    let aantal = regel.aantal.unwrap_or(1.0);
-    if !aantal.is_finite() || aantal == 0.0 {
-        return Err(format!("Het aantal van regel {n} is geen geldig getal"));
-    }
-    let prijs = amount(regel.prijs, &format!("De prijs van regel {n}"))?;
-    let btw = books.btw(&regel.btw_code)?;
+    Ok(aantal)
+}
+
+/// A btw code an invoice line can carry.
+fn verkoop_btw<'a>(books: &'a Books, code: &str) -> Result<&'a Btw, String> {
+    let btw = books.btw(code)?;
     if btw.soort == "INK" {
         return Err(format!(
             "Btw-code {} is voor inkoop; een factuur wil een verkoopcode of GEEN",
@@ -1197,11 +1224,35 @@ fn factuur_item(
     if btw.code.starts_with("AFW") {
         return Err("Een afwijkend btw-percentage kan EB MCP niet op een factuur zetten".into());
     }
-    let factor = 1.0 + btw.percentage / 100.0;
-    let (excl, incl) = match in_ex {
+    Ok(btw)
+}
+
+/// A line's price without and with btw, from the price as the document counts it.
+fn excl_incl(prijs: f64, percentage: f64, in_ex: InEx) -> (f64, f64) {
+    let factor = 1.0 + percentage / 100.0;
+    match in_ex {
         InEx::Excl => (prijs, round2(prijs * factor)),
         InEx::Incl => (round4(prijs / factor), prijs),
-    };
+    }
+}
+
+/// A line of an invoice or subscription as `factuur/model` and `abonnement/model` take it in `factuurItems.insert`.
+fn factuur_item(
+    regel: &FactuurRegelArg,
+    index: usize,
+    in_ex: InEx,
+    zero: Zero,
+    books: &Books,
+) -> Result<(Value, Line), String> {
+    let n = index + 1;
+    let omschrijving = regel.omschrijving.trim();
+    if omschrijving.is_empty() {
+        return Err(format!("Regel {n} heeft geen omschrijving"));
+    }
+    let aantal = aantal_of(regel.aantal.unwrap_or(1.0), &format!("regel {n}"), zero)?;
+    let prijs = amount(regel.prijs, &format!("De prijs van regel {n}"))?;
+    let btw = verkoop_btw(books, &regel.btw_code)?;
+    let (excl, incl) = excl_incl(prijs, btw.percentage, in_ex);
     let rekening = books.rekening(&regel.tegenrekening)?;
     let mut item = Map::new();
     item.insert("id".into(), json!(-(n as i64)));
@@ -1217,6 +1268,12 @@ fn factuur_item(
     item.insert("volgorde".into(), json!(index));
     if let Some(code) = text(&regel.code) {
         item.insert("code".into(), json!(code));
+    }
+    if let Some(id) = regel.artikel_id.filter(|id| *id != 0) {
+        item.insert("artikelId".into(), json!(id));
+    }
+    if let Some(id) = regel.eenheid_id.filter(|id| *id != 0) {
+        item.insert("eenheidId".into(), json!(id));
     }
     let shown = line(
         &format!("Regel {n}"),
@@ -1234,6 +1291,7 @@ fn factuur_item(
 fn factuur_items(
     regels: &[FactuurRegelArg],
     in_ex: InEx,
+    zero: Zero,
     books: &Books,
 ) -> Result<(Vec<Value>, Vec<Line>), String> {
     if regels.is_empty() {
@@ -1245,11 +1303,245 @@ fn factuur_items(
     let mut items = Vec::new();
     let mut lines = vec![line("Prijzen", in_ex.naam())];
     for (i, regel) in regels.iter().enumerate() {
-        let (item, shown) = factuur_item(regel, i, in_ex, books)?;
+        let (item, shown) = factuur_item(regel, i, in_ex, zero, books)?;
         items.push(item);
         lines.push(shown);
     }
     Ok((items, lines))
+}
+
+/// What an edit of an invoice or subscription asks of its lines.
+struct RegelEdit<'a> {
+    bedragen: Option<InEx>,
+    regels: Option<&'a [FactuurRegelArg]>,
+    toevoegen: Option<&'a [FactuurRegelArg]>,
+    wijzigen: Option<&'a [FactuurRegelWijzigArg]>,
+    verwijderen: Option<&'a [u64]>,
+}
+
+/// A line's place in its document, which e-Boekhouden gives as a number or as text.
+fn volgorde_of(item: &Value) -> Option<u64> {
+    let volgorde = item.get("volgorde")?;
+    volgorde
+        .as_u64()
+        .or_else(|| volgorde.as_str()?.trim().parse().ok())
+}
+
+/// One existing line with the named changes, as `factuurItems.update` takes it: the line as it was read, so
+/// its id, artikel, eenheid, kostenplaats, korting and place stay, with only what the edit names set anew.
+fn changed_item(
+    now: &Value,
+    place: usize,
+    edit: &FactuurRegelWijzigArg,
+    in_ex: InEx,
+    zero: Zero,
+    books: &Books,
+) -> Result<(Value, Line), String> {
+    let what = format!("regel {place}");
+    let mut item = now
+        .as_object()
+        .cloned()
+        .ok_or("e-Boekhouden gaf een regel in een onbekende vorm terug")?;
+    let was = now
+        .get("omschrijving")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let mut says = Vec::new();
+    if let Some(aantal) = edit.aantal {
+        let aantal = aantal_of(aantal, &what, zero)?;
+        let old = now.get("aantal").and_then(Value::as_f64).unwrap_or(0.0);
+        says.push(format!("aantal {aantal} (was {old})"));
+        item.insert("aantal".into(), json!(aantal));
+    }
+    if let Some(omschrijving) = &edit.omschrijving {
+        let omschrijving = omschrijving.trim();
+        if omschrijving.is_empty() {
+            return Err(format!("De omschrijving van {what} mag niet leeg zijn"));
+        }
+        says.push(format!("omschrijving {omschrijving:?}"));
+        item.insert("omschrijving".into(), json!(omschrijving));
+    }
+    if edit.prijs.is_some() || edit.btw_code.is_some() {
+        let code = match &edit.btw_code {
+            Some(code) => code.clone(),
+            None => now
+                .get("btw")
+                .and_then(Value::as_str)
+                .ok_or("e-Boekhouden gaf een regel zonder btw-code terug")?
+                .to_owned(),
+        };
+        let btw = verkoop_btw(books, &code)?;
+        let key = match in_ex {
+            InEx::Excl => "prijsExcl",
+            InEx::Incl => "prijsIncl",
+        };
+        let old = now.get(key).and_then(Value::as_f64);
+        let prijs = match edit.prijs {
+            Some(prijs) => amount(prijs, &format!("De prijs van {what}"))?,
+            None => old.ok_or("e-Boekhouden gaf een regel zonder prijs terug")?,
+        };
+        let (excl, incl) = excl_incl(prijs, btw.percentage, in_ex);
+        if edit.prijs.is_some() {
+            says.push(format!(
+                "prijs {} (was {})",
+                euro(prijs),
+                old.map(euro).unwrap_or_else(|| "onbekend".into())
+            ));
+        }
+        if edit.btw_code.is_some() {
+            says.push(format!("btw {}", btw.naam));
+            item.insert("btw".into(), json!(btw.code));
+        }
+        item.insert("prijsExcl".into(), json!(excl));
+        item.insert("prijsIncl".into(), json!(incl));
+    }
+    if let Some(code) = &edit.tegenrekening {
+        let rekening = books.rekening(code)?;
+        says.push(format!("op {} {}", rekening.code, rekening.naam));
+        item.insert("grootboekId".into(), json!(rekening.id));
+    }
+    if let Some(code) = &edit.code {
+        says.push(format!("productcode {:?}", code.trim()));
+        item.insert("code".into(), json!(code.trim()));
+    }
+    if let Some(id) = edit.artikel_id {
+        says.push(format!("artikel id {id}"));
+        item.insert("artikelId".into(), json!(id));
+    }
+    if let Some(id) = edit.eenheid_id {
+        says.push(format!("eenheid id {id}"));
+        item.insert("eenheidId".into(), json!(id));
+    }
+    if says.is_empty() {
+        return Err(format!(
+            "Bij {what} (id {}) staat niets dat anders moet",
+            edit.id
+        ));
+    }
+    let shown = line(
+        &format!("Regel {place} wordt"),
+        format!("{was}: {}", says.join(", ")),
+    );
+    Ok((Value::Object(item), shown))
+}
+
+/// The `factuurItems` of an edit and what it shows, or `None` when the edit leaves the lines alone. With
+/// `regels` every line is replaced; otherwise lines are added, changed and removed one by one and the others
+/// are not sent at all, so they stay exactly as they are.
+fn regel_changes(
+    edit: &RegelEdit<'_>,
+    items: &Value,
+    kept: InEx,
+    zero: Zero,
+    books: &Books,
+) -> Result<Option<(Value, InEx, Vec<Line>)>, String> {
+    let some = |list: Option<usize>| list.is_some_and(|len| len > 0);
+    let one_by_one = some(edit.toevoegen.map(<[_]>::len))
+        || some(edit.wijzigen.map(<[_]>::len))
+        || some(edit.verwijderen.map(<[_]>::len));
+    if let Some(regels) = edit.regels {
+        if one_by_one {
+            return Err("Geef regels (vervangt alles) of regels_toevoegen, regels_wijzigen en regels_verwijderen, niet allebei".into());
+        }
+        let in_ex = edit.bedragen.unwrap_or(kept);
+        let (new_items, item_lines) = factuur_items(regels, in_ex, zero, books)?;
+        let mut lines = vec![line("Regels", "alle regels worden vervangen door:")];
+        lines.extend(item_lines);
+        return Ok(Some((
+            json!({"insert": new_items, "update": [], "delete": item_ids(items)}),
+            in_ex,
+            lines,
+        )));
+    }
+    if edit.bedragen.is_some() {
+        return Err(
+            "Incl of excl btw wijzigen kan alleen samen met regels, die alle regels vervangen"
+                .into(),
+        );
+    }
+    if !one_by_one {
+        return Ok(None);
+    }
+    let now: &[Value] = items.as_array().map(Vec::as_slice).unwrap_or_default();
+    // A line is named by its id; its place (1, 2, 3) is how the user knows it.
+    let find = |id: u64| {
+        now.iter()
+            .position(|item| item.get("id").and_then(Value::as_u64) == Some(id))
+            .ok_or_else(|| format!("Er is geen regel met id {id}; lees de regels eerst opnieuw"))
+    };
+    let mut touched = std::collections::HashSet::new();
+    let mut lines = Vec::new();
+    let mut delete = Vec::new();
+    for id in edit.verwijderen.unwrap_or_default() {
+        let at = find(*id)?;
+        if !touched.insert(*id) {
+            return Err(format!("Regel id {id} staat twee keer in de wijziging"));
+        }
+        let item = &now[at];
+        lines.push(line(
+            &format!("Regel {} vervalt", at + 1),
+            format!(
+                "{} x {}",
+                item.get("aantal").and_then(Value::as_f64).unwrap_or(0.0),
+                item.get("omschrijving")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            ),
+        ));
+        delete.push(json!(id));
+    }
+    let mut update = Vec::new();
+    for change in edit.wijzigen.unwrap_or_default() {
+        let at = find(change.id)?;
+        if !touched.insert(change.id) {
+            return Err(format!(
+                "Regel id {} staat twee keer in de wijziging",
+                change.id
+            ));
+        }
+        let (item, shown) = changed_item(&now[at], at + 1, change, kept, zero, books)?;
+        update.push(item);
+        lines.push(shown);
+    }
+    let added = edit.toevoegen.unwrap_or_default();
+    let left = now.len() - delete.len() + added.len();
+    if left == 0 {
+        return Err("Er moet minstens één regel overblijven".into());
+    }
+    if left > MAX_REGELS {
+        return Err(format!("Hoogstens {MAX_REGELS} regels"));
+    }
+    // New lines go after the last one there is, also after one that is removed in the same edit.
+    let first = now
+        .iter()
+        .filter_map(volgorde_of)
+        .max()
+        .map_or(0, |last| last as usize + 1)
+        .max(now.len());
+    let mut insert = Vec::new();
+    for (i, regel) in added.iter().enumerate() {
+        let (mut item, shown) = factuur_item(regel, first + i, kept, zero, books)?;
+        // The new lines of one edit are told apart by a negative id of their own: -1, -2, ...
+        item["id"] = json!(-(i as i64 + 1));
+        insert.push(item);
+        lines.push(line(
+            &format!("Regel {} komt erbij", first + i + 1),
+            shown.value,
+        ));
+    }
+    lines.push(line(
+        "Overige regels",
+        format!(
+            "{} blijven zoals ze zijn",
+            now.len() - delete.len() - update.len()
+        ),
+    ));
+    Ok(Some((
+        json!({"insert": insert, "update": update, "delete": delete}),
+        kept,
+        lines,
+    )))
 }
 
 fn item_ids(items: &Value) -> Vec<Value> {
@@ -1373,7 +1665,7 @@ pub fn factuur_nieuw(
     if nummer.is_empty() {
         return Err("Geef een factuurnummer".into());
     }
-    let (items, item_lines) = factuur_items(&args.regels, in_ex, books)?;
+    let (items, item_lines) = factuur_items(&args.regels, in_ex, Zero::Refused, books)?;
     let sjabloon = args
         .sjabloon_id
         .map(|id| factuur_sjabloon(id, sjablonen))
@@ -1456,8 +1748,14 @@ pub struct FactuurWijzigenArgs {
     pub kenmerk: Option<String>,
     /// Prijzen incl of excl btw. Alleen samen met `regels`.
     pub bedragen: Option<InEx>,
-    /// Vervangt alle regels van de factuur. Laat weg om ze te houden.
+    /// Vervangt alle regels van de factuur. Laat weg om ze te houden. Voor één of enkele regels zijn regels_toevoegen, regels_wijzigen en regels_verwijderen veiliger: die laten de andere regels onaangeraakt.
     pub regels: Option<Vec<FactuurRegelArg>>,
+    /// Regels die erbij komen, achter de bestaande. De andere regels blijven zoals ze zijn. Niet samen met `regels`.
+    pub regels_toevoegen: Option<Vec<FactuurRegelArg>>,
+    /// Bestaande regels die veranderen, op hun id; alleen wat je per regel noemt verandert. Niet samen met `regels`.
+    pub regels_wijzigen: Option<Vec<FactuurRegelWijzigArg>>,
+    /// Ids van regels die vervallen. Niet samen met `regels`.
+    pub regels_verwijderen: Option<Vec<u64>>,
     /// Ander factuursjabloon voor de opmaak (id uit sjablonen met soort factuur).
     pub sjabloon_id: Option<u64>,
     /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
@@ -1598,22 +1896,21 @@ pub fn factuur_gewijzigd(
         }
     }
     let mut item_changes = json!({"insert": [], "update": [], "delete": []});
-    match &args.regels {
-        Some(regels) => {
-            let in_ex = args
-                .bedragen
-                .unwrap_or_else(|| InEx::from_code(factuur["inEx"].as_str().unwrap_or("EX")));
-            factuur.insert("inEx".into(), json!(in_ex.code()));
-            let (new_items, item_lines) = factuur_items(regels, in_ex, books)?;
-            lines.push(line("Regels", "alle regels worden vervangen door:"));
-            lines.extend(item_lines);
-            item_changes = json!({"insert": new_items, "update": [], "delete": item_ids(items)});
-            changed = true;
-        }
-        None if args.bedragen.is_some() => {
-            return Err("Incl of excl btw wijzigen kan alleen samen met nieuwe regels".into());
-        }
-        None => {}
+    let edit = RegelEdit {
+        bedragen: args.bedragen,
+        regels: args.regels.as_deref(),
+        toevoegen: args.regels_toevoegen.as_deref(),
+        wijzigen: args.regels_wijzigen.as_deref(),
+        verwijderen: args.regels_verwijderen.as_deref(),
+    };
+    let kept = InEx::from_code(factuur["inEx"].as_str().unwrap_or("EX"));
+    if let Some((changes, in_ex, item_lines)) =
+        regel_changes(&edit, items, kept, Zero::Refused, books)?
+    {
+        factuur.insert("inEx".into(), json!(in_ex.code()));
+        lines.extend(item_lines);
+        item_changes = changes;
+        changed = true;
     }
     if !changed {
         return Err("Er is niets gewijzigd: geef aan wat er anders moet".into());
@@ -1838,7 +2135,7 @@ pub fn offerte_regels(
     in_ex: InEx,
     books: &Books,
 ) -> Result<(Vec<Value>, Vec<Line>), String> {
-    let (items, lines) = factuur_items(regels, in_ex, books)?;
+    let (items, lines) = factuur_items(regels, in_ex, Zero::Refused, books)?;
     let regels = items
         .into_iter()
         .map(|item| {
@@ -2297,7 +2594,7 @@ pub fn abonnement_nieuw(
     if prolongatie < start {
         return Err("De prolongatiedatum ligt voor de startdatum".into());
     }
-    let (items, item_lines) = factuur_items(&args.regels, in_ex, books)?;
+    let (items, item_lines) = factuur_items(&args.regels, in_ex, Zero::Allowed, books)?;
     let mut factuur = Map::new();
     factuur.insert("relatieId".into(), json!(args.relatie_id));
     factuur.insert("nummer".into(), json!(naam));
@@ -2363,8 +2660,14 @@ pub struct AbonnementWijzigenArgs {
     pub niet_factureren: Option<bool>,
     /// Prijzen incl of excl btw. Alleen samen met `regels`.
     pub bedragen: Option<InEx>,
-    /// Vervangt alle regels van het abonnement. Laat weg om ze te houden.
+    /// Vervangt alle regels van het abonnement. Laat weg om ze te houden. Voor één of enkele regels zijn regels_toevoegen, regels_wijzigen en regels_verwijderen veiliger: die laten de andere regels onaangeraakt.
     pub regels: Option<Vec<FactuurRegelArg>>,
+    /// Regels die erbij komen, achter de bestaande. De andere regels blijven zoals ze zijn. Niet samen met `regels`.
+    pub regels_toevoegen: Option<Vec<FactuurRegelArg>>,
+    /// Bestaande regels die veranderen, op hun id; alleen wat je per regel noemt verandert. Niet samen met `regels`.
+    pub regels_wijzigen: Option<Vec<FactuurRegelWijzigArg>>,
+    /// Ids van regels die vervallen. Niet samen met `regels`.
+    pub regels_verwijderen: Option<Vec<u64>>,
     /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
@@ -2378,6 +2681,23 @@ pub fn abonnement_gewijzigd(
 ) -> Result<Built, String> {
     let mut factuur = factuur_kept(now, "dit abonnement")?;
     factuur.insert("type".into(), json!("E"));
+    // What only a subscription has. e-Boekhouden's form sends these back with every edit, and refuses one
+    // without its e-mail template ("E-mailsjabloon is niet ingevuld").
+    for name in [
+        "emailSjabloonId",
+        "autoVerwerkMethod",
+        "rekening",
+        "tenNameVan",
+        "plaats",
+        "machtigingSoort",
+        "machtigingId",
+        "machtigingDatum",
+        "machtigingFirst",
+    ] {
+        if let Some(value) = now.get(name) {
+            factuur.insert(name.into(), value.clone());
+        }
+    }
     let old_naam = now
         .get("nummer")
         .and_then(Value::as_str)
@@ -2441,22 +2761,21 @@ pub fn abonnement_gewijzigd(
         changed = true;
     }
     let mut item_changes = json!({"insert": [], "update": [], "delete": []});
-    match &args.regels {
-        Some(regels) => {
-            let in_ex = args
-                .bedragen
-                .unwrap_or_else(|| InEx::from_code(factuur["inEx"].as_str().unwrap_or("EX")));
-            factuur.insert("inEx".into(), json!(in_ex.code()));
-            let (new_items, item_lines) = factuur_items(regels, in_ex, books)?;
-            lines.push(line("Regels", "alle regels worden vervangen door:"));
-            lines.extend(item_lines);
-            item_changes = json!({"insert": new_items, "update": [], "delete": item_ids(items)});
-            changed = true;
-        }
-        None if args.bedragen.is_some() => {
-            return Err("Incl of excl btw wijzigen kan alleen samen met nieuwe regels".into());
-        }
-        None => {}
+    let edit = RegelEdit {
+        bedragen: args.bedragen,
+        regels: args.regels.as_deref(),
+        toevoegen: args.regels_toevoegen.as_deref(),
+        wijzigen: args.regels_wijzigen.as_deref(),
+        verwijderen: args.regels_verwijderen.as_deref(),
+    };
+    let kept = InEx::from_code(factuur["inEx"].as_str().unwrap_or("EX"));
+    if let Some((changes, in_ex, item_lines)) =
+        regel_changes(&edit, items, kept, Zero::Allowed, books)?
+    {
+        factuur.insert("inEx".into(), json!(in_ex.code()));
+        lines.extend(item_lines);
+        item_changes = changes;
+        changed = true;
     }
     if !changed {
         return Err("Er is niets gewijzigd: geef aan wat er anders moet".into());
@@ -3246,6 +3565,8 @@ mod tests {
             btw_code: "LAAG_VERK_9".into(),
             tegenrekening: "0130".into(),
             code: None,
+            artikel_id: None,
+            eenheid_id: None,
         }
     }
 
@@ -3322,6 +3643,9 @@ mod tests {
             kenmerk: None,
             bedragen: None,
             regels: None,
+            regels_toevoegen: None,
+            regels_wijzigen: None,
+            regels_verwijderen: None,
             sjabloon_id: None,
             account: None,
         };
@@ -3433,6 +3757,9 @@ mod tests {
             kenmerk: None,
             bedragen: None,
             regels: None,
+            regels_toevoegen: None,
+            regels_wijzigen: None,
+            regels_verwijderen: None,
             sjabloon_id: Some(900001),
             account: None,
         };
@@ -3569,6 +3896,9 @@ mod tests {
             niet_factureren: None,
             bedragen: None,
             regels: None,
+            regels_toevoegen: None,
+            regels_wijzigen: None,
+            regels_verwijderen: None,
             account: None,
         };
         let body = abonnement_gewijzigd(&args, &now, &extra, &json!([]), &books())
@@ -3584,6 +3914,212 @@ mod tests {
         );
         args.prolongatie = Some("2026-10-01".into());
         assert!(abonnement_gewijzigd(&args, &now, &extra, &json!([]), &books()).is_err());
+    }
+
+    /// The subscription of the report that led to this: lines with an artikel and eenheid, one with aantal 0.
+    fn abonnement_now() -> (Value, Value, Value) {
+        let regel = |id: u64, aantal: f64, park: &str, volgorde: &str| {
+            json!({"aantal": aantal, "administratieId": 789004, "artikelId": 17855291, "btw": "LAAG_VERK_9", "code": "verbleif-pro",
+                   "eenheidId": 2552113, "enkelvoud": "stuk", "factuurId": 0, "grootboekId": 26852146, "id": id, "kortingIsPerc": true,
+                   "kostenplaatsId": 0, "meervoud": "stuks", "omschrijving": format!("Verbleif Pro ({park})"), "prijsExcl": 5.0,
+                   "prijsIncl": 5.45, "volgorde": volgorde})
+        };
+        (
+            json!({"id": 56510916, "relatieId": 58629769, "nummer": "Pro Europarcs", "inEx": "EX", "termijn": 30, "sjabloonId": 1301520,
+                   "emailSjabloonId": 1028438, "autoVerwerk": true, "autoVerwerkMethod": 0, "emailen": false, "tenNameVan": "Europarcs B.V.",
+                   "plaats": "Amersfoort", "machtigingSoort": "", "machtigingId": "", "machtigingDatum": {"day": 1, "month": 4, "year": 2025},
+                   "machtigingFirst": false, "factOm1": "Factuur: [FACTUUR]", "geenFactuur": false, "totaal": 6470.18}),
+            json!({"id": 4620220, "startDatum": {"year": 2025, "month": 4, "day": 1}, "expiratieDatum": {"year": 2026, "month": 12, "day": 1}, "per": "M"}),
+            json!([
+                regel(11, 17.0, "De Hooge Veluwe", "0"),
+                regel(12, 0.0, "Koningshof", "1"),
+                regel(13, 24.0, "De Zanding", "2")
+            ]),
+        )
+    }
+
+    fn abonnement_edit() -> AbonnementWijzigenArgs {
+        AbonnementWijzigenArgs {
+            id: 56510916,
+            naam: None,
+            per: None,
+            termijn: None,
+            start: None,
+            prolongatie: None,
+            kenmerk: None,
+            niet_factureren: None,
+            bedragen: None,
+            regels: None,
+            regels_toevoegen: None,
+            regels_wijzigen: None,
+            regels_verwijderen: None,
+            account: None,
+        }
+    }
+
+    #[test]
+    fn a_line_is_added_to_a_subscription_and_the_others_are_not_touched() {
+        let (now, extra, items) = abonnement_now();
+        let mut args = abonnement_edit();
+        args.regels_toevoegen = Some(vec![FactuurRegelArg {
+            aantal: Some(9.0),
+            omschrijving: "Verbleif Pro (Kagerplassen)".into(),
+            prijs: 5.0,
+            btw_code: "LAAG_VERK_9".into(),
+            tegenrekening: "8000".into(),
+            code: Some("verbleif-pro".into()),
+            artikel_id: Some(17855291),
+            eenheid_id: Some(2552113),
+        }]);
+        let built = abonnement_gewijzigd(&args, &now, &extra, &items, &books()).unwrap();
+        let changes = &built.body["factuurItems"];
+        assert_eq!(changes["update"], json!([]));
+        assert_eq!(changes["delete"], json!([]));
+        assert_eq!(
+            changes["insert"],
+            json!([{"id": -1, "factuurId": 0, "aantal": 9.0, "omschrijving": "Verbleif Pro (Kagerplassen)", "prijs": null,
+                    "btw": "LAAG_VERK_9", "grootboekId": 26852143, "prijsExcl": 5.0, "prijsIncl": 5.45, "kortingIsPerc": true,
+                    "volgorde": 3, "code": "verbleif-pro", "artikelId": 17855291, "eenheidId": 2552113}])
+        );
+        // The subscription goes back with what e-Boekhouden's form sends too, its e-mail template first of all.
+        let factuur = &built.body["factuur"];
+        assert_eq!(factuur["emailSjabloonId"], 1028438);
+        assert_eq!(factuur["autoVerwerkMethod"], 0);
+        assert_eq!(factuur["tenNameVan"], "Europarcs B.V.");
+        assert_eq!(factuur["inEx"], "EX");
+        let shown: Vec<String> = built
+            .lines
+            .iter()
+            .map(|l| format!("{}: {}", l.label, l.value))
+            .collect();
+        assert!(
+            shown
+                .iter()
+                .any(|l| l.starts_with("Regel 4 komt erbij: 9 x Verbleif Pro (Kagerplassen)")),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(&"Overige regels: 3 blijven zoals ze zijn".to_owned()),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn lines_are_changed_and_removed_by_their_id() {
+        let (now, extra, items) = abonnement_now();
+        let change = |id: u64| FactuurRegelWijzigArg {
+            id,
+            aantal: None,
+            omschrijving: None,
+            prijs: None,
+            btw_code: None,
+            tegenrekening: None,
+            code: None,
+            artikel_id: None,
+            eenheid_id: None,
+        };
+        let mut args = abonnement_edit();
+        args.regels_wijzigen = Some(vec![
+            FactuurRegelWijzigArg {
+                aantal: Some(0.0),
+                ..change(11)
+            },
+            FactuurRegelWijzigArg {
+                prijs: Some(6.0),
+                ..change(12)
+            },
+        ]);
+        args.regels_verwijderen = Some(vec![13]);
+        let built = abonnement_gewijzigd(&args, &now, &extra, &items, &books()).unwrap();
+        let changes = &built.body["factuurItems"];
+        assert_eq!(changes["insert"], json!([]));
+        assert_eq!(changes["delete"], json!([13]));
+        // A changed line goes back whole, as it was read, with only the named field anew.
+        let mut first = items[0].clone();
+        first["aantal"] = json!(0.0);
+        let mut second = items[1].clone();
+        second["prijsExcl"] = json!(6.0);
+        second["prijsIncl"] = json!(6.54);
+        assert_eq!(changes["update"], json!([first, second]));
+        assert_eq!(changes["update"][0]["artikelId"], 17855291);
+        assert_eq!(changes["update"][0]["volgorde"], "0");
+
+        // What cannot be meant is refused before anything goes out.
+        let refused = |edit: &dyn Fn(&mut AbonnementWijzigenArgs)| {
+            let mut args = abonnement_edit();
+            edit(&mut args);
+            abonnement_gewijzigd(&args, &now, &extra, &items, &books()).unwrap_err()
+        };
+        assert!(
+            refused(&|a| a.regels_verwijderen = Some(vec![99])).contains("geen regel met id 99")
+        );
+        assert!(
+            refused(&|a| a.regels_wijzigen = Some(vec![change(11)]))
+                .contains("niets dat anders moet")
+        );
+        assert!(
+            refused(&|a| {
+                a.regels_verwijderen = Some(vec![11]);
+                a.regels_wijzigen = Some(vec![FactuurRegelWijzigArg {
+                    aantal: Some(2.0),
+                    ..change(11)
+                }]);
+            })
+            .contains("twee keer")
+        );
+        assert!(
+            refused(&|a| a.regels_verwijderen = Some(vec![11, 12, 13]))
+                .contains("minstens één regel")
+        );
+        assert!(
+            refused(&|a| {
+                a.regels = Some(vec![factuurregel()]);
+                a.regels_verwijderen = Some(vec![11]);
+            })
+            .contains("niet allebei")
+        );
+        assert!(refused(&|a| a.bedragen = Some(InEx::Incl)).contains("alleen samen met regels"));
+    }
+
+    #[test]
+    fn a_subscription_takes_a_line_with_aantal_zero_and_an_invoice_does_not() {
+        let (now, extra, items) = abonnement_now();
+        let mut zero = factuurregel();
+        zero.aantal = Some(0.0);
+        let mut args = abonnement_edit();
+        args.regels = Some(vec![zero.clone()]);
+        let built = abonnement_gewijzigd(&args, &now, &extra, &items, &books()).unwrap();
+        assert_eq!(built.body["factuurItems"]["insert"][0]["aantal"], 0.0);
+        assert_eq!(built.body["factuurItems"]["delete"], json!([11, 12, 13]));
+
+        let (now, items) = factuur_now();
+        let mut args = FactuurWijzigenArgs {
+            id: 73391389,
+            datum: None,
+            nummer: None,
+            termijn: None,
+            factuurtekst: None,
+            kenmerk: None,
+            bedragen: None,
+            regels: None,
+            regels_toevoegen: Some(vec![zero]),
+            regels_wijzigen: None,
+            regels_verwijderen: None,
+            sjabloon_id: None,
+            account: None,
+        };
+        assert!(
+            factuur_gewijzigd(&args, &now, &items, &books(), None)
+                .unwrap_err()
+                .contains("geen geldig getal")
+        );
+        // An invoice takes a new line the same way; its place follows the line it has.
+        args.regels_toevoegen = Some(vec![factuurregel()]);
+        let body = factuur_gewijzigd(&args, &now, &items, &books(), None)
+            .unwrap()
+            .body;
+        assert_eq!(body["factuurItems"]["insert"][0]["volgorde"], 1);
+        assert_eq!(body["factuurItems"]["delete"], json!([]));
     }
 
     #[test]

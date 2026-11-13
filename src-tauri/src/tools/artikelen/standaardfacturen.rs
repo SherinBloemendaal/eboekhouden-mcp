@@ -540,6 +540,8 @@ mod tests {
             btw_code: btw.into(),
             tegenrekening: "8000".into(),
             code: Some("OND".into()),
+            artikel_id: None,
+            eenheid_id: None,
         }
     }
 

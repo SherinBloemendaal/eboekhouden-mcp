@@ -110,6 +110,8 @@ pub struct Signins {
     /// Locked only while `pending` is held or on its own, never the other way round.
     last: Mutex<HashMap<Uuid, SigninEvent>>,
     traces: Mutex<VecDeque<(Instant, Trace)>>,
+    /// The end state of every sign-in as it ends, for who waits on one (the `inloggen` tool).
+    ended: tokio::sync::broadcast::Sender<SigninEvent>,
 }
 
 impl Default for Signins {
@@ -120,6 +122,7 @@ impl Default for Signins {
             pending: Mutex::default(),
             last: Mutex::default(),
             traces: Mutex::default(),
+            ended: tokio::sync::broadcast::channel(32).0,
         }
     }
 }
@@ -212,9 +215,49 @@ impl Signins {
 
     /// Ends a sign-in: it no longer runs and `event` is its end state, both at once.
     fn finish(&self, event: SigninEvent) {
-        let mut pending = self.pending.lock().unwrap();
-        pending.remove(&event.account_id);
-        self.last.lock().unwrap().insert(event.account_id, event);
+        {
+            let mut pending = self.pending.lock().unwrap();
+            pending.remove(&event.account_id);
+            self.last
+                .lock()
+                .unwrap()
+                .insert(event.account_id, event.clone());
+        }
+        let _ = self.ended.send(event);
+    }
+
+    /// Waits until this account's sign-in ends and gives its end state; `None` when `limit` passes first.
+    /// Call it before starting the sign-in and await it after, so an end that comes at once is not missed.
+    pub fn end_of(
+        &self,
+        id: Uuid,
+        limit: Duration,
+    ) -> impl Future<Output = Option<SigninEvent>> + use<'_> {
+        let mut ended = self.ended.subscribe();
+        async move {
+            let wait = async {
+                loop {
+                    match ended.recv().await {
+                        Ok(event) if event.account_id == id => return Some(event),
+                        Ok(_) => {}
+                        // Too many ends to keep up with: the account's newest step tells whether its own passed.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            if let (false, Some(event)) = self.state_of(id) {
+                                return Some(event);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            };
+            tokio::time::timeout(limit, wait).await.ok().flatten()
+        }
+    }
+
+    /// Ends a sign-in as the real one does, for a test that stands in for e-Boekhouden's login form.
+    #[cfg(test)]
+    pub(crate) fn end_for_test(&self, event: SigninEvent) {
+        self.finish(event);
     }
 
     /// Drops what is known about an account's sign-ins, when the account is removed.
@@ -690,6 +733,28 @@ mod tests {
         assert_eq!(last.message.as_deref(), Some("Studio Noord B.V."));
         signins.forget(id);
         assert!(matches!(signins.state_of(id), (false, None)));
+    }
+
+    #[tokio::test]
+    async fn who_waits_for_a_sign_in_hears_its_end_and_no_other() {
+        let signins = Signins::default();
+        let (mine, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let end = |account_id, step| SigninEvent {
+            account_id,
+            step,
+            message: None,
+        };
+        let waiting = signins.end_of(mine, Duration::from_secs(5));
+        signins.finish(end(other, Step::Failed));
+        signins.finish(end(mine, Step::Done));
+        assert_eq!(waiting.await.unwrap().step, Step::Done);
+        // Nothing ends: the wait gives up at its limit.
+        assert!(
+            signins
+                .end_of(mine, Duration::from_millis(20))
+                .await
+                .is_none()
+        );
     }
 
     #[test]

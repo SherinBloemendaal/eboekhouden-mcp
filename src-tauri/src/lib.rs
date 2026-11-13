@@ -1488,7 +1488,10 @@ pub fn run() {
             }
             app.manage(app_state.clone());
             app.manage(settings.clone());
-            app.manage(Arc::new(Signins::default()));
+            app.manage(app_state.signins.clone());
+            // The `inloggen` tool starts a sign-in exactly as the windows do.
+            let handle = app.handle().clone();
+            app_state.on_sign_in(move |id| start_sign_in(&handle, id));
 
             // The request log is saved when it changed, at most every LOG_SAVE_INTERVAL, and at quit.
             let saving = app_state.clone();

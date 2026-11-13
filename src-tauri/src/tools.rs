@@ -352,6 +352,12 @@ pub struct AkkoordIntrekkenArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct InloggenArgs {
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct IdArgs {
     /// Het id uit een lijst van e-Boekhouden.
     pub id: u64,
@@ -1029,6 +1035,11 @@ fn client_name(context: &RequestContext<RoleServer>) -> String {
         .unwrap_or_else(|| "Onbekende client".into())
 }
 
+/// How long the `inloggen` tool waits for a sign-in before it answers that it still runs. Under the minute
+/// after which some AI clients give up on a tool call; a sign-in itself takes a few seconds, the rest is
+/// the user answering 1Password or Touch ID.
+const SIGN_IN_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// The account a tool call is about. There is no default account: with several accounts a call must name
 /// its own, so an AI client never answers from the wrong books. A single account needs no name.
 fn pick_account(mut accounts: Vec<Account>, name: Option<&str>) -> Result<Account, String> {
@@ -1150,6 +1161,23 @@ impl EbMcp {
         };
         let _ = self.state.events.send(AppEvent::LogChanged);
         answer
+    }
+
+    /// Ends a call that answers from EB MCP itself, not with data from e-Boekhouden.
+    fn done(&self, run: Run, value: Value) -> CallToolResult {
+        self.state
+            .log
+            .finish_mcp(run.id, Outcome::Ok, Some(&value), None);
+        let _ = self.state.events.send(AppEvent::LogChanged);
+        CallToolResult::success(vec![ContentBlock::text(value.to_string())])
+    }
+
+    fn fail(&self, run: Run, message: String) -> CallToolResult {
+        self.state
+            .log
+            .finish_mcp(run.id, Outcome::Error, None, Some(message.clone()));
+        let _ = self.state.events.send(AppEvent::LogChanged);
+        CallToolResult::error(vec![ContentBlock::text(message)])
     }
 
     fn refuse(&self, run: Run, message: String) -> CallToolResult {
@@ -2326,7 +2354,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Welke e-Boekhouden-accounts er in EB MCP staan, welke is ingelogd en wat er per account mag (rechten: boeken en wijzigen, verwijderen, versturen en ingrijpend, elk uit, met akkoord of zonder akkoord). Gebruik dit eerst als er meer dan één account kan zijn, of als een andere tool zegt dat er niemand is ingelogd.",
+        description = "Welke e-Boekhouden-accounts er in EB MCP staan, welke is ingelogd en wat er per account mag (rechten: boeken en wijzigen, verwijderen, versturen en ingrijpend, elk uit, met akkoord of zonder akkoord). Gebruik dit eerst als er meer dan één account kan zijn, of als een andere tool zegt dat er niemand is ingelogd; een account dat niet is ingelogd of verlopen is, log je in met inloggen.",
         annotations(title = "Status", read_only_hint = true, open_world_hint = false)
     )]
     async fn status(&self) -> Result<CallToolResult, McpError> {
@@ -2359,7 +2387,7 @@ impl EbMcp {
             "alleen_lezen": !can_write,
             "accounts": accounts,
             "let_op": if self.state.session_count() == 0 {
-                "Nog niemand ingelogd. Vraag de gebruiker in te loggen via EB MCP in de menubalk."
+                "Nog niemand ingelogd. Log een account in met de tool inloggen, of vraag de gebruiker in te loggen via EB MCP in de menubalk."
             } else if can_write {
                 "Per account staat bij rechten wat er mag, per soort wijziging: boeken_en_wijzigen (toevoegen en wijzigen), verwijderen, versturen (mail, Peppol, het incassobestand, een bericht of opdracht aan de accountant) en ingrijpend (crediteren, in bulk factureren of boeken, afboeken, de beginbalans, bedrijfsgegevens, een btw-aangifte verwerken). Elk staat op uit (de tool weigert), met akkoord (de gebruiker keurt elke wijziging goed in EB MCP) of zonder akkoord; versturen en ingrijpend gaan nooit zonder akkoord. Een wijziging die op akkoord wacht geeft meteen antwoord met een voorstel_id; akkoord_status geeft later de uitkomst."
             } else {
@@ -2465,6 +2493,89 @@ impl EbMcp {
                 }
             )),
         }
+    }
+
+    #[tool(
+        description = "Een account dat in EB MCP staat inloggen bij e-Boekhouden, als status zegt dat het niet is ingelogd of verlopen is, of als een tool antwoordt met Niet ingelogd. EB MCP leest de inloggegevens zelf uit 1Password of de sleutelhanger van de gebruiker; jij krijgt ze niet te zien en geeft ze nooit mee. Het kan zijn dat de gebruiker daarvoor even Touch ID of 1Password moet bevestigen: zeg dat erbij. De tool wacht tot de aanmelding klaar is. Een account toevoegen of zijn gegevens wijzigen kan alleen de gebruiker, in EB MCP onder Accounts. Mislukt het inloggen, probeer het dan niet telkens opnieuw: herhaalde mislukte pogingen kunnen het account bij e-Boekhouden blokkeren. Wat het account mag (rechten) verandert hierdoor niet.",
+        annotations(
+            title = "Inloggen",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn inloggen(
+        &self,
+        Parameters(args): Parameters<InloggenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let run = match self.begin(&context, "inloggen", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let (id, label) = (run.account.id, run.account.label.clone());
+        let answer = |status: &str, let_op: String| {
+            json!({
+                "account": label,
+                "administratie": self.state.accounts.get(id).and_then(|a| a.administration),
+                "status": status,
+                "let_op": let_op,
+            })
+        };
+        let signed_in = || {
+            self.state
+                .sessions()
+                .iter()
+                .any(|s| s.account_id == id && !s.expired)
+        };
+        if signed_in() {
+            let value = answer(
+                "ingelogd",
+                format!("{label} was al ingelogd; er is niet opnieuw ingelogd."),
+            );
+            return Ok(self.done(run, value));
+        }
+        // Listening starts before the sign-in does, so an end that comes at once is heard.
+        let ended = self.state.signins.end_of(id, SIGN_IN_WAIT);
+        if !self.state.start_sign_in(id) {
+            return Ok(self.fail(
+                run,
+                "EB MCP kan nu geen aanmelding starten. Vraag de gebruiker in te loggen via EB MCP in de menubalk.".into(),
+            ));
+        }
+        use crate::signin::Step;
+        Ok(match ended.await {
+            Some(event) if event.step == Step::Done => {
+                let value = answer("ingelogd", format!("{label} is ingelogd bij e-Boekhouden."));
+                self.done(run, value)
+            }
+            Some(event) if event.step == Step::Cancelled => self.fail(
+                run,
+                format!("De gebruiker heeft het inloggen van {label} gestopt in EB MCP. Probeer het niet opnieuw zonder het te vragen."),
+            ),
+            Some(event) => self.fail(
+                run,
+                format!(
+                    "Inloggen bij {label} is mislukt: {}. Probeer het niet telkens opnieuw; laat de gebruiker in EB MCP onder Accounts kijken.",
+                    event
+                        .message
+                        .unwrap_or_else(|| "e-Boekhouden gaf geen reden".into())
+                ),
+            ),
+            // Still running: most likely 1Password or Touch ID waits for the user.
+            None if signed_in() => {
+                let value = answer("ingelogd", format!("{label} is ingelogd bij e-Boekhouden."));
+                self.done(run, value)
+            }
+            None => {
+                let value = answer(
+                    "bezig",
+                    format!("De aanmelding van {label} loopt nog; waarschijnlijk wacht 1Password of Touch ID op de gebruiker. Vraag de gebruiker dat te bevestigen en kijk daarna met status of het account is ingelogd. Start geen tweede aanmelding."),
+                );
+                self.done(run, value)
+            }
+        })
     }
 
     #[tool(
@@ -3150,7 +3261,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een verkoopfactuur wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. De mutatie van een verwerkte factuur volgt vanzelf. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een verkoopfactuur wijzigen, op id. Wat je niet noemt blijft zoals het is. Eén of enkele regels: regels_toevoegen (komt achteraan), regels_wijzigen (op het id van de regel uit factuur) en regels_verwijderen; de andere regels worden dan niet aangeraakt en houden hun artikel, eenheid en volgorde. Met regels vervang je alle regels in één keer: gebruik dat alleen als alles opnieuw moet. De mutatie van een verwerkte factuur volgt vanzelf. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Factuur wijzigen",
             read_only_hint = false,
@@ -3368,7 +3479,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een abonnement wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een abonnement wijzigen, op id. Wat je niet noemt blijft zoals het is. Eén of enkele regels: regels_toevoegen (komt achteraan), regels_wijzigen (op het id van de regel uit abonnement) en regels_verwijderen; de andere regels worden dan niet aangeraakt en houden hun artikel, eenheid en volgorde. Met regels vervang je alle regels in één keer, wat de koppeling met artikel en eenheid van de oude regels weghaalt: gebruik dat alleen als alles opnieuw moet. Een regel mag aantal 0 hebben. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Abonnement wijzigen",
             read_only_hint = false,
@@ -4829,6 +4940,7 @@ impl ServerHandler for EbMcp {
                  Een btw-aangifte, ICP-opgave of suppletie versturen, indienen of betalen kan EB MCP niet: dat doet de gebruiker zelf. \
                  Wel kan btwaangifte_betaallink de iDEAL-link van een verstuurde aangifte opzoeken: toon die link aan de gebruiker om zelf te openen, open of volg hem nooit zelf. \
                  Zegt een tool dat de uitkomst onbekend is (een mail of bestand dat mogelijk al weg is), probeer het dan niet opnieuw maar laat de gebruiker eerst kijken. \
+                 Is een account niet ingelogd of is zijn sessie verlopen, log het dan in met inloggen: EB MCP leest de inloggegevens zelf uit 1Password of de sleutelhanger, de gebruiker bevestigt dat zo nodig met Touch ID, en jij ziet ze nooit. Mislukt dat, probeer het niet telkens opnieuw. \
                  Staat er meer dan één account in EB MCP, dan moet elke tool de account-parameter meekrijgen; status zegt welke accounts er zijn.",
             )
     }
@@ -5063,7 +5175,7 @@ mod tests {
     fn counts_its_tools_on_the_router() {
         // The tools of this file, plus what each part names in its own module.
         let [reads, writes, _] = part_tools();
-        assert_eq!(tool_count(), 56 + reads.len() + writes.len());
+        assert_eq!(tool_count(), 57 + reads.len() + writes.len());
     }
 
     #[test]

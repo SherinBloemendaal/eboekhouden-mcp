@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -87,6 +87,10 @@ pub struct AppState {
     pub events: broadcast::Sender<AppEvent>,
     /// Set while EB MCP gets ready to restart into an update: new tool calls are refused.
     updating: AtomicBool,
+    /// The sign-ins that run and how the last one of each account ended (signin.rs).
+    pub signins: Arc<crate::signin::Signins>,
+    /// Starts a sign-in the way the app's own button does. Set once the app runs (lib.rs).
+    sign_in: OnceLock<Box<dyn Fn(Uuid) + Send + Sync>>,
 }
 
 pub fn now_ms() -> u64 {
@@ -108,6 +112,24 @@ impl AppState {
             sessions: RwLock::new(HashMap::new()),
             events,
             updating: AtomicBool::new(false),
+            signins: Arc::default(),
+            sign_in: OnceLock::new(),
+        }
+    }
+
+    /// How a sign-in is started from outside the app's own windows (the `inloggen` tool). Set once.
+    pub fn on_sign_in(&self, start: impl Fn(Uuid) + Send + Sync + 'static) {
+        let _ = self.sign_in.set(Box::new(start));
+    }
+
+    /// Starts a sign-in of this account; `false` when the app is not there to run one.
+    pub fn start_sign_in(&self, account_id: Uuid) -> bool {
+        match self.sign_in.get() {
+            Some(start) => {
+                start(account_id);
+                true
+            }
+            None => false,
         }
     }
 
@@ -628,7 +650,7 @@ fn not_signed_in(path: &str, query: &[(String, String)], label: &str) -> ApiCall
         rows: None,
         json: None,
         error: Some(format!(
-            "Niet ingelogd bij {label}. Log in via EB MCP in de menubalk."
+            "Niet ingelogd bij {label}. Log in met de tool inloggen, of via EB MCP in de menubalk."
         )),
     }
 }

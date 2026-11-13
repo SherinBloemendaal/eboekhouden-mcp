@@ -287,6 +287,7 @@ mod tests {
             "kvk_adres",
             "akkoord_status",
             "akkoord_intrekken",
+            "inloggen",
         ] {
             assert!(names.contains(&want), "{want} missing from {names:?}");
         }
@@ -305,6 +306,8 @@ mod tests {
         let writes = [
             // Changes nothing in the books, but takes a proposal out of EB MCP's queue: not a read.
             "akkoord_intrekken",
+            // Changes nothing in the books either, but opens a session with e-Boekhouden.
+            "inloggen",
             "mutatie_toevoegen",
             "mutatie_wijzigen",
             "archief_uploaden",
@@ -878,6 +881,129 @@ mod tests {
                 "ingetrokken",
             ]
         );
+    }
+
+    /// `inloggen` starts the sign-in the app's own button starts, waits for its end and tells how it went.
+    #[tokio::test]
+    async fn the_inloggen_tool_signs_an_account_in_and_reports_how_it_went() {
+        use crate::accounts::{AccountInput, Rights, Store};
+        use crate::signin::{SigninEvent, Step};
+        let jar = Arc::new(crate::state::testing::FakeJar::default());
+        let state = Arc::new(crate::state::testing::state_with(jar, "http://127.0.0.1:9"));
+        let account = state
+            .accounts
+            .add(AccountInput {
+                label: "Studio Noord".into(),
+                username: "lisa@studionoord.example".into(),
+                store: Store::System,
+                op_ref: None,
+                op_title: None,
+                op_vault: None,
+                rights: Rights::OFF,
+            })
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mcp = router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
+        tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{PATH}");
+        let post = |body: serde_json::Value, session: Option<String>| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&body);
+            if let Some(s) = session {
+                request = request.header("mcp-session-id", s);
+            }
+            request.send()
+        };
+        let init = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        let inloggen = || {
+            let request = post(
+                serde_json::json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "inloggen", "arguments": {}}}),
+                session.clone(),
+            );
+            async move { answer_of(request.await.unwrap().text().await.unwrap()) }
+        };
+
+        // Without the app around it there is nothing to start a sign-in with.
+        let (error, text) = inloggen().await;
+        assert!(
+            error && text.contains("kan nu geen aanmelding starten"),
+            "{text}"
+        );
+
+        // The app's sign-in, stood in for: it ends the way `outcome` says, and a good one leaves a session.
+        let outcome = Arc::new(std::sync::Mutex::new(Step::Failed));
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (weak, how, count) = (Arc::downgrade(&state), outcome.clone(), started.clone());
+        state.on_sign_in(move |id| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let state = weak.upgrade().unwrap();
+            let step = *how.lock().unwrap();
+            let message = match step {
+                Step::Done => {
+                    state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
+                    state.add_session(id, "Studio Noord", "sessie");
+                    None
+                }
+                Step::Failed => Some("De gebruikersnaam of het wachtwoord klopt niet".to_owned()),
+                _ => None,
+            };
+            state.signins.end_for_test(SigninEvent {
+                account_id: id,
+                step,
+                message,
+            });
+        });
+
+        let (error, text) = inloggen().await;
+        assert!(error, "{text}");
+        assert!(
+            text.contains("is mislukt: De gebruikersnaam of het wachtwoord klopt niet"),
+            "{text}"
+        );
+        assert!(text.contains("niet telkens opnieuw"), "{text}");
+
+        *outcome.lock().unwrap() = Step::Cancelled;
+        let (error, text) = inloggen().await;
+        assert!(error && text.contains("gestopt"), "{text}");
+
+        *outcome.lock().unwrap() = Step::Done;
+        let (error, text) = inloggen().await;
+        assert!(!error, "{text}");
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["status"], "ingelogd");
+        assert_eq!(value["account"], "Studio Noord");
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // Signed in already: no second sign-in is started.
+        let (error, text) = inloggen().await;
+        assert!(!error && text.contains("was al ingelogd"), "{text}");
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(state.sign_out(account.id, "test"));
+
+        // No answer and no secret of the account reaches the client.
+        assert!(!text.contains("jwt") && !text.contains("lisa@"), "{text}");
     }
 
     /// The JSON-RPC answer in a body that is plain JSON or server-sent events: whether it is an error, and its text.
