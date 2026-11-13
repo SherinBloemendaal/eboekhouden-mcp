@@ -21,7 +21,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::accounts::{Store, WriteMode};
+use crate::accounts::{Rights, Store};
 use crate::reqlog::{self, Entry, MASK, RequestLog, Snapshot};
 use crate::signin::Trace;
 
@@ -152,7 +152,7 @@ pub struct ExportAccount {
     pub label: String,
     pub administration: Option<String>,
     pub store: Store,
-    pub write: WriteMode,
+    pub rights: Rights,
     pub signed_in: bool,
 }
 
@@ -681,7 +681,7 @@ mod tests {
             label: "Studio Noord".into(),
             administration: Some("Studio Noord B.V.".into()),
             store: Store::OnePassword,
-            write: WriteMode::Ask,
+            rights: Rights::ASK,
             signed_in: true,
         }];
         let traces = [Trace {
@@ -733,12 +733,15 @@ mod tests {
         assert_eq!(account["label"], "Studio Noord");
         assert_eq!(account["administration"], "Studio Noord B.V.");
         assert_eq!(account["store"], "onePassword");
-        assert_eq!(account["write"], "ask");
+        assert_eq!(
+            account["rights"],
+            json!({"change": "ask", "delete": "ask", "send": "ask", "heavy": "ask"})
+        );
         assert_eq!(account["signedIn"], true);
         assert_eq!(
             account.as_object().unwrap().len(),
             5,
-            "label, administration, store, write and signedIn only"
+            "label, administration, store, rights and signedIn only"
         );
         assert_eq!(lines[1]["type"], "signinTrace");
         assert_eq!(lines[2]["type"], "stats");

@@ -2,7 +2,7 @@
 //! MCP against a stand-in for e-Boekhouden, where a change reaches the stand-in only after the user approves.
 
 use super::*;
-use crate::accounts::{AccountInput, Store, WriteMode};
+use crate::accounts::{AccountInput, Rights, Store};
 use std::sync::{Arc, Mutex, RwLock};
 
 // ---------------------------------------------------------------- the pure part
@@ -1393,7 +1393,7 @@ struct Harness {
 }
 
 impl Harness {
-    async fn start(mode: WriteMode) -> Self {
+    async fn start(mode: Rights) -> Self {
         let seen: Seen = Arc::default();
         let flags: Flags = Arc::default();
         let jar = Arc::new(crate::state::testing::FakeJar::default());
@@ -1430,7 +1430,7 @@ impl Harness {
         harness
     }
 
-    fn input(mode: WriteMode) -> AccountInput {
+    fn input(mode: Rights) -> AccountInput {
         AccountInput {
             label: "Atelier Zuid".into(),
             username: "lisa@atelierzuid.example".into(),
@@ -1438,11 +1438,11 @@ impl Harness {
             op_ref: None,
             op_title: None,
             op_vault: None,
-            write: mode,
+            rights: mode,
         }
     }
 
-    fn set_write(&self, mode: WriteMode) {
+    fn set_write(&self, mode: Rights) {
         self.state
             .accounts
             .update(self.account, Self::input(mode))
@@ -1552,7 +1552,7 @@ fn shown(proposal: &crate::approvals::Proposal, label: &str) -> String {
 #[tokio::test]
 async fn following_up_a_quote_goes_out_only_after_approval() {
     use crate::approvals::Status;
-    let h = Harness::start(WriteMode::Ask).await;
+    let h = Harness::start(Rights::ASK).await;
 
     // Bad input is refused before anything is asked or sent.
     let (is_error, text) = h
@@ -1601,7 +1601,7 @@ async fn following_up_a_quote_goes_out_only_after_approval() {
     assert_eq!(changes[0].2["vanEmail"], "offertes@atelierzuid.example");
 
     // Mail always asks, also for an account that needs no approval; progress does not.
-    h.set_write(WriteMode::Auto);
+    h.set_write(Rights::AUTO);
     let proposal = h
         .waits(
             "offerte_mailen",
@@ -1625,7 +1625,7 @@ async fn following_up_a_quote_goes_out_only_after_approval() {
             json!({"offerteId": 7, "onderwerp": "Akkoord per mail", "voortgangsoortId": 2})
         )
     );
-    h.set_write(WriteMode::Ask);
+    h.set_write(Rights::ASK);
 
     // Progress of another quote is never touched; removing asks always.
     let (is_error, text) = h
@@ -1696,7 +1696,7 @@ async fn following_up_a_quote_goes_out_only_after_approval() {
 #[tokio::test]
 async fn the_agenda_of_a_quote_end_to_end() {
     use crate::approvals::Status;
-    let h = Harness::start(WriteMode::Ask).await;
+    let h = Harness::start(Rights::ASK).await;
     let (is_error, text) = h.call("offerte_agenda", json!({"offerte_id": 7})).await;
     assert!(!is_error, "{text}");
     let value: Value = serde_json::from_str(&text).unwrap();
@@ -1784,7 +1784,7 @@ async fn the_agenda_of_a_quote_end_to_end() {
 #[tokio::test]
 async fn invoice_mail_sends_the_filled_text_that_was_shown() {
     use crate::approvals::Status;
-    let h = Harness::start(WriteMode::Ask).await;
+    let h = Harness::start(Rights::ASK).await;
 
     // factuur_mailen: own text with a code is refused; a template for quotes only is refused.
     let (is_error, text) = h
@@ -1910,7 +1910,7 @@ async fn invoice_mail_sends_the_filled_text_that_was_shown() {
 #[tokio::test]
 async fn peppol_and_incasso_ask_always_and_check_again_after_approval() {
     use crate::approvals::Status;
-    let h = Harness::start(WriteMode::Auto).await;
+    let h = Harness::start(Rights::AUTO).await;
 
     // Peppol: always asked, refused sends nothing, the invoice's id is the body.
     let proposal = h.waits("peppol_versturen", json!({"id": 12})).await;
@@ -2016,7 +2016,7 @@ async fn peppol_and_incasso_ask_always_and_check_again_after_approval() {
 #[tokio::test]
 async fn unlinking_printing_and_the_codes() {
     use crate::approvals::Status;
-    let h = Harness::start(WriteMode::Auto).await;
+    let h = Harness::start(Rights::AUTO).await;
     // Unlinking from a mutatie needs no question on an account without approval, and removes only that link.
     let (is_error, text) = h
         .call(
@@ -2070,7 +2070,7 @@ async fn unlinking_printing_and_the_codes() {
     let (is_error, text) = h.call("emailsjabloon_codes", json!({})).await;
     assert!(!is_error && text.contains("[FACTNUMMER]"), "{text}");
     assert_eq!(h.changes().len(), 4, "reading changes nothing");
-    h.set_write(WriteMode::Off);
+    h.set_write(Rights::OFF);
     let (is_error, text) = h.call("peppol_versturen", json!({"id": 12})).await;
     assert!(is_error && text.contains("alleen-lezen"), "{text}");
     assert_eq!(h.changes().len(), 4);

@@ -540,7 +540,7 @@ mod end_to_end {
 
     use serde_json::{Value, json};
 
-    use crate::accounts::{AccountInput, Store, WriteMode};
+    use crate::accounts::{AccountInput, Rights, Store};
     use crate::state::AppState;
 
     /// What the stand-in for e-Boekhouden was sent: method and path, with the query for a read, and the body.
@@ -702,7 +702,7 @@ mod end_to_end {
         panic!("proposal {id} did not settle");
     }
 
-    fn input(mode: WriteMode) -> AccountInput {
+    fn input(mode: Rights) -> AccountInput {
         AccountInput {
             label: "Studio Noord".into(),
             username: "lisa@studionoord.example".into(),
@@ -710,7 +710,7 @@ mod end_to_end {
             op_ref: None,
             op_title: None,
             op_vault: None,
-            write: mode,
+            rights: mode,
         }
     }
 
@@ -724,7 +724,7 @@ mod end_to_end {
             jar,
             &eboekhouden(seen.clone(), answers.clone()).await,
         ));
-        let account = state.accounts.add(input(WriteMode::Off)).unwrap();
+        let account = state.accounts.add(input(Rights::OFF)).unwrap();
         state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
         state.add_session(account.id, &account.label, "sessie");
         let client = Client::start(state.clone()).await;
@@ -804,7 +804,7 @@ mod end_to_end {
         // An account that needs no approval for ordinary changes still asks before e-mail goes out.
         state
             .accounts
-            .update(account.id, input(WriteMode::Auto))
+            .update(account.id, input(Rights::AUTO))
             .unwrap();
         let (is_error, text) = client.call("aanmaning_versturen", reminder.clone()).await;
         assert!(!is_error, "{text}");
@@ -943,7 +943,7 @@ mod end_to_end {
         // With approval asked for every change: marking as read waits too, and a refused check request sends nothing.
         state
             .accounts
-            .update(account.id, input(WriteMode::Ask))
+            .update(account.id, input(Rights::ASK))
             .unwrap();
         let (_, text) = client.call("bericht_gelezen", json!({"ids": [31]})).await;
         let id = waiting_id(&text);

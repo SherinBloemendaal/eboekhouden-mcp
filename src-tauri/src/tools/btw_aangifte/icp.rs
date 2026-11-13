@@ -841,7 +841,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een regel van een ICP-opgave verwijderen, op id (uit icp_opgave_openen). Alleen de regels die de gebruiker zelf bijhoudt (rubriek 1a, 1b, 2 en 4), in een opgave die al bestaat: geef het tijdvak waarin icp_opgave_openen de regel liet zien. Dit is niet terug te draaien. Dit verstuurt niets naar de Belastingdienst. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een regel van een ICP-opgave verwijderen, op id (uit icp_opgave_openen). Alleen de regels die de gebruiker zelf bijhoudt (rubriek 1a, 1b, 2 en 4), in een opgave die al bestaat: geef het tijdvak waarin icp_opgave_openen de regel liet zien. Dit is niet terug te draaien. Dit verstuurt niets naar de Belastingdienst. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "ICP-regel verwijderen",
             read_only_hint = false,

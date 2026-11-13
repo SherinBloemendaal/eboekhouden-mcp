@@ -170,7 +170,7 @@ fn in_ex_from(code: &str) -> write::InEx {
 mod tests {
     //! End to end: the tools of this part against a stand-in for e-Boekhouden, through the real MCP server.
     use super::*;
-    use crate::accounts::{AccountInput, Store, WriteMode};
+    use crate::accounts::{AccountInput, Rights, Store};
     use crate::mcp::{PATH, router};
     use axum::extract::{Path, RawQuery};
     use axum::routing::get;
@@ -395,16 +395,16 @@ mod tests {
             jar,
             &eboekhouden(changes.clone()).await,
         ));
-        let input = |mode: WriteMode| AccountInput {
+        let input = |mode: Rights| AccountInput {
             label: "Studio Noord".into(),
             username: "lisa@studionoord.example".into(),
             store: Store::System,
             op_ref: None,
             op_title: None,
             op_vault: None,
-            write: mode,
+            rights: mode,
         };
-        let account = state.accounts.add(input(WriteMode::Ask)).unwrap();
+        let account = state.accounts.add(input(Rights::ASK)).unwrap();
         state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
         state.add_session(account.id, &account.label, "sessie");
 
@@ -499,7 +499,7 @@ mod tests {
         // changes more than this product, so that still asks; the query says how far it goes.
         state
             .accounts
-            .update(account.id, input(WriteMode::Auto))
+            .update(account.id, input(Rights::AUTO))
             .unwrap();
         let (is_error, text) = call(
             "artikel_wijzigen",

@@ -9,7 +9,7 @@ import Icon from '../components/Icon.vue'
 import Sheet from '../components/Sheet.vue'
 import SigninSteps from '../components/SigninSteps.vue'
 import {
-  cancelSignIn, connect, dismissSignin, getSettings, isRunning, opLabel, removeAccount, sessionAge, signIn, signInAll, signingIn, signOut, store, WRITE_MODES,
+  cancelSignIn, connect, dismissSignin, getSettings, isRunning, opLabel, removeAccount, sessionAge, signIn, signInAll, signingIn, signOut, store, rightsChip, rightsText,
   type AccountView,
 } from '../lib/accounts'
 import { unlockName } from '../lib/server'
@@ -48,10 +48,6 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => clearInterval(tick))
 
-/** The account's write setting in words, for the chip's tooltip. */
-function writeLabel(account: AccountView): string {
-  return WRITE_MODES.find((m) => m.value === account.write)?.hint ?? ''
-}
 
 const idleText = computed(() => (idleMinutes.value === 60 ? '1 uur' : idleMinutes.value === 240 ? '4 uur' : `${idleMinutes.value} minuten`))
 
@@ -157,7 +153,7 @@ function sessionText(account: AccountView): { tone: string; text: string } {
         <span class="who">
           <Avatar :label="account.label" :muted="!account.session" />
           <span class="stack">
-            <span class="name"><span class="name-text" :title="account.label">{{ account.label }}</span><span v-if="account.write !== 'off'" class="chip" :class="account.write === 'auto' ? 'warn' : 'info'" :title="writeLabel(account)">{{ account.write === 'auto' ? 'Boekt zelf' : 'Boekt met akkoord' }}</span></span>
+            <span class="name"><span class="name-text" :title="account.label">{{ account.label }}</span><span v-if="rightsChip(account.rights)" class="chip" :class="rightsChip(account.rights)!.tone" :title="rightsText(account.rights)">{{ rightsChip(account.rights)!.label }}</span></span>
             <span class="sub" :title="account.store === 'onePassword' ? account.username || opLabel(account) : account.username">{{ account.store === 'onePassword' ? account.username || opLabel(account) : account.username }}</span>
           </span>
         </span>

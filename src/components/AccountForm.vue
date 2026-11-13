@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Add or edit an account. Passwords go straight to the system store; the app keeps none.
 import { computed, reactive, ref } from 'vue'
-import { addAccount, updateAccount, WRITE_MODES, type AccountView, type OpItem, type StoreKind, type WriteMode } from '../lib/accounts'
+import { addAccount, KINDS, LEVEL_LABELS, presetOf, PRESETS, updateAccount, type AccountView, type Kind, type Level, type OpItem, type Rights, type StoreKind } from '../lib/accounts'
 import { unlockName } from '../lib/server'
 import Icon from './Icon.vue'
 import OpItemPicker from './OpItemPicker.vue'
@@ -19,9 +19,14 @@ const form = reactive({
   opVault: props.account?.opVault ?? null as string | null,
   username: props.account?.store === 'system' ? props.account.username : '',
   password: '',
-  write: (props.account?.write ?? 'off') as WriteMode,
+  rights: { ...(props.account?.rights ?? PRESETS[0]!.rights) } as Rights,
 })
-const writeHint = computed(() => WRITE_MODES.find((m) => m.value === form.write)?.hint ?? '')
+/** The preset the four levels add up to, if any; set by hand they are an own choice. */
+const preset = computed(() => presetOf(form.rights))
+const rightsHint = computed(() => preset.value?.hint ?? 'Eigen instelling: per soort wijziging hieronder.')
+function setLevel(kind: Kind, level: Level) {
+  form.rights[kind] = level
+}
 const error = ref<string | null>(null)
 const busy = ref(false)
 const showPassword = ref(false)
@@ -80,7 +85,7 @@ async function save() {
     opRef: form.store === 'onePassword' ? form.opRef : null,
     opTitle: form.store === 'onePassword' ? form.opTitle : null,
     opVault: form.store === 'onePassword' ? form.opVault : null,
-    write: form.write,
+    rights: { ...form.rights },
   }
   try {
     const password = form.store === 'system' && form.password ? form.password : null
@@ -172,12 +177,30 @@ async function save() {
           </div>
         </div>
       </Transition>
-      <div class="field-block" role="radiogroup" aria-label="AI-clients mogen in dit account">
+      <div class="field-block">
         <span class="label">AI-clients mogen in dit account</span>
-        <div class="seg">
-          <button v-for="mode in WRITE_MODES" :key="mode.value" type="button" role="radio" :aria-checked="form.write === mode.value" :class="{ on: form.write === mode.value }" @click="form.write = mode.value">{{ mode.label }}</button>
+        <div class="seg" role="radiogroup" aria-label="AI-clients mogen in dit account">
+          <button v-for="p in PRESETS" :key="p.id" type="button" role="radio" :aria-checked="preset?.id === p.id" :class="{ on: preset?.id === p.id }" @click="form.rights = { ...p.rights }">{{ p.label }}</button>
         </div>
-        <span class="hint">{{ writeHint }}</span>
+        <span class="hint">{{ rightsHint }}</span>
+        <div class="rights">
+          <div v-for="k in KINDS" :key="k.kind" class="right" :class="{ off: form.rights[k.kind] === 'off' }">
+            <span class="right-text">
+              <span class="right-name">{{ k.label }}</span>
+              <span class="hint">{{ k.hint }}</span>
+            </span>
+            <div class="seg small" role="radiogroup" :aria-label="k.label">
+              <button v-for="level in k.levels" :key="level" type="button" role="radio" :aria-checked="form.rights[k.kind] === level" :class="{ on: form.rights[k.kind] === level, free: level === 'auto' }" @click="setLevel(k.kind, level)">{{ LEVEL_LABELS[level] }}</button>
+            </div>
+          </div>
+        </div>
+        <Transition name="accordion">
+          <div v-if="form.rights.delete === 'auto'" class="accordion fields">
+            <div class="fields-inner">
+              <p class="note bad" role="status">Verwijderen zonder akkoord: een AI-client kan iets weghalen zonder dat jij het eerst ziet, en dat komt niet terug.</p>
+            </div>
+          </div>
+        </Transition>
       </div>
       <p v-if="!editing" class="hint">Bij Opslaan logt EB MCP op de achtergrond één keer in, om de gegevens te controleren en de administratienaam op te halen.</p>
       <p v-if="error" class="note bad rise" role="alert">{{ error }}</p>
@@ -204,6 +227,15 @@ async function save() {
 .seg button { height: 24px; padding: 0 12px; border: 0; border-radius: 999px; background: transparent; font-size: 12px; transition: background-color 180ms var(--ease), box-shadow 180ms var(--ease); }
 .seg button:hover { background: var(--hover); }
 .seg button.on { background: var(--seg-on); box-shadow: var(--seg-on-shadow); font-weight: 500; }
+.seg.small { align-self: center; flex: none; }
+.seg.small button { height: 22px; padding: 0 10px; font-size: 11.5px; transition: background-color 180ms var(--ease), box-shadow 180ms var(--ease), color 180ms var(--ease); }
+.seg.small button.free.on { color: var(--danger); }
+.rights { display: flex; flex-direction: column; margin-top: 4px; border-radius: 10px; background: var(--sunken); box-shadow: inset 0 0 0 0.5px var(--field); }
+.right { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 9px 10px 9px 12px; }
+.right + .right { box-shadow: inset 0 0.5px 0 var(--field); }
+.right-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.right-name { font-size: 12.5px; font-weight: 500; transition: color 180ms var(--ease); }
+.right.off .right-name { color: var(--label); }
 .options { display: flex; gap: 10px; }
 .option {
   flex: 1; display: flex; gap: 10px; align-items: flex-start; padding: 12px; border: 0; border-radius: 12px; text-align: left;

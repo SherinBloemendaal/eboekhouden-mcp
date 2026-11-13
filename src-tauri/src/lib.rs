@@ -225,25 +225,30 @@ fn account_update(
         return Err("Vul het wachtwoord in voor de sleutelhanger".into());
     }
     let account = app_state.accounts.update(id, input)?;
-    // Writing turned off: whatever this account still had waiting for approval is refused. Other sign-in
+    // A kind of change turned off: what this account still had waiting of that kind is refused. Other sign-in
     // details: what waits was asked for the old ones, so it lapses. The store changed first (approve in
     // tools.rs reads it again after it put a proposal up, so none slips through in between).
     let now = state::now_ms();
-    let ended = if account.write == accounts::WriteMode::Off {
-        app_state.approvals.end_account(
-            id,
-            approvals::Answer::Refused(approvals::REFUSED_READ_ONLY.into()),
-            now,
-        )
-    } else if account.username != before.username || account.op_ref != before.op_ref {
-        app_state.approvals.end_account(
-            id,
-            approvals::Answer::Lapsed(approvals::LAPSED_ACCOUNT_CHANGED.into()),
-            now,
-        )
-    } else {
-        0
-    };
+    let rights = account.rights;
+    let turned_off = app_state.approvals.end_account_where(
+        id,
+        |proposal| {
+            let kind = accounts::Kind::of(&proposal.tool, proposal.danger);
+            (rights.level(kind) == accounts::Level::Off)
+                .then(|| approvals::Answer::Refused(approvals::turned_off(rights, kind)))
+        },
+        now,
+    );
+    let ended = turned_off
+        + if account.username != before.username || account.op_ref != before.op_ref {
+            app_state.approvals.end_account(
+                id,
+                approvals::Answer::Lapsed(approvals::LAPSED_ACCOUNT_CHANGED.into()),
+                now,
+            )
+        } else {
+            0
+        };
     if ended > 0 {
         let _ = app_state.events.send(state::AppEvent::ApprovalsChanged);
     }
@@ -622,7 +627,7 @@ async fn log_export(
             label: account.label,
             administration: account.administration,
             store: account.store,
-            write: account.write,
+            rights: account.rights,
         })
         .collect();
     // Oldest first, like the entries.

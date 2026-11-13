@@ -36,22 +36,188 @@ pub struct Account {
     pub op_vault: Option<String>,
     /// Filled in from e-Boekhouden after a sign-in.
     pub administration: Option<String>,
-    /// Whether AI clients may change this account's books. Off unless the user turns it on.
-    #[serde(default)]
-    pub write: WriteMode,
+    /// What AI clients may do in this account's books besides reading. Nothing unless the user turns it on.
+    /// Before 0.6.0 the file held one setting, `write`; `Rights` reads that too.
+    #[serde(default, alias = "write")]
+    pub rights: Rights,
 }
 
-/// What AI clients may do in an account's books besides reading.
+/// How far AI clients may go with one kind of change.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum WriteMode {
-    /// Read only: every tool that changes something is refused.
+pub enum Level {
+    /// Refused.
     #[default]
     Off,
     /// Each change waits for the user's approval in EB MCP.
     Ask,
-    /// Changes go through at once. Deleting and crediting still ask.
+    /// Goes through at once.
     Auto,
+}
+
+/// The kinds of change the user sets a level for, from what can be put right to what cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// Adding and changing: booking a mutatie, making an invoice, editing a relatie. Can be put right afterwards.
+    Change,
+    /// Deleting. What is gone stays gone.
+    Delete,
+    /// Mail, Peppol, the incassobestand, a message to the accountant: it leaves e-Boekhouden.
+    Send,
+    /// Reaches further than one record: crediting, invoicing or booking in bulk, writing off, the beginbalans,
+    /// company details, processing a btw-aangifte, and a change that moves where money or mail goes.
+    Heavy,
+}
+
+/// The tools that send something out of e-Boekhouden.
+pub const SENDS: [&str; 8] = [
+    "factuur_mailen",
+    "facturen_mailen",
+    "offerte_mailen",
+    "aanmaning_versturen",
+    "peppol_versturen",
+    "incassobestand_maken",
+    "bericht_versturen",
+    "controleopdracht_aanvragen",
+];
+
+impl Kind {
+    pub const ALL: [Kind; 4] = [Kind::Change, Kind::Delete, Kind::Send, Kind::Heavy];
+
+    /// The kind of a tool's change. Deleting and sending follow from the tool; of the others a call is
+    /// `heavier` when the tool says this change reaches further than one record that can be put right.
+    pub fn of(tool: &str, heavier: bool) -> Self {
+        if tool.ends_with("_verwijderen") {
+            Kind::Delete
+        } else if SENDS.contains(&tool) {
+            Kind::Send
+        } else if heavier {
+            Kind::Heavy
+        } else {
+            Kind::Change
+        }
+    }
+
+    /// The most a kind can be set to: what leaves e-Boekhouden or reaches far never goes without approval.
+    pub fn most(self) -> Level {
+        match self {
+            Kind::Change | Kind::Delete => Level::Auto,
+            Kind::Send | Kind::Heavy => Level::Ask,
+        }
+    }
+
+    /// The name in the app, as the object of "staat ... niet toe".
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Change => "boeken en wijzigen",
+            Kind::Delete => "verwijderen",
+            Kind::Send => "versturen",
+            Kind::Heavy => "ingrijpende wijzigingen",
+        }
+    }
+}
+
+/// What AI clients may do in an account's books besides reading: a level per kind of change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Rights {
+    pub change: Level,
+    pub delete: Level,
+    pub send: Level,
+    pub heavy: Level,
+}
+
+impl Rights {
+    /// Read only.
+    pub const OFF: Rights = Rights::all(Level::Off);
+    /// Everything waits for approval.
+    pub const ASK: Rights = Rights::all(Level::Ask);
+    /// Adding and changing go through at once; the rest waits for approval.
+    pub const AUTO: Rights = Rights {
+        change: Level::Auto,
+        ..Rights::ASK
+    };
+
+    const fn all(level: Level) -> Self {
+        Rights {
+            change: level,
+            delete: level,
+            send: level,
+            heavy: level,
+        }
+    }
+
+    pub fn level(&self, kind: Kind) -> Level {
+        match kind {
+            Kind::Change => self.change,
+            Kind::Delete => self.delete,
+            Kind::Send => self.send,
+            Kind::Heavy => self.heavy,
+        }
+    }
+
+    /// Whether every kind of change is refused.
+    pub fn read_only(&self) -> bool {
+        Kind::ALL.iter().all(|&k| self.level(k) == Level::Off)
+    }
+
+    /// The same rights with no kind set above its most.
+    fn capped(self) -> Self {
+        let cap = |kind: Kind| match (self.level(kind), kind.most()) {
+            (Level::Auto, Level::Ask) => Level::Ask,
+            (level, _) => level,
+        };
+        Rights {
+            change: cap(Kind::Change),
+            delete: cap(Kind::Delete),
+            send: cap(Kind::Send),
+            heavy: cap(Kind::Heavy),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Rights {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The one setting from before 0.6.0.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        enum Before {
+            Off,
+            Ask,
+            Auto,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Now {
+            #[serde(default)]
+            change: Level,
+            #[serde(default)]
+            delete: Level,
+            #[serde(default)]
+            send: Level,
+            #[serde(default)]
+            heavy: Level,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Stored {
+            Before(Before),
+            Now(Now),
+        }
+        Ok(match Stored::deserialize(deserializer)? {
+            Stored::Before(Before::Off) => Rights::OFF,
+            Stored::Before(Before::Ask) => Rights::ASK,
+            // "Boeken zonder akkoord" always asked for deleting, sending and what reaches far.
+            Stored::Before(Before::Auto) => Rights::AUTO,
+            Stored::Now(now) => Rights {
+                change: now.change,
+                delete: now.delete,
+                send: now.send,
+                heavy: now.heavy,
+            }
+            .capped(),
+        })
+    }
 }
 
 /// What the UI sends to add or change an account.
@@ -67,7 +233,7 @@ pub struct AccountInput {
     #[serde(default)]
     pub op_vault: Option<String>,
     #[serde(default)]
-    pub write: WriteMode,
+    pub rights: Rights,
 }
 
 pub struct AccountStore {
@@ -168,7 +334,7 @@ impl AccountStore {
             op_title: input.op_title,
             op_vault: input.op_vault,
             administration: None,
-            write: input.write,
+            rights: input.rights,
         };
         accounts.push(account.clone());
         self.save(&accounts)?;
@@ -188,7 +354,7 @@ impl AccountStore {
         account.op_ref = input.op_ref;
         account.op_title = input.op_title;
         account.op_vault = input.op_vault;
-        account.write = input.write;
+        account.rights = input.rights;
         let updated = account.clone();
         self.save(&accounts)?;
         Ok(updated)
@@ -287,7 +453,7 @@ mod tests {
             op_ref: None,
             op_title: None,
             op_vault: None,
-            write: WriteMode::Off,
+            rights: Rights::OFF,
         }
     }
 
@@ -316,7 +482,7 @@ mod tests {
             op_ref: Some("op://Werk".into()),
             op_title: None,
             op_vault: None,
-            write: WriteMode::Off,
+            rights: Rights::OFF,
         };
         assert!(store.add(bad_ref).is_err());
         let good_ref = AccountInput {
@@ -326,7 +492,7 @@ mod tests {
             op_ref: Some(" op://Werk/e-Boekhouden Studio Noord ".into()),
             op_title: Some(" e-Boekhouden Studio Noord ".into()),
             op_vault: Some("  ".into()),
-            write: WriteMode::Off,
+            rights: Rights::OFF,
         };
         let added = store.add(good_ref).unwrap();
         assert_eq!(
@@ -343,7 +509,7 @@ mod tests {
             op_ref: Some("op://abcvault123/xyzitem456".into()),
             op_title: Some("e-Boekhouden".into()),
             op_vault: Some("Werk".into()),
-            write: WriteMode::Off,
+            rights: Rights::OFF,
         };
         assert!(store.add(by_id).is_ok());
         // Accounts written before these fields existed, and with the default mark of 0.1.12 and older, still load.
@@ -392,6 +558,68 @@ mod tests {
         let (store, notice) = AccountStore::open_or_recover(&dir()).unwrap();
         assert!(store.list().is_empty());
         assert_eq!(notice, None);
+    }
+
+    #[test]
+    fn the_one_setting_from_before_becomes_a_level_per_kind() {
+        let read = |text: &str| serde_json::from_str::<Rights>(text).unwrap();
+        assert_eq!(read("\"off\""), Rights::OFF);
+        assert_eq!(read("\"ask\""), Rights::ASK);
+        // Boeken zonder akkoord never let deleting, sending or a far-reaching change through unasked.
+        assert_eq!(read("\"auto\""), Rights::AUTO);
+        assert_eq!(Rights::AUTO.delete, Level::Ask);
+
+        // An account file from before: the key was `write`.
+        let dir = dir();
+        fs::write(
+            dir.join("accounts.json"),
+            r#"[{"id":"6d2f0a50-0f0b-4a57-9d0b-0a1f6a2b3c4d","label":"Atelier Zuid","username":"lisa@atelierzuid.example",
+                "store":"system","opRef":null,"administration":null,"write":"auto"}]"#,
+        )
+        .unwrap();
+        let store = AccountStore::open(&dir).unwrap();
+        assert_eq!(store.list()[0].rights, Rights::AUTO);
+        // And one from before there was any setting reads nothing but.
+        assert_eq!(read("{}"), Rights::OFF);
+    }
+
+    #[test]
+    fn what_leaves_or_reaches_far_never_goes_without_approval() {
+        let rights: Rights = serde_json::from_str(
+            r#"{"change":"auto","delete":"auto","send":"auto","heavy":"auto"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rights,
+            Rights {
+                change: Level::Auto,
+                delete: Level::Auto,
+                send: Level::Ask,
+                heavy: Level::Ask
+            }
+        );
+        // Saved and read again, the levels are the same.
+        let text = serde_json::to_string(&rights).unwrap();
+        assert_eq!(serde_json::from_str::<Rights>(&text).unwrap(), rights);
+        assert!(Rights::OFF.read_only());
+        assert!(
+            !Rights {
+                delete: Level::Ask,
+                ..Rights::OFF
+            }
+            .read_only()
+        );
+    }
+
+    #[test]
+    fn a_tool_falls_under_one_kind() {
+        assert_eq!(Kind::of("mutatie_toevoegen", false), Kind::Change);
+        assert_eq!(Kind::of("relatie_wijzigen", true), Kind::Heavy);
+        // Deleting and sending follow from the tool, whatever the call says.
+        assert_eq!(Kind::of("archief_verwijderen", false), Kind::Delete);
+        assert_eq!(Kind::of("mutatie_verwijderen", true), Kind::Delete);
+        assert_eq!(Kind::of("factuur_mailen", true), Kind::Send);
+        assert_eq!(Kind::of("factuur_crediteren", true), Kind::Heavy);
     }
 
     #[test]

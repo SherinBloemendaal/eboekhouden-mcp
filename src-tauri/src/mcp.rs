@@ -439,7 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_change_waits_for_the_user_and_goes_out_only_when_approved() {
-        use crate::accounts::{AccountInput, Store, WriteMode};
+        use crate::accounts::{AccountInput, Rights, Store};
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let jar = Arc::new(crate::state::testing::FakeJar::default());
         let state = Arc::new(crate::state::testing::state_with(
@@ -455,12 +455,12 @@ mod tests {
                 op_ref: None,
                 op_title: None,
                 op_vault: None,
-                write: WriteMode::Off,
+                rights: Rights::OFF,
             })
             .unwrap();
         state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
         state.add_session(account.id, &account.label, "sessie");
-        let set_write = |mode: WriteMode| {
+        let set_write = |mode: Rights| {
             state
                 .accounts
                 .update(
@@ -472,7 +472,7 @@ mod tests {
                         op_ref: None,
                         op_title: None,
                         op_vault: None,
-                        write: mode,
+                        rights: mode,
                     },
                 )
                 .unwrap();
@@ -595,7 +595,7 @@ mod tests {
         );
 
         // With approval the call answers at once that the change waits; the user says no: nothing goes out.
-        set_write(WriteMode::Ask);
+        set_write(Rights::ASK);
         // A bank line that is not among the unprocessed ones (a wrong id, or one that was processed already) is
         // refused before the user is asked anything: booking it would put the same money in the books twice.
         let unknown = post(
@@ -759,7 +759,7 @@ mod tests {
         assert_eq!(detail.args["omschrijving"], "Parkeergarage");
 
         // Without approval the booking goes straight through, and the history says so.
-        set_write(WriteMode::Auto);
+        set_write(Rights::AUTO);
         let (is_error, text) = book(5).await;
         assert!(!is_error, "{text}");
         assert!(text.contains("\"mutNr\":3908"), "{text}");
@@ -775,8 +775,39 @@ mod tests {
             "it never waited"
         );
 
+        // The levels are per kind of change. An account that only lets AI clients delete refuses a booking, and
+        // says which kind is off; status names all four.
+        set_write(Rights {
+            delete: crate::accounts::Level::Ask,
+            ..Rights::OFF
+        });
+        let (is_error, text) = book(6).await;
+        assert!(
+            is_error && text.contains("staat boeken en wijzigen niet toe"),
+            "{text}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2, "nothing went out");
+        let (_, status) = answer_of(
+            post(
+                serde_json::json!({"jsonrpc": "2.0", "id": 91, "method": "tools/call", "params": {"name": "status", "arguments": {}}}),
+                session.clone(),
+            )
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        );
+        assert!(
+            status.contains(
+                r#""rechten":{"boeken_en_wijzigen":"uit","ingrijpend":"uit","versturen":"uit","verwijderen":"met akkoord"}"#
+            ) && status.contains(r#""alleen_lezen":false"#),
+            "{status}"
+        );
+        set_write(Rights::AUTO);
+
         // Approved after the account signed out: it fails as "Niet ingelogd", and nothing went out.
-        set_write(WriteMode::Ask);
+        set_write(Rights::ASK);
         let (_, text) = book(6).await;
         let id = waiting_id(&text);
         state.sign_out(account.id, "test");
@@ -800,7 +831,7 @@ mod tests {
         state.add_session(account.id, &account.label, "sessie");
         let (_, text) = book(7).await;
         let id = waiting_id(&text);
-        set_write(WriteMode::Off);
+        set_write(Rights::OFF);
         assert_eq!(
             state.approvals.end_account(
                 account.id,
@@ -994,24 +1025,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn what_cannot_be_undone_always_asks_and_reading_a_template_saves_nothing() {
-        use crate::accounts::{AccountInput, Store, WriteMode};
+    async fn deleting_follows_its_own_level_and_reading_a_template_saves_nothing() {
+        use crate::accounts::{AccountInput, Level, Rights, Store};
         let changes: Changes = Arc::default();
         let jar = Arc::new(crate::state::testing::FakeJar::default());
         let state = Arc::new(crate::state::testing::state_with(
             jar,
             &books_mock(changes.clone()).await,
         ));
-        let input = |mode: WriteMode| AccountInput {
+        let input = |mode: Rights| AccountInput {
             label: "Studio Noord".into(),
             username: "lisa@studionoord.example".into(),
             store: Store::System,
             op_ref: None,
             op_title: None,
             op_vault: None,
-            write: mode,
+            rights: mode,
         };
-        let account = state.accounts.add(input(WriteMode::Off)).unwrap();
+        let account = state.accounts.add(input(Rights::OFF)).unwrap();
         state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
         state.add_session(account.id, &account.label, "sessie");
 
@@ -1116,7 +1147,7 @@ mod tests {
         // An account that needs no approval for ordinary changes still asks before a mutatie is deleted.
         state
             .accounts
-            .update(account.id, input(WriteMode::Auto))
+            .update(account.id, input(Rights::AUTO))
             .unwrap();
         let (is_error, text) = call("mutatie_verwijderen", serde_json::json!({"nr": 16})).await;
         assert!(!is_error, "{text}");
@@ -1159,11 +1190,35 @@ mod tests {
             "{status}"
         );
 
-        // A file nothing hangs on goes without asking on this account; a linked one always asks, with a warning.
+        // Deleting has a level of its own. Set to go without approval, a file is deleted at once.
+        let deleting = |delete: Level| {
+            state
+                .accounts
+                .update(
+                    account.id,
+                    input(Rights {
+                        delete,
+                        ..Rights::AUTO
+                    }),
+                )
+                .unwrap();
+        };
+        deleting(Level::Auto);
         let (is_error, text) =
             call("archief_verwijderen", serde_json::json!({"bestand_id": 1})).await;
         assert!(!is_error, "{text}");
         assert_eq!(made().last().unwrap(), "delete file 1");
+        // Turned off, it is refused by name while booking still goes; nothing is sent.
+        deleting(Level::Off);
+        let (is_error, text) =
+            call("archief_verwijderen", serde_json::json!({"bestand_id": 2})).await;
+        assert!(
+            is_error && text.contains("staat verwijderen niet toe"),
+            "{text}"
+        );
+        assert_eq!(made().len(), 2, "nothing was deleted");
+        // With approval, the file waits, with a warning for what still hangs on it.
+        deleting(Level::Ask);
         let (is_error, text) =
             call("archief_verwijderen", serde_json::json!({"bestand_id": 2})).await;
         assert!(!is_error, "{text}");
@@ -1220,7 +1275,7 @@ mod tests {
         // A changed layout says what changes, and is saved in a new session only after the user's word.
         state
             .accounts
-            .update(account.id, input(WriteMode::Ask))
+            .update(account.id, input(Rights::ASK))
             .unwrap();
         let opmaak = serde_json::json!({"elements": [{"id": 1, "tag": "text", "x": 1, "y": 2, "width": 3, "height": 4, "content": "<h1>FACTUUR 2</h1>"}]});
         let (is_error, text) = call(

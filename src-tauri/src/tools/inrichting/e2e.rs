@@ -9,7 +9,7 @@ use axum::http::{Method, Uri};
 use axum::routing::get;
 use serde_json::{Value, json};
 
-use crate::accounts::{AccountInput, Store, WriteMode};
+use crate::accounts::{AccountInput, Rights, Store};
 use crate::approvals::{Proposal, Record, Status};
 use crate::mcp::{PATH, router};
 use crate::state::AppState;
@@ -152,7 +152,7 @@ struct Harness {
     session: Option<String>,
 }
 
-fn input(mode: WriteMode) -> AccountInput {
+fn input(mode: Rights) -> AccountInput {
     AccountInput {
         label: "Studio Noord".into(),
         username: "lisa@studionoord.example".into(),
@@ -160,7 +160,7 @@ fn input(mode: WriteMode) -> AccountInput {
         op_ref: None,
         op_title: None,
         op_vault: None,
-        write: mode,
+        rights: mode,
     }
 }
 
@@ -172,7 +172,7 @@ impl Harness {
             jar,
             &eboekhouden(seen.clone()).await,
         ));
-        let account = state.accounts.add(input(WriteMode::Off)).unwrap();
+        let account = state.accounts.add(input(Rights::OFF)).unwrap();
         state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
         state.add_session(account.id, &account.label, "sessie");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -214,7 +214,7 @@ impl Harness {
         request.send().await.unwrap()
     }
 
-    fn set_write(&self, mode: WriteMode) {
+    fn set_write(&self, mode: Rights) {
         self.state
             .accounts
             .update(self.account, input(mode))
@@ -296,7 +296,7 @@ async fn an_importregel_goes_out_only_when_approved_and_running_them_always_asks
     assert_eq!(h.state.approvals.count(), 0);
 
     // A rule without any criterion is refused before anything is asked.
-    h.set_write(WriteMode::Ask);
+    h.set_write(Rights::ASK);
     let (is_error, text) = h
         .call(
             "importregel_toevoegen",
@@ -333,7 +333,7 @@ async fn an_importregel_goes_out_only_when_approved_and_running_them_always_asks
     );
 
     // Running all rules books in bulk: it asks even when the account needs no approval.
-    h.set_write(WriteMode::Auto);
+    h.set_write(Rights::AUTO);
     let (is_error, text) = h.call("importregels_verwerken", json!({})).await;
     assert!(!is_error, "{text}");
     let id = waiting_id(&text);
@@ -367,7 +367,7 @@ async fn an_importregel_goes_out_only_when_approved_and_running_them_always_asks
 #[tokio::test]
 async fn a_vast_actief_is_added_after_approval_and_deleting_always_asks() {
     let h = Harness::new().await;
-    h.set_write(WriteMode::Ask);
+    h.set_write(Rights::ASK);
 
     // Reading names the group and the rekeningen.
     let (is_error, text) = h.call("vastactief", json!({"id": 12})).await;
@@ -432,7 +432,7 @@ async fn a_vast_actief_is_added_after_approval_and_deleting_always_asks() {
     assert_eq!(h.state.approvals.count(), 0);
 
     // Without approval otherwise, a plain edit runs and says recalc=false.
-    h.set_write(WriteMode::Auto);
+    h.set_write(Rights::AUTO);
     let (is_error, text) = h
         .call("vastactief_wijzigen", json!({"id": 12, "restwaarde": 100}))
         .await;
@@ -497,7 +497,7 @@ async fn a_vast_actief_is_added_after_approval_and_deleting_always_asks() {
 #[tokio::test]
 async fn booking_depreciations_shows_the_due_lines_and_always_asks() {
     let h = Harness::new().await;
-    h.set_write(WriteMode::Auto);
+    h.set_write(Rights::AUTO);
     let (is_error, text) = h.call("afschrijvingen_boeken", json!({})).await;
     assert!(!is_error, "{text}");
     let id = waiting_id(&text);
@@ -536,7 +536,7 @@ async fn booking_depreciations_shows_the_due_lines_and_always_asks() {
 #[tokio::test]
 async fn an_importregel_edit_keeps_it_off_and_deleting_always_asks() {
     let h = Harness::new().await;
-    h.set_write(WriteMode::Ask);
+    h.set_write(Rights::ASK);
 
     // An extended btw code is not offered while the setting is off.
     let (is_error, text) = h
@@ -592,7 +592,7 @@ async fn an_importregel_edit_keeps_it_off_and_deleting_always_asks() {
 #[tokio::test]
 async fn the_beginbalans_changes_only_in_balance_and_always_asks() {
     let h = Harness::new().await;
-    h.set_write(WriteMode::Auto);
+    h.set_write(Rights::AUTO);
 
     let (is_error, text) = h.call("beginbalans", json!({})).await;
     assert!(!is_error, "{text}");

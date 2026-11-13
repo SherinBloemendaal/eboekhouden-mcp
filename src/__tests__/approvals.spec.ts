@@ -2,7 +2,7 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from '../App.vue'
 import AccountForm from '../components/AccountForm.vue'
-import { store, type AccountView } from '../lib/accounts'
+import { rightsChip, rightsText, store, type AccountView } from '../lib/accounts'
 import {
   ago, approvalState, decisionLabel, filterHistory, followSelection, nameList, proposalKind, quitWarning, refreshApprovals, splitTitle, statusOf, type ApprovalDetail, type ApprovalRecord, type DecideAllResult, type Proposal,
 } from '../lib/approvals'
@@ -833,25 +833,74 @@ describe('the menu-bar panel', () => {
 describe('the write setting of an account', () => {
   const account: AccountView = {
     id: 'a1', label: 'Studio Noord', username: 'jan@studionoord.example', store: 'system', opRef: null, opTitle: null, opVault: null,
-    administration: 'Studio Noord B.V.', write: 'off', session: null, signingIn: false, signin: null,
+    administration: 'Studio Noord B.V.', rights: { change: 'off', delete: 'off', send: 'off', heavy: 'off' }, session: null, signingIn: false, signin: null,
   }
+
+  const ask = { change: 'ask', delete: 'ask', send: 'ask', heavy: 'ask' } as const
+  const levels = (kind: string) => {
+    const group = document.querySelector(`[role="radiogroup"][aria-label="${kind}"]`)!
+    return [...group.querySelectorAll<HTMLButtonElement>('[role="radio"]')]
+  }
+  const checked = (kind: string) => levels(kind).find((o) => o.getAttribute('aria-checked') === 'true')?.textContent
 
   it('is read-only until the user chooses otherwise, and saves the choice', async () => {
     const wrapper = mount(AccountForm, { props: { account }, attachTo: document.body })
     mounted.push(wrapper)
     await flushPromises()
-    const group = document.querySelector('[role="radiogroup"][aria-label="AI-clients mogen in dit account"]')!
-    const options = [...group.querySelectorAll<HTMLButtonElement>('[role="radio"]')]
-    expect(options.map((o) => o.textContent)).toEqual(['Alleen lezen', 'Boeken met akkoord', 'Boeken zonder akkoord'])
-    expect(options.map((o) => o.getAttribute('aria-checked'))).toEqual(['true', 'false', 'false'])
-    expect(group.textContent).toContain('niets wijzigen')
-    options[1]!.click()
+    const block = document.querySelector('.rights')!.parentElement!
+    const presets = levels('AI-clients mogen in dit account')
+    expect(presets.map((o) => o.textContent)).toEqual(['Alleen lezen', 'Alles met akkoord', 'Vrij boeken'])
+    expect(presets.map((o) => o.getAttribute('aria-checked'))).toEqual(['true', 'false', 'false'])
+    expect(block.textContent).toContain('niets wijzigen')
+    expect(['Boeken en wijzigen', 'Verwijderen', 'Versturen', 'Ingrijpend'].map(checked)).toEqual(['Uit', 'Uit', 'Uit', 'Uit'])
+    presets[1]!.click()
     await flushPromises()
-    expect(options[1]!.getAttribute('aria-checked')).toBe('true')
-    expect(group.textContent).toContain('pas na Goedkeuren')
-    invoke.mockImplementation(async (command: string) => (command === 'account_update' ? { ...account, write: 'ask' } : []))
+    expect(presets[1]!.getAttribute('aria-checked')).toBe('true')
+    expect(block.textContent).toContain('pas na Goedkeuren')
+    expect(['Boeken en wijzigen', 'Verwijderen', 'Versturen', 'Ingrijpend'].map(checked)).toEqual(['Met akkoord', 'Met akkoord', 'Met akkoord', 'Met akkoord'])
+    invoke.mockImplementation(async (command: string) => (command === 'account_update' ? { ...account, rights: ask } : []))
     document.querySelector<HTMLFormElement>('#account-form')!.requestSubmit()
     await flushPromises()
-    expect(invoke).toHaveBeenCalledWith('account_update', expect.objectContaining({ id: 'a1', input: expect.objectContaining({ write: 'ask' }) }))
+    expect(invoke).toHaveBeenCalledWith('account_update', expect.objectContaining({ id: 'a1', input: expect.objectContaining({ rights: ask }) }))
+  })
+
+  it('sets each kind of change on its own, and never lets sending or a far-reaching change go without approval', async () => {
+    const wrapper = mount(AccountForm, { props: { account }, attachTo: document.body })
+    mounted.push(wrapper)
+    await flushPromises()
+    const presets = levels('AI-clients mogen in dit account')
+    // Vrij boeken: booking goes at once, the rest still asks.
+    presets[2]!.click()
+    await flushPromises()
+    expect(['Boeken en wijzigen', 'Verwijderen', 'Versturen', 'Ingrijpend'].map(checked)).toEqual(['Zonder akkoord', 'Met akkoord', 'Met akkoord', 'Met akkoord'])
+    expect(levels('Versturen').map((o) => o.textContent)).toEqual(['Uit', 'Met akkoord'])
+    expect(levels('Ingrijpend').map((o) => o.textContent)).toEqual(['Uit', 'Met akkoord'])
+    expect(levels('Verwijderen').map((o) => o.textContent)).toEqual(['Uit', 'Met akkoord', 'Zonder akkoord'])
+    // Deleting off while booking stays free: no preset is that, and the form says it is an own choice.
+    levels('Verwijderen')[0]!.click()
+    await flushPromises()
+    expect(presets.map((o) => o.getAttribute('aria-checked'))).toEqual(['false', 'false', 'false'])
+    expect(document.querySelector('.rights')!.parentElement!.textContent).toContain('Eigen instelling')
+    expect(document.querySelector('.note.bad')).toBeNull()
+    // Deleting without approval comes with a warning.
+    levels('Verwijderen')[2]!.click()
+    await flushPromises()
+    expect(document.querySelector('.note.bad')!.textContent).toContain('komt niet terug')
+    levels('Verwijderen')[0]!.click()
+    await flushPromises()
+    invoke.mockImplementation(async (command: string) => (command === 'account_update' ? account : []))
+    document.querySelector<HTMLFormElement>('#account-form')!.requestSubmit()
+    await flushPromises()
+    expect(invoke).toHaveBeenCalledWith('account_update', expect.objectContaining({ input: expect.objectContaining({ rights: { change: 'auto', delete: 'off', send: 'ask', heavy: 'ask' } }) }))
+  })
+
+  it('names the rights on the account in a few words', () => {
+    expect(rightsChip({ change: 'off', delete: 'off', send: 'off', heavy: 'off' })).toBeNull()
+    expect(rightsChip(ask)).toEqual({ label: 'Boekt met akkoord', tone: 'info' })
+    expect(rightsChip({ ...ask, change: 'auto' })).toEqual({ label: 'Boekt zelf', tone: 'warn' })
+    expect(rightsChip({ ...ask, change: 'auto', delete: 'auto' })).toEqual({ label: 'Boekt en verwijdert zelf', tone: 'warn' })
+    expect(rightsChip({ ...ask, delete: 'auto' })).toEqual({ label: 'Verwijdert zelf', tone: 'warn' })
+    expect(rightsChip({ ...ask, change: 'off' })).toEqual({ label: 'Beperkt met akkoord', tone: 'info' })
+    expect(rightsText({ ...ask, change: 'auto', delete: 'off' })).toBe('Boeken en wijzigen: zonder akkoord · Verwijderen: uit · Versturen: met akkoord · Ingrijpend: met akkoord')
   })
 })

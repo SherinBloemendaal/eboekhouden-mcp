@@ -7,7 +7,7 @@ import Sheet from '../components/Sheet.vue'
 import ClientIcon from '../components/ClientIcon.vue'
 import { CLIENT_NAMES, SERVER_NAMES, usesBridge, clientsStatus, link, otherClientSettings, preview, renewToken, revealToken, unlink, type Client, type ClientStatus, type Preview } from '../lib/connect'
 import { masked, serverInfo, type ServerInfo } from '../lib/server'
-import { connect as watchAccounts, store } from '../lib/accounts'
+import { connect as watchAccounts, readOnly, store } from '../lib/accounts'
 
 const info = ref<ServerInfo | null>(null)
 const clients = ref<ClientStatus[]>([])
@@ -31,7 +31,7 @@ onMounted(load)
 
 // Whether any account lets AI clients change its books: the page says so next to the other safeguards.
 onMounted(() => void watchAccounts())
-const writes = computed(() => store.accounts.some((a) => a.write !== 'off'))
+const writes = computed(() => store.accounts.some((a) => !readOnly(a.rights)))
 
 function flash(what: string) {
   copied.value = what

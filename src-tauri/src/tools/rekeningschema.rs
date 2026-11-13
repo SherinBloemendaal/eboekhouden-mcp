@@ -467,7 +467,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een grootboekrekening uit het rekeningschema verwijderen, op id of code. Dit is niet terug te draaien; staan er nog boekingen op de rekening, dan kan e-Boekhouden weigeren. Wil je hem alleen niet meer gebruiken, zet hem dan op inactief met grootboekrekening_wijzigen. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een grootboekrekening uit het rekeningschema verwijderen, op id of code. Dit is niet terug te draaien; staan er nog boekingen op de rekening, dan kan e-Boekhouden weigeren. Wil je hem alleen niet meer gebruiken, zet hem dan op inactief met grootboekrekening_wijzigen. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Grootboekrekening verwijderen",
             read_only_hint = false,
@@ -579,7 +579,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een rekeninggroep verwijderen, op id (uit rekeninggroepen). Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een rekeninggroep verwijderen, op id (uit rekeninggroepen). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Rekeninggroep verwijderen",
             read_only_hint = false,
@@ -685,7 +685,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een kostenplaats verwijderen, op id (uit kostenplaatsen). Dit is niet terug te draaien; het akkoordvenster noemt de kostenplaatsen die eronder staan. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een kostenplaats verwijderen, op id (uit kostenplaatsen). Dit is niet terug te draaien; het akkoordvenster noemt de kostenplaatsen die eronder staan. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Kostenplaats verwijderen",
             read_only_hint = false,

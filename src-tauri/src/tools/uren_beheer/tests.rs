@@ -1132,7 +1132,7 @@ struct Harness {
     session: Option<String>,
 }
 
-fn account_input(mode: WriteMode) -> crate::accounts::AccountInput {
+fn account_input(mode: Rights) -> crate::accounts::AccountInput {
     crate::accounts::AccountInput {
         label: "Studio Noord".into(),
         username: "lisa@studionoord.example".into(),
@@ -1140,12 +1140,12 @@ fn account_input(mode: WriteMode) -> crate::accounts::AccountInput {
         op_ref: None,
         op_title: None,
         op_vault: None,
-        write: mode,
+        rights: mode,
     }
 }
 
 impl Harness {
-    async fn new(mode: WriteMode) -> Self {
+    async fn new(mode: Rights) -> Self {
         let seen: Seen = Arc::default();
         let reads: Arc<Mutex<Vec<String>>> = Arc::default();
         let overrides: Overrides = Arc::default();
@@ -1354,7 +1354,7 @@ fn families() -> Vec<Family> {
 async fn every_change_waits_for_the_user_and_goes_out_only_when_approved() {
     use crate::approvals::Status;
     for (tool, arguments, (method, path, body), danger) in families() {
-        let h = Harness::new(WriteMode::Ask).await;
+        let h = Harness::new(Rights::ASK).await;
         // The user says no: nothing goes out.
         let (is_error, text) = h.call(tool, arguments.clone()).await;
         assert!(!is_error, "{tool}: {text}");
@@ -1451,14 +1451,14 @@ async fn bad_input_is_refused_before_anything_is_asked_or_sent() {
             "Geen eenheid",
         ),
     ] {
-        let h = Harness::new(WriteMode::Ask).await;
+        let h = Harness::new(Rights::ASK).await;
         let (is_error, text) = h.call(tool, arguments).await;
         assert!(is_error && text.contains(why), "{tool}: {text}");
         assert_eq!(h.state.approvals.count(), 0, "{tool}: nothing was put up");
         assert!(h.sent().is_empty(), "{tool}: nothing went out");
     }
     // A read-only account is refused before anything is read.
-    let h = Harness::new(WriteMode::Off).await;
+    let h = Harness::new(Rights::OFF).await;
     let (is_error, text) = h.call("uur_verwijderen", json!({"id": 7})).await;
     assert!(is_error && text.contains("alleen-lezen"), "{text}");
     assert!(h.reads.lock().unwrap().is_empty());
@@ -1466,7 +1466,7 @@ async fn bad_input_is_refused_before_anything_is_asked_or_sent() {
 
 #[tokio::test]
 async fn without_approval_an_ordinary_change_goes_through_but_a_delete_still_asks() {
-    let h = Harness::new(WriteMode::Auto).await;
+    let h = Harness::new(Rights::AUTO).await;
     h.answer("user/selectlist", Some(json!([{"id": 3, "naam": "Lisa"}])));
     let (is_error, text) = h
         .call(
@@ -1489,7 +1489,7 @@ async fn without_approval_an_ordinary_change_goes_through_but_a_delete_still_ask
     // Writing turned off: refused before anything is asked.
     h.state
         .accounts
-        .update(h.account, account_input(WriteMode::Off))
+        .update(h.account, account_input(Rights::OFF))
         .unwrap();
     let (is_error, _) = h.call("uur_verwijderen", json!({"id": 7})).await;
     assert!(is_error);
@@ -1498,7 +1498,7 @@ async fn without_approval_an_ordinary_change_goes_through_but_a_delete_still_ask
 
 #[tokio::test]
 async fn the_invoicing_list_shows_per_relatie_what_would_be_invoiced() {
-    let h = Harness::new(WriteMode::Ask).await;
+    let h = Harness::new(Rights::ASK).await;
     let (is_error, text) = h
         .call(
             "uren_te_factureren",
@@ -1521,7 +1521,7 @@ async fn the_invoicing_list_shows_per_relatie_what_would_be_invoiced() {
 #[tokio::test]
 async fn invoicing_several_relaties_makes_one_invoice_each_and_finds_inactive_projects() {
     use crate::approvals::Status;
-    let h = Harness::new(WriteMode::Ask).await;
+    let h = Harness::new(Rights::ASK).await;
     // Project 13 is inactive, so project/rel leaves it out: its relatie comes from the project itself.
     h.answer(
         "uur/factureren/gridtable",
@@ -1579,7 +1579,7 @@ async fn invoicing_several_relaties_makes_one_invoice_each_and_finds_inactive_pr
 #[tokio::test]
 async fn hours_changed_while_the_approval_waits_are_not_invoiced() {
     use crate::approvals::Status;
-    let h = Harness::new(WriteMode::Ask).await;
+    let h = Harness::new(Rights::ASK).await;
     let (_, text) = h
         .call(
             "uren_factureren",
@@ -1606,7 +1606,7 @@ async fn hours_changed_while_the_approval_waits_are_not_invoiced() {
     assert!(h.sent().is_empty(), "nothing was invoiced");
 
     // Already invoiced in the meantime: the line is gone from the list.
-    let h = Harness::new(WriteMode::Ask).await;
+    let h = Harness::new(Rights::ASK).await;
     let (_, text) = h
         .call(
             "uren_factureren",
@@ -1624,7 +1624,7 @@ async fn hours_changed_while_the_approval_waits_are_not_invoiced() {
 async fn an_activity_keeps_its_kostenplaats_only_where_the_administration_uses_them() {
     let wijzig = json!({"id": 20, "uurtarief": 85});
     // Cost centres on: the kostenplaats the activity has goes back with the change.
-    let h = Harness::new(WriteMode::Auto).await;
+    let h = Harness::new(Rights::AUTO).await;
     h.answer(
         "setting/administratie.use-kostenplaatsen",
         Some(json!({"key": "administratie.use-kostenplaatsen", "value": "true"})),
@@ -1645,7 +1645,7 @@ async fn an_activity_keeps_its_kostenplaats_only_where_the_administration_uses_t
     );
 
     // Cost centres on but the kostenplaats cannot be read: a plain refusal, nothing sent.
-    let h = Harness::new(WriteMode::Auto).await;
+    let h = Harness::new(Rights::AUTO).await;
     h.answer(
         "setting/administratie.use-kostenplaatsen",
         Some(json!({"value": "true"})),
@@ -1659,7 +1659,7 @@ async fn an_activity_keeps_its_kostenplaats_only_where_the_administration_uses_t
     assert!(h.sent().is_empty());
 
     // Cost centres off: the kostenplaats is not read, and a failing lookup cannot block the change.
-    let h = Harness::new(WriteMode::Auto).await;
+    let h = Harness::new(Rights::AUTO).await;
     h.answer("kostenplaats/GetByActiviteitId/20", None);
     let (is_error, text) = h.call("activiteit_wijzigen", wijzig.clone()).await;
     assert!(!is_error, "{text}");
@@ -1667,13 +1667,13 @@ async fn an_activity_keeps_its_kostenplaats_only_where_the_administration_uses_t
     assert!(!h.read("kostenplaats/GetByActiviteitId/20"));
 
     // An unreadable btw setting is an error, not "btw-plichtig".
-    let h = Harness::new(WriteMode::Auto).await;
+    let h = Harness::new(Rights::AUTO).await;
     h.answer("setting/administratie.niet-btw-plichtig", Some(json!(42)));
     let (is_error, text) = h.call("activiteit_wijzigen", wijzig).await;
     assert!(is_error && text.contains("onbekende vorm"), "{text}");
     assert!(h.sent().is_empty());
     // Not btw-plichtig: a facturabele activity needs no btw code.
-    let h = Harness::new(WriteMode::Auto).await;
+    let h = Harness::new(Rights::AUTO).await;
     h.answer(
         "setting/administratie.niet-btw-plichtig",
         Some(json!({"value": "true"})),
@@ -1691,7 +1691,7 @@ async fn an_activity_keeps_its_kostenplaats_only_where_the_administration_uses_t
 #[tokio::test]
 async fn without_invoice_settings_the_tools_say_so_and_can_make_them() {
     use crate::approvals::Status;
-    let h = Harness::new(WriteMode::Ask).await;
+    let h = Harness::new(Rights::ASK).await;
     h.answer("factuursetting/exists", Some(json!(false)));
     h.answer("factuursetting", None);
     let (is_error, text) = h.call("uren_factuurinstellingen", json!({})).await;

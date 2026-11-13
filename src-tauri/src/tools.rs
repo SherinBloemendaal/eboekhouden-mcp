@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
-use crate::accounts::{Account, WriteMode};
+use crate::accounts::{Account, Kind, Level, Rights};
 use crate::approvals::{self, Answer, Ask, Technical, line};
 use crate::reqlog::Outcome;
 use crate::state::{AppEvent, AppState};
@@ -1204,13 +1204,42 @@ fn read_only(label: &str) -> String {
     )
 }
 
-/// What a tool args struct says about writing, for the user who reads `status`.
-fn write_mode_name(mode: WriteMode) -> &'static str {
-    match mode {
-        WriteMode::Off => "uit",
-        WriteMode::Ask => "met akkoord",
-        WriteMode::Auto => "zonder akkoord",
+/// The refusal for a kind of change the account does not allow, while it allows another.
+fn not_allowed(label: &str, kind: Kind) -> String {
+    format!(
+        "{label} staat {} niet toe in EB MCP: er is niets gewijzigd. De gebruiker kan dit aanzetten in EB MCP onder Accounts, bij het bewerken van het account.",
+        kind.name()
+    )
+}
+
+/// Why a change of this kind is refused, or `None` when the account allows it (with or without approval).
+fn refusal(label: &str, rights: Rights, kind: Kind) -> Option<String> {
+    if rights.level(kind) != Level::Off {
+        None
+    } else if rights.read_only() {
+        Some(read_only(label))
+    } else {
+        Some(not_allowed(label, kind))
     }
+}
+
+/// A level as `status` names it.
+fn level_name(level: Level) -> &'static str {
+    match level {
+        Level::Off => "uit",
+        Level::Ask => "met akkoord",
+        Level::Auto => "zonder akkoord",
+    }
+}
+
+/// What an account allows, per kind of change, as `status` names it.
+fn rights_value(rights: Rights) -> Value {
+    json!({
+        "boeken_en_wijzigen": level_name(rights.change),
+        "verwijderen": level_name(rights.delete),
+        "versturen": level_name(rights.send),
+        "ingrijpend": level_name(rights.heavy),
+    })
 }
 
 /// A file from this computer for the digitaal archief: its name and its bytes in base64, as `folder/upload` takes them.
@@ -1262,8 +1291,12 @@ impl EbMcp {
         account: Option<&str>,
     ) -> Result<Run, CallToolResult> {
         let run = self.begin(context, tool, args, account)?;
-        if run.account.write == WriteMode::Off {
-            let message = read_only(&run.account.label);
+        // A tool is one kind of change, or one of two when a call can reach further than usual. Refused here
+        // when the account allows neither; `approve` checks the kind the change turns out to be.
+        let rights = run.account.rights;
+        let kinds = [Kind::of(tool, false), Kind::of(tool, true)];
+        if kinds.iter().all(|&k| rights.level(k) == Level::Off) {
+            let message = refusal(&run.account.label, rights, kinds[0]).unwrap_or_default();
             return Err(self.refuse(run, message));
         }
         Ok(run)
@@ -1410,16 +1443,20 @@ impl EbMcp {
     }
 
     /// Puts the change in front of the user and waits for the answer; the MCP call has answered already by
-    /// then (`write_tool`). An account that needs no approval skips this, except for `danger` (deleting,
-    /// crediting, invoicing in bulk, where mail goes): those always ask. Either way the change gets a record in
-    /// the history. The account is read again here: writing may have been turned off since the call began.
+    /// then (`write_tool`). The account sets a level per kind of change (`Kind::of`): `heavier` says this call
+    /// reaches further than the tool usually does (crediting, invoicing in bulk, where mail goes), which the
+    /// account never lets through without approval. A kind set to "zonder akkoord" skips the wait. Either way
+    /// the change gets a record in the history. The account is read again here: the kind may have been turned
+    /// off since the call began.
     async fn approve(
         &self,
         run: &Run,
         tool: &str,
         built: &Built,
-        danger: bool,
+        heavier: bool,
     ) -> Result<(), Halt> {
+        let kind = Kind::of(tool, heavier);
+        let danger = kind != Kind::Change;
         let Some(write) = run.write.as_ref() else {
             return Err(Halt::Error(
                 "EB MCP kon deze wijziging niet voorleggen; er is niets gewijzigd.".into(),
@@ -1428,16 +1465,16 @@ impl EbMcp {
         if !write.gate.commit() {
             return Err(Halt::Refused(ABANDONED.into()));
         }
-        let mode = match self.state.accounts.get(run.account.id) {
-            Some(account) => account.write,
+        let rights = match self.state.accounts.get(run.account.id) {
+            Some(account) => account.rights,
             None => {
                 return Err(Halt::Refused(
                     "Dit account staat niet meer in EB MCP. Er is niets gewijzigd.".into(),
                 ));
             }
         };
-        if mode == WriteMode::Off {
-            return Err(Halt::Refused(read_only(&run.account.label)));
+        if let Some(message) = refusal(&run.account.label, rights, kind) {
+            return Err(Halt::Refused(message));
         }
         let ask = Ask {
             account_id: run.account.id,
@@ -1454,7 +1491,7 @@ impl EbMcp {
             log_id: Some(run.id),
         };
         let now = crate::state::now_ms();
-        if mode == WriteMode::Auto && !danger {
+        if rights.level(kind) == Level::Auto {
             let id = self.state.approvals.record_auto(ask, technical, now);
             *write.proposal.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
             self.state.log.link_proposal(run.id, id);
@@ -1465,7 +1502,7 @@ impl EbMcp {
         *write.proposal.lock().unwrap_or_else(|e| e.into_inner()) = Some(proposal.id);
         self.state.log.link_proposal(run.id, proposal.id);
         self.state.log.wait_mcp(run.id);
-        // Account removed or writing turned off between the check above and the ask: account_update and
+        // Account removed or this kind of change turned off between the check above and the ask: account_update and
         // account_remove change the store before they end what waits, so one of the two sees it.
         let ended = match self.state.accounts.get(run.account.id) {
             None => self.state.approvals.end(
@@ -1473,9 +1510,9 @@ impl EbMcp {
                 Answer::Refused(approvals::REFUSED_ACCOUNT_GONE.into()),
                 now,
             ),
-            Some(account) if account.write == WriteMode::Off => self.state.approvals.end(
+            Some(account) if account.rights.level(kind) == Level::Off => self.state.approvals.end(
                 proposal.id,
-                Answer::Refused(approvals::REFUSED_READ_ONLY.into()),
+                Answer::Refused(approvals::turned_off(account.rights, kind)),
                 now,
             ),
             Some(_) => false,
@@ -2289,7 +2326,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Welke e-Boekhouden-accounts er in EB MCP staan, welke is ingelogd en of er per account geboekt mag worden (schrijven: uit, met akkoord of zonder akkoord). Gebruik dit eerst als er meer dan één account kan zijn, of als een andere tool zegt dat er niemand is ingelogd.",
+        description = "Welke e-Boekhouden-accounts er in EB MCP staan, welke is ingelogd en wat er per account mag (rechten: boeken en wijzigen, verwijderen, versturen en ingrijpend, elk uit, met akkoord of zonder akkoord). Gebruik dit eerst als er meer dan één account kan zijn, of als een andere tool zegt dat er niemand is ingelogd.",
         annotations(title = "Status", read_only_hint = true, open_world_hint = false)
     )]
     async fn status(&self) -> Result<CallToolResult, McpError> {
@@ -2299,7 +2336,7 @@ impl EbMcp {
             .accounts
             .list()
             .iter()
-            .any(|a| a.write != WriteMode::Off);
+            .any(|a| !a.rights.read_only());
         let accounts: Vec<Value> = self
             .state
             .accounts
@@ -2310,7 +2347,7 @@ impl EbMcp {
                 json!({
                     "account": a.label,
                     "administratie": a.administration,
-                    "schrijven": write_mode_name(a.write),
+                    "rechten": rights_value(a.rights),
                     "ingelogd": session.is_some_and(|s| !s.expired),
                     "verlopen": session.is_some_and(|s| s.expired),
                 })
@@ -2324,7 +2361,7 @@ impl EbMcp {
             "let_op": if self.state.session_count() == 0 {
                 "Nog niemand ingelogd. Vraag de gebruiker in te loggen via EB MCP in de menubalk."
             } else if can_write {
-                "Per account staat bij schrijven of er geboekt mag worden: uit (alleen lezen), met akkoord (de gebruiker keurt elke wijziging goed in EB MCP) of zonder akkoord. Verwijderen, crediteren en abonnementen factureren vragen altijd akkoord. Een wijziging die op akkoord wacht geeft meteen antwoord met een voorstel_id; akkoord_status geeft later de uitkomst."
+                "Per account staat bij rechten wat er mag, per soort wijziging: boeken_en_wijzigen (toevoegen en wijzigen), verwijderen, versturen (mail, Peppol, het incassobestand, een bericht of opdracht aan de accountant) en ingrijpend (crediteren, in bulk factureren of boeken, afboeken, de beginbalans, bedrijfsgegevens, een btw-aangifte verwerken). Elk staat op uit (de tool weigert), met akkoord (de gebruiker keurt elke wijziging goed in EB MCP) of zonder akkoord; versturen en ingrijpend gaan nooit zonder akkoord. Een wijziging die op akkoord wacht geeft meteen antwoord met een voorstel_id; akkoord_status geeft later de uitkomst."
             } else {
                 "Alleen lezen: schrijven staat voor elk account uit. De gebruiker kan het per account aanzetten in EB MCP onder Accounts."
             },
@@ -3149,7 +3186,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een verkoopfactuur verwijderen, op id. De mutatie van een verwerkte factuur verdwijnt mee. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een verkoopfactuur verwijderen, op id. De mutatie van een verwerkte factuur verdwijnt mee. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Factuur verwijderen",
             read_only_hint = false,
@@ -3368,7 +3405,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een abonnement verwijderen, op id. Facturen die er al van gemaakt zijn blijven staan. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een abonnement verwijderen, op id. Facturen die er al van gemaakt zijn blijven staan. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Abonnement verwijderen",
             read_only_hint = false,
@@ -3479,7 +3516,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een mutatie verwijderen, op mutatienummer. Boekhoudkundig wordt dit afgeraden: corrigeer liever met een tegenboeking of wijzig de mutatie, zodat zichtbaar blijft wat er is gebeurd. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een mutatie verwijderen, op mutatienummer. Boekhoudkundig wordt dit afgeraden: corrigeer liever met een tegenboeking of wijzig de mutatie, zodat zichtbaar blijft wat er is gebeurd. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Mutatie verwijderen",
             read_only_hint = false,
@@ -3558,7 +3595,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een bestand uit het digitaal archief verwijderen; het gaat naar de prullenbak van het archief. Is het bestand nog aan een mutatie of iets anders gekoppeld, dan krijgt de gebruiker een waarschuwing en moet die het altijd goedkeuren. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een bestand uit het digitaal archief verwijderen; het gaat naar de prullenbak van het archief. Is het bestand nog aan een mutatie of iets anders gekoppeld, dan staat er een waarschuwing bij. Of de gebruiker het eerst goedkeurt, volgt uit wat het account voor verwijderen toestaat. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Bestand verwijderen",
             read_only_hint = false,
@@ -3920,7 +3957,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een e-mailsjabloon verwijderen, op id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een e-mailsjabloon verwijderen, op id. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "E-mailsjabloon verwijderen",
             read_only_hint = false,
@@ -4146,7 +4183,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een offerte verwijderen, op id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een offerte verwijderen, op id. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Offerte verwijderen",
             read_only_hint = false,
@@ -4436,7 +4473,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een sjabloon verwijderen, op soort en id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een sjabloon verwijderen, op soort en id. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Sjabloon verwijderen",
             read_only_hint = false,
@@ -4699,7 +4736,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een relatie verwijderen, op id. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een relatie verwijderen, op id. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Relatie verwijderen",
             read_only_hint = false,
@@ -4780,9 +4817,9 @@ impl ServerHandler for EbMcp {
             .with_server_info(server_info())
             .with_instructions(
                 "Leest de boekhouding in e-Boekhouden van de accounts die in EB MCP zijn ingelogd. \
-                 Wijzigen (relaties, mutaties, bestanden, facturen, offertes, abonnementen, sjablonen, uren en projecten, producten, grootboekrekeningen en kostenplaatsen, importregels, vaste activa, de beginbalans, bedrijfsgegevens) en alles wat e-Boekhouden verlaat (facturen, offertes en aanmaningen mailen, Peppol, het incassobestand) kan alleen voor accounts waar de gebruiker schrijven heeft aangezet; \
-                 status zegt per account of dat uit staat, met akkoord of zonder akkoord. Met akkoord toont EB MCP elke wijziging eerst aan de gebruiker; \
-                 verwijderen, crediteren, alles wat mail of een bestand de deur uit doet, in bulk factureren of boeken, afboeken, bedrijfsgegevens en het verwerken van een btw-aangifte vragen altijd akkoord. Zo'n tool wacht niet op de gebruiker: \
+                 Wijzigen (relaties, mutaties, bestanden, facturen, offertes, abonnementen, sjablonen, uren en projecten, producten, grootboekrekeningen en kostenplaatsen, importregels, vaste activa, de beginbalans, bedrijfsgegevens) en alles wat e-Boekhouden verlaat (facturen, offertes en aanmaningen mailen, Peppol, het incassobestand) kan alleen voor accounts waar de gebruiker dat heeft aangezet, per soort wijziging: boeken en wijzigen, verwijderen, versturen en ingrijpend; \
+                 status zegt per account en per soort of die uit staat, met akkoord of zonder akkoord. Staat een soort uit, dan weigert de tool en zegt hij welke. Met akkoord toont EB MCP elke wijziging eerst aan de gebruiker; \
+                 alles wat mail of een bestand de deur uit doet, crediteren, in bulk factureren of boeken, afboeken, bedrijfsgegevens en het verwerken van een btw-aangifte vragen altijd akkoord, en verwijderen ook tenzij de gebruiker dat anders heeft gezet. Zo'n tool wacht niet op de gebruiker: \
                  hij antwoordt meteen met status wacht en een voorstel_id, en voert de wijziging zelf uit zodra de gebruiker goedkeurt. \
                  Vertel de gebruiker dat er in EB MCP een wijziging op akkoord wacht, ga gerust verder met ander werk, \
                  en vraag de uitkomst later op met akkoord_status (met voorstel_id voor één voorstel en zijn resultaat; zonder voor alles van de laatste 24 uur). \
@@ -4879,7 +4916,7 @@ mod tests {
             op_title: None,
             op_vault: None,
             administration: None,
-            write: crate::accounts::WriteMode::Off,
+            rights: crate::accounts::Rights::OFF,
         }
     }
 
@@ -5027,6 +5064,18 @@ mod tests {
         // The tools of this file, plus what each part names in its own module.
         let [reads, writes, _] = part_tools();
         assert_eq!(tool_count(), 56 + reads.len() + writes.len());
+    }
+
+    #[test]
+    fn every_tool_that_sends_something_out_is_a_tool() {
+        let names: Vec<String> = EbMcp::routers()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for tool in crate::accounts::SENDS {
+            assert!(names.iter().any(|n| n == tool), "{tool} is not a tool");
+        }
     }
 
     #[test]

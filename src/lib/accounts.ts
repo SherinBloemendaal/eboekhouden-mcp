@@ -23,8 +23,8 @@ export interface AccountView {
   opTitle: string | null
   opVault: string | null
   administration: string | null
-  /** Whether AI clients may change this account's books: not at all, each change with approval, or freely. */
-  write: WriteMode
+  /** What AI clients may do in this account's books besides reading: a level per kind of change. */
+  rights: Rights
   session: SessionView | null
   signingIn: boolean
   /** The newest step of this account's latest sign-in since EB MCP started, its end state included. */
@@ -38,7 +38,7 @@ export interface AccountInput {
   opRef: string | null
   opTitle: string | null
   opVault: string | null
-  write: WriteMode
+  rights: Rights
 }
 
 /** A Login item in 1Password, as `op item list` gives it. Never carries a password. */
@@ -84,14 +84,57 @@ export interface SigninEvent {
 
 export type Appearance = 'system' | 'light' | 'dark'
 
-export type WriteMode = 'off' | 'ask' | 'auto'
+/** How far AI clients may go with one kind of change: refused, each one with approval, or at once. */
+export type Level = 'off' | 'ask' | 'auto'
 
-/** How the app names an account's write setting. */
-export const WRITE_MODES: { value: WriteMode; label: string; hint: string }[] = [
-  { value: 'off', label: 'Alleen lezen', hint: 'AI-clients kunnen in dit account niets wijzigen.' },
-  { value: 'ask', label: 'Boeken met akkoord', hint: 'Elke wijziging komt eerst bij jou in EB MCP; pas na Goedkeuren gaat hij naar e-Boekhouden.' },
-  { value: 'auto', label: 'Boeken zonder akkoord', hint: 'AI-clients boeken en wijzigen direct. Verwijderen, crediteren en abonnementen factureren vragen nog wel je akkoord.' },
+/** The kinds of change an account sets a level for (accounts.rs). */
+export type Kind = 'change' | 'delete' | 'send' | 'heavy'
+
+export type Rights = Record<Kind, Level>
+
+export const LEVEL_LABELS: Record<Level, string> = { off: 'Uit', ask: 'Met akkoord', auto: 'Zonder akkoord' }
+
+/** The kinds as the app names them, with the levels each can be set to: what leaves or reaches far never goes without approval. */
+export const KINDS: { kind: Kind; label: string; hint: string; levels: Level[] }[] = [
+  { kind: 'change', label: 'Boeken en wijzigen', hint: 'Mutaties, facturen, relaties en al het andere toevoegen of wijzigen. Is terug te draaien.', levels: ['off', 'ask', 'auto'] },
+  { kind: 'delete', label: 'Verwijderen', hint: 'Wat weg is, komt niet terug.', levels: ['off', 'ask', 'auto'] },
+  { kind: 'send', label: 'Versturen', hint: 'Mail, Peppol, het incassobestand en berichten aan de accountant. Gaat nooit zonder akkoord.', levels: ['off', 'ask'] },
+  { kind: 'heavy', label: 'Ingrijpend', hint: 'Crediteren, in bulk factureren of boeken, afboeken, de beginbalans, bedrijfsgegevens en een btw-aangifte verwerken. Gaat nooit zonder akkoord.', levels: ['off', 'ask'] },
 ]
+
+const all = (level: Level): Rights => ({ change: level, delete: level, send: level, heavy: level })
+
+/** The usual choices in one click; the rows under them say exactly what each sets. */
+export const PRESETS: { id: string; label: string; hint: string; rights: Rights }[] = [
+  { id: 'off', label: 'Alleen lezen', hint: 'AI-clients kunnen in dit account niets wijzigen.', rights: all('off') },
+  { id: 'ask', label: 'Alles met akkoord', hint: 'Elke wijziging komt eerst bij jou in EB MCP; pas na Goedkeuren gaat hij naar e-Boekhouden.', rights: all('ask') },
+  { id: 'auto', label: 'Vrij boeken', hint: 'AI-clients boeken en wijzigen direct. Verwijderen, versturen en wat ingrijpend is vragen nog wel je akkoord.', rights: { ...all('ask'), change: 'auto' } },
+]
+
+/** The preset these rights are, or `null` when the user set the kinds by hand. */
+export function presetOf(rights: Rights): (typeof PRESETS)[number] | null {
+  return PRESETS.find((p) => KINDS.every((k) => p.rights[k.kind] === rights[k.kind])) ?? null
+}
+
+/** Whether AI clients can change nothing at all. */
+export function readOnly(rights: Rights): boolean {
+  return KINDS.every((k) => rights[k.kind] === 'off')
+}
+
+/** The rights in a few words for the chip on an account, `null` for read-only. Red when something goes without approval. */
+export function rightsChip(rights: Rights): { label: string; tone: 'info' | 'warn' } | null {
+  if (readOnly(rights)) return null
+  const free = KINDS.filter((k) => rights[k.kind] === 'auto')
+  if (free.some((k) => k.kind === 'delete')) return { label: free.length > 1 ? 'Boekt en verwijdert zelf' : 'Verwijdert zelf', tone: 'warn' }
+  if (free.length) return { label: 'Boekt zelf', tone: 'warn' }
+  if (rights.change === 'off') return { label: 'Beperkt met akkoord', tone: 'info' }
+  return { label: 'Boekt met akkoord', tone: 'info' }
+}
+
+/** Every kind with its level, for a tooltip: "Boeken en wijzigen: met akkoord · Verwijderen: uit · ...". */
+export function rightsText(rights: Rights): string {
+  return KINDS.map((k) => `${k.label}: ${LEVEL_LABELS[rights[k.kind]].toLowerCase()}`).join(' · ')
+}
 
 export interface Settings {
   idleMinutes: number

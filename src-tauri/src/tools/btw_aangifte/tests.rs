@@ -509,14 +509,14 @@ const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789a
 
 impl Harness {
     async fn new() -> Self {
-        use crate::accounts::WriteMode;
+        use crate::accounts::Rights;
         let seen: Seen = Arc::default();
         let jar = Arc::new(crate::state::testing::FakeJar::default());
         let state = Arc::new(crate::state::testing::state_with(
             jar,
             &btw_mock(seen.clone()).await,
         ));
-        let account = state.accounts.add(Self::input(WriteMode::Off)).unwrap();
+        let account = state.accounts.add(Self::input(Rights::OFF)).unwrap();
         state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
         state.add_session(account.id, &account.label, "sessie");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -544,7 +544,7 @@ impl Harness {
         harness
     }
 
-    fn input(mode: crate::accounts::WriteMode) -> crate::accounts::AccountInput {
+    fn input(mode: crate::accounts::Rights) -> crate::accounts::AccountInput {
         crate::accounts::AccountInput {
             label: "Studio Noord".into(),
             username: "lisa@studionoord.example".into(),
@@ -552,11 +552,11 @@ impl Harness {
             op_ref: None,
             op_title: None,
             op_vault: None,
-            write: mode,
+            rights: mode,
         }
     }
 
-    fn set_write(&self, mode: crate::accounts::WriteMode) {
+    fn set_write(&self, mode: crate::accounts::Rights) {
         self.state
             .accounts
             .update(self.account, Self::input(mode))
@@ -644,7 +644,7 @@ impl Harness {
 
 #[tokio::test]
 async fn reads_and_draws_up_returns_only_after_approval_and_never_files() {
-    use crate::accounts::WriteMode;
+    use crate::accounts::Rights;
     use approvals::Status;
     let eb = Harness::new().await;
 
@@ -707,7 +707,7 @@ async fn reads_and_draws_up_returns_only_after_approval_and_never_files() {
     assert_eq!(eb.state.approvals.count(), 0);
 
     // Even without approval set for the account, drawing up always asks; refused: nothing goes out.
-    eb.set_write(WriteMode::Auto);
+    eb.set_write(Rights::AUTO);
     let (is_error, text) = eb
         .call(
             "btwaangifte_verwerken",
@@ -749,7 +749,7 @@ async fn reads_and_draws_up_returns_only_after_approval_and_never_files() {
     assert!(eb.changes().is_empty());
 
     // Approved: exactly the screen's request, made only after the answer.
-    eb.set_write(WriteMode::Ask);
+    eb.set_write(Rights::ASK);
     let (_, text) = eb
         .call("btwaangifte_verwerken", json!({"jaar": 2026, "periode": 3}))
         .await;
@@ -827,7 +827,7 @@ async fn reads_and_draws_up_returns_only_after_approval_and_never_files() {
 
 #[tokio::test]
 async fn opens_and_keeps_the_icp_opgave_only_after_approval_and_never_files() {
-    use crate::accounts::WriteMode;
+    use crate::accounts::Rights;
     use approvals::Status;
     let eb = Harness::new().await;
 
@@ -856,7 +856,7 @@ async fn opens_and_keeps_the_icp_opgave_only_after_approval_and_never_files() {
     assert!(is_error);
     assert_eq!(eb.opened(), 0);
 
-    eb.set_write(WriteMode::Ask);
+    eb.set_write(Rights::ASK);
     let (is_error, text) = eb
         .call(
             "icp_opgave_openen",
@@ -1030,7 +1030,7 @@ async fn opens_and_keeps_the_icp_opgave_only_after_approval_and_never_files() {
 
 #[tokio::test]
 async fn shows_a_pay_link_after_approval_and_never_pays_opens_or_files() {
-    use crate::accounts::WriteMode;
+    use crate::accounts::Rights;
     use approvals::Status;
     let eb = Harness::new().await;
     let pay_requests = |eb: &Harness| -> Vec<String> {
@@ -1049,7 +1049,7 @@ async fn shows_a_pay_link_after_approval_and_never_pays_opens_or_files() {
     assert!(eb.seen.lock().unwrap().is_empty());
 
     // Even an account that needs no approval: what cannot be paid says so, and nothing is asked or started.
-    eb.set_write(WriteMode::Auto);
+    eb.set_write(Rights::AUTO);
     for (id, want) in [
         (13, "kan in e-Boekhouden niet met iDEAL betaald worden"),
         (14, "al via iDEAL betaald op 20-01-2026 10:00"),

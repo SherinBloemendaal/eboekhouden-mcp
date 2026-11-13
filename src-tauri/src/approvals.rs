@@ -42,6 +42,24 @@ pub const REFUSED_BY_USER: &str =
 pub const REFUSED_ACCOUNT_GONE: &str =
     "Het account is uit EB MCP verwijderd voordat de gebruiker antwoordde. Er is niets gewijzigd.";
 pub const REFUSED_READ_ONLY: &str = "Schrijven is voor dit account uitgezet voordat de gebruiker antwoordde. Er is niets gewijzigd.";
+/// The refusal for what waited when the user turned one kind of change off ("verwijderen", "versturen").
+pub fn refused_turned_off(kind: &str) -> String {
+    let mut name = kind.to_owned();
+    if let Some(first) = name.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    format!(
+        "{name} is voor dit account uitgezet voordat de gebruiker antwoordde. Er is niets gewijzigd."
+    )
+}
+/// The refusal for what waited when its kind of change was turned off: all writing, or that kind alone.
+pub fn turned_off(rights: crate::accounts::Rights, kind: crate::accounts::Kind) -> String {
+    if rights.read_only() {
+        REFUSED_READ_ONLY.into()
+    } else {
+        refused_turned_off(kind.name())
+    }
+}
 pub const LAPSED_ACCOUNT_CHANGED: &str = "De inloggegevens van het account zijn gewijzigd voordat de gebruiker antwoordde; het voorstel is vervallen. Er is niets gewijzigd.";
 pub const LAPSED_RESTART: &str = "EB MCP is opnieuw gestart voordat de gebruiker antwoordde; het voorstel is vervallen. Er is niets gewijzigd.";
 pub const LAPSED_WHILE_RUNNING: &str =
@@ -75,7 +93,8 @@ pub struct Proposal {
     /// "Mutatie toevoegen: Geld uitgegeven", "Factuur F00012 verwijderen".
     pub title: String,
     pub lines: Vec<Line>,
-    /// Deleting and crediting: shown as such, and asked even when the account needs no approval otherwise.
+    /// Anything but adding and changing (deleting, sending, what reaches far): shown as such. With the tool it
+    /// says which kind of change this is (`accounts::Kind::of`).
     pub danger: bool,
     pub asked_at: u64,
 }
@@ -538,20 +557,31 @@ impl Approvals {
     /// Ends every waiting proposal of an account with `answer`: refused when the account is removed or set to
     /// read-only, lapsed when its sign-in details changed. How many there were.
     pub fn end_account(&self, account_id: Uuid, answer: Answer, now: u64) -> usize {
+        self.end_account_where(account_id, |_| Some(answer.clone()), now)
+    }
+
+    /// Ends the waiting proposals of an account that `pick` gives an answer for, and leaves the rest waiting:
+    /// the user turned one kind of change off and kept another. How many it ended.
+    pub fn end_account_where(
+        &self,
+        account_id: Uuid,
+        pick: impl Fn(&Proposal) -> Option<Answer>,
+        now: u64,
+    ) -> usize {
         let mut inner = self.lock();
-        let ids: Vec<u64> = inner
+        let ended: Vec<(u64, Answer)> = inner
             .records
             .iter()
             .filter(|d| {
                 d.record.proposal.account_id == account_id
                     && inner.pending.contains_key(&d.record.proposal.id)
             })
-            .map(|d| d.record.proposal.id)
+            .filter_map(|d| pick(&d.record.proposal).map(|answer| (d.record.proposal.id, answer)))
             .collect();
-        for &id in &ids {
-            self.close(&mut inner, id, answer.clone(), now, false);
+        for (id, answer) in &ended {
+            self.close(&mut inner, *id, answer.clone(), now, false);
         }
-        ids.len()
+        ended.len()
     }
 
     /// The outcome of a change that ran: done with the tool's answer, or failed with the error. Only a
@@ -991,6 +1021,41 @@ mod tests {
         let record = approvals.get(proposal.id).unwrap().record;
         assert_eq!(record.status, Status::Lapsed);
         assert_eq!(approvals.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn turning_one_kind_off_ends_only_what_fell_under_it() {
+        let approvals = Approvals::default();
+        let account = Uuid::new_v4();
+        let mut delete = ask(account, "Mutatie 12 verwijderen");
+        delete.tool = "mutatie_verwijderen".into();
+        let (gone, answer) = approvals.ask(delete, technical(), 1);
+        let (kept, _waits) = approvals.ask(ask(account, "Mutatie toevoegen"), technical(), 2);
+        let refusal = refused_turned_off("verwijderen");
+        assert_eq!(
+            refusal,
+            "Verwijderen is voor dit account uitgezet voordat de gebruiker antwoordde. Er is niets gewijzigd."
+        );
+        assert_eq!(
+            approvals.end_account_where(
+                account,
+                |p| p
+                    .tool
+                    .ends_with("_verwijderen")
+                    .then(|| Answer::Refused(refusal.clone())),
+                3
+            ),
+            1
+        );
+        assert_eq!(answer.await, Ok(Answer::Refused(refusal.clone())));
+        assert_eq!(
+            approvals.get(gone.id).unwrap().record.status,
+            Status::Refused
+        );
+        assert_eq!(
+            approvals.list().iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![kept.id]
+        );
     }
 
     #[tokio::test]

@@ -869,7 +869,7 @@ mod tests {
 
     #[test]
     fn alles_inloggen_takes_the_accounts_without_a_session_that_stands() {
-        use crate::accounts::{AccountInput, Store, WriteMode};
+        use crate::accounts::{AccountInput, Rights, Store};
         let state = state_with(Arc::new(FakeJar::default()), "http://127.0.0.1:9/v1/api/");
         let add = |label: &str| {
             state
@@ -881,7 +881,7 @@ mod tests {
                     op_ref: None,
                     op_title: None,
                     op_vault: None,
-                    write: WriteMode::Off,
+                    rights: Rights::OFF,
                 })
                 .unwrap()
                 .id

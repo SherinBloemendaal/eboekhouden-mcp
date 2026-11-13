@@ -507,16 +507,16 @@ async fn changing_the_own_details_always_asks_and_sends_only_after_approval() {
         jar,
         &mock(seen.clone(), stub.clone()).await,
     ));
-    let input = |mode: WriteMode| AccountInput {
+    let input = |mode: Rights| AccountInput {
         label: "Studio Noord".into(),
         username: "lisa@studionoord.example".into(),
         store: Store::System,
         op_ref: None,
         op_title: None,
         op_vault: None,
-        write: mode,
+        rights: mode,
     };
-    let account = state.accounts.add(input(WriteMode::Off)).unwrap();
+    let account = state.accounts.add(input(Rights::OFF)).unwrap();
     state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
     state.add_session(account.id, &account.label, "sessie");
 
@@ -617,7 +617,7 @@ async fn changing_the_own_details_always_asks_and_sends_only_after_approval() {
     // Writing without approval for ordinary changes: the company details still ask.
     state
         .accounts
-        .update(account.id, input(WriteMode::Auto))
+        .update(account.id, input(Rights::AUTO))
         .unwrap();
 
     // Bad input is refused before anything is asked or sent.

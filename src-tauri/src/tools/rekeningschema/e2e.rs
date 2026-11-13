@@ -10,7 +10,7 @@ use axum::http::{Method, Uri};
 use axum::routing::{get, post};
 use serde_json::{Value, json};
 
-use crate::accounts::{Account, AccountInput, Store, WriteMode};
+use crate::accounts::{Account, AccountInput, Rights, Store};
 use crate::approvals::{Proposal, Status};
 use crate::state::AppState;
 
@@ -184,7 +184,7 @@ struct Harness {
     session: Option<String>,
 }
 
-fn input(mode: WriteMode) -> AccountInput {
+fn input(mode: Rights) -> AccountInput {
     AccountInput {
         label: "Studio Noord".into(),
         username: "lisa@studionoord.example".into(),
@@ -192,7 +192,7 @@ fn input(mode: WriteMode) -> AccountInput {
         op_ref: None,
         op_title: None,
         op_vault: None,
-        write: mode,
+        rights: mode,
     }
 }
 
@@ -223,7 +223,7 @@ impl Harness {
             jar,
             &eboekhouden(changes.clone(), kostenplaatsen_aan.clone()).await,
         ));
-        let account = state.accounts.add(input(WriteMode::Off)).unwrap();
+        let account = state.accounts.add(input(Rights::OFF)).unwrap();
         state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
         state.add_session(account.id, &account.label, "sessie");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -276,7 +276,7 @@ impl Harness {
         answer_of(&body)
     }
 
-    fn set_write(&self, mode: WriteMode) {
+    fn set_write(&self, mode: Rights) {
         self.state
             .accounts
             .update(self.account.id, input(mode))
@@ -364,7 +364,7 @@ async fn grootboekrekeningen_change_only_after_approval() {
     assert_eq!(h.state.approvals.count(), 0);
 
     // Bad input is refused before anything is asked.
-    h.set_write(WriteMode::Ask);
+    h.set_write(Rights::ASK);
     let (is_error, text) = h
         .call(
             "grootboekrekening_toevoegen",
@@ -415,7 +415,7 @@ async fn grootboekrekeningen_change_only_after_approval() {
     );
 
     // A plain edit follows the account's setting; without approval it goes straight through.
-    h.set_write(WriteMode::Auto);
+    h.set_write(Rights::AUTO);
     let (is_error, text) = h
         .call(
             "grootboekrekening_wijzigen",
@@ -481,7 +481,7 @@ async fn rekeninggroepen_change_only_after_approval() {
     let (is_error, text) = h.call("rekeninggroepen", json!({})).await;
     assert!(!is_error && text.contains("\"code\":\"OMZ\""), "{text}");
 
-    h.set_write(WriteMode::Ask);
+    h.set_write(Rights::ASK);
     let (is_error, text) = h
         .call(
             "rekeninggroep_toevoegen",
@@ -515,7 +515,7 @@ async fn rekeninggroepen_change_only_after_approval() {
     );
 
     // A new name follows the setting; a new code always asks.
-    h.set_write(WriteMode::Auto);
+    h.set_write(Rights::AUTO);
     let (is_error, text) = h
         .call(
             "rekeninggroep_wijzigen",
@@ -583,7 +583,7 @@ async fn kostenplaatsen_change_only_after_approval_and_go_on_a_mutatie_line() {
     let (is_error, text) = h.call("kostenplaats", json!({"id": 502})).await;
     assert!(!is_error && text.contains("Projecten>Noord"), "{text}");
 
-    h.set_write(WriteMode::Ask);
+    h.set_write(Rights::ASK);
     let (is_error, text) = h
         .call(
             "kostenplaats_toevoegen",
@@ -640,7 +640,7 @@ async fn kostenplaatsen_change_only_after_approval_and_go_on_a_mutatie_line() {
     );
 
     // Deleting always asks, also without approval set.
-    h.set_write(WriteMode::Auto);
+    h.set_write(Rights::AUTO);
     let (_, text) = h.call("kostenplaats_verwijderen", json!({"id": 501})).await;
     waiting(&text);
     let (proposal, _) = h
@@ -690,7 +690,7 @@ async fn kostenplaatsen_change_only_after_approval_and_go_on_a_mutatie_line() {
 #[tokio::test]
 async fn an_edited_mutatie_keeps_or_names_its_kostenplaats() {
     let h = Harness::new().await;
-    h.set_write(WriteMode::Auto);
+    h.set_write(Rights::AUTO);
     let last_lines = |h: &Harness| h.state.approvals.history(Some(1))[0].proposal.lines.clone();
 
     // A kept line keeps its kostenplaats and shows it by name; with kostenplaatsen turned off that still works,
