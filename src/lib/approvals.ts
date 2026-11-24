@@ -28,11 +28,13 @@ export interface Attachment {
   path: string
   name: string
   size: number
-  /** 'application/pdf' or an image type when the preview can show it; null: only Openen. */
+  /** 'application/pdf' or an image type when the preview can show it, told from the file's bytes; null: no preview. */
   kind: string | null
+  /** Openen may hand the file to its own app: only a PDF or an image. Anything else is only shown in its folder. */
+  openable: boolean
 }
 
-/** The file as it is on disk now (`approval_file`); `changed`: not the version the proposal read, which is what goes out. */
+/** The file as the proposal read it (`approval_file`), which is what goes out; `changed`: the file on disk is no longer that, or is gone. */
 export interface FilePreview {
   name: string
   kind: string | null
@@ -297,7 +299,7 @@ export const approvalFile = (id: number): Promise<FilePreview> => invoke<FilePre
 /** Opens the file of a waiting proposal in its own app, or shows it in Finder or Explorer with `reveal`. */
 export const openApprovalFile = (id: number, reveal = false): Promise<void> => invoke<void>('approval_file_open', { id, reveal })
 
-/** What the preview can show of a file: an image, a PDF, or nothing (only Openen). */
+/** What the preview can show of a file: an image, a PDF, or nothing. */
 export function previewKind(kind: string | null | undefined): 'image' | 'pdf' | null {
   if (kind === 'application/pdf') return 'pdf'
   return kind?.startsWith('image/') ? 'image' : null

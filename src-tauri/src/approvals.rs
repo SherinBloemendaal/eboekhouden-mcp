@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
@@ -115,8 +115,8 @@ pub struct Ask {
 }
 
 /// A file from this computer that a change sends to e-Boekhouden. The tool read it when the proposal came up, and
-/// that read is what goes out after Goedkeuren; `fingerprint` lets the preview say when the file on disk changed
-/// since.
+/// that read is what goes out after Goedkeuren. The preview shows those same bytes, so what the user approves
+/// is what goes out; `fingerprint` lets it say when the file on disk changed since.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Attachment {
@@ -124,9 +124,19 @@ pub struct Attachment {
     /// The name it gets in the archive.
     pub name: String,
     pub size: u64,
-    /// The media type when the preview can show it ("application/pdf", "image/png"); else only Openen.
+    /// The media type when the preview can show it ("application/pdf", "image/png"), told from the bytes and
+    /// not from the name: a file is shown as what it is.
     pub kind: Option<String>,
     pub fingerprint: String,
+    /// Whether Openen may hand the file on disk to its own app: only a PDF or an image, by the extension the
+    /// system goes by. Anything else may be a script or a program, which opening would run, so it can only
+    /// be shown in its folder.
+    #[serde(default)]
+    pub openable: bool,
+    /// The bytes the tool read. Kept in memory while the proposal waits (`Approvals::waiting_file`); never
+    /// saved and never sent along with the proposal.
+    #[serde(skip)]
+    pub sent: Option<Arc<[u8]>>,
 }
 
 impl Attachment {
@@ -135,44 +145,72 @@ impl Attachment {
             path: path.to_string_lossy().into_owned(),
             name: name.to_owned(),
             size: bytes.len() as u64,
-            kind: media_type(name).map(str::to_owned),
+            kind: sniff(bytes).map(str::to_owned),
             fingerprint: fingerprint(bytes),
+            openable: path
+                .file_name()
+                .is_some_and(|n| media_type(&n.to_string_lossy()).is_some()),
+            sent: Some(Arc::from(bytes)),
         }
     }
 
-    /// The file as it is on disk now, for the preview. `changed`: it is not the file the proposal read.
-    pub fn read(&self) -> Result<FilePreview, String> {
+    /// The preview of `sent`, the bytes that go out after Goedkeuren. `changed`: the file on disk is no longer
+    /// those bytes, or is gone.
+    pub fn preview(&self, sent: &[u8]) -> FilePreview {
         use base64::Engine;
-        let bytes = std::fs::read(&self.path).map_err(|_| {
-            format!(
-                "{} is niet meer te lezen op {}. Wat na Goedkeuren wordt geüpload, is het bestand zoals het was toen het voorstel kwam.",
-                self.name, self.path
-            )
-        })?;
-        Ok(FilePreview {
+        FilePreview {
             name: self.name.clone(),
             kind: self.kind.clone(),
-            size: bytes.len() as u64,
-            changed: fingerprint(&bytes) != self.fingerprint,
-            data: base64::engine::general_purpose::STANDARD.encode(bytes),
-        })
+            size: sent.len() as u64,
+            changed: std::fs::read(&self.path)
+                .map_or(true, |now| fingerprint(&now) != self.fingerprint),
+            data: base64::engine::general_purpose::STANDARD.encode(sent),
+        }
     }
 }
 
-/// A file's contents for the preview on Akkoord (`approval_file`).
+/// The contents of the file a proposal sends along, for the preview on Akkoord (`approval_file`): the bytes
+/// that go out, not the file as it is on disk now.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FilePreview {
     pub name: String,
     pub kind: Option<String>,
     pub size: u64,
-    /// The file on disk differs from what the proposal read, which is what will be uploaded.
+    /// The file on disk differs from what is shown here, or is gone. What is shown is what will be uploaded.
     pub changed: bool,
     /// Base64.
     pub data: String,
 }
 
-/// The media type of the files the preview shows, by extension.
+/// What the bytes of a file are, of the kinds the preview shows.
+pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"%PDF") {
+        return Some("application/pdf");
+    }
+    if bytes.starts_with(b"\x89PNG") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF8") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    // HEIC is an ISO media file: a `ftyp` box whose brand names the format.
+    if bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && matches!(&bytes[8..12], b"heic" | b"heix" | b"mif1" | b"msf1")
+    {
+        return Some("image/heic");
+    }
+    None
+}
+
+/// The media type a file name stands for, of the kinds the preview shows: what the system opens it as.
 pub fn media_type(name: &str) -> Option<&'static str> {
     let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
     Some(match ext.as_str() {
@@ -357,6 +395,8 @@ struct Inner {
     next: u64,
     /// The waiting proposals and the channel to the change that waits on each.
     pending: BTreeMap<u64, oneshot::Sender<Answer>>,
+    /// The bytes of the file a waiting proposal sends along, for its preview. Gone once it is answered.
+    files: BTreeMap<u64, Arc<[u8]>>,
     /// Oldest first.
     records: VecDeque<Detail>,
 }
@@ -396,6 +436,7 @@ impl Default for Approvals {
             inner: Mutex::new(Inner {
                 next: 1,
                 pending: BTreeMap::new(),
+                files: BTreeMap::new(),
                 records: VecDeque::new(),
             }),
             changes: AtomicU64::new(0),
@@ -515,10 +556,20 @@ impl Approvals {
         let (sender, receiver) = oneshot::channel();
         let proposal = {
             let mut inner = self.lock();
-            let detail = Self::new_detail(&mut inner, ask, technical, now, false);
+            let mut detail = Self::new_detail(&mut inner, ask, technical, now, false);
+            // The bytes stay apart from the record: the history and the windows get the proposal without them.
+            let sent = detail
+                .record
+                .proposal
+                .file
+                .as_mut()
+                .and_then(|file| file.sent.take());
             let proposal = detail.record.proposal.clone();
             inner.push(detail);
             inner.pending.insert(proposal.id, sender);
+            if let Some(sent) = sent {
+                inner.files.insert(proposal.id, sent);
+            }
             proposal
         };
         self.changed();
@@ -529,7 +580,11 @@ impl Approvals {
     pub fn record_auto(&self, ask: Ask, technical: Technical, now: u64) -> u64 {
         let id = {
             let mut inner = self.lock();
-            let detail = Self::new_detail(&mut inner, ask, technical, now, true);
+            let mut detail = Self::new_detail(&mut inner, ask, technical, now, true);
+            // Nothing waits, so nothing is previewed: the bytes are not kept.
+            if let Some(file) = detail.record.proposal.file.as_mut() {
+                file.sent = None;
+            }
             let id = detail.record.proposal.id;
             inner.push(detail);
             id
@@ -545,6 +600,7 @@ impl Approvals {
         let Some(sender) = inner.pending.remove(&id) else {
             return false;
         };
+        inner.files.remove(&id);
         let delivered = sender.send(answer.clone()).is_ok();
         if let Some(detail) = inner.record_mut(id) {
             let record = &mut detail.record;
@@ -710,18 +766,20 @@ impl Approvals {
             .collect()
     }
 
-    /// The file of a proposal that still waits; `None` when it has none or no longer waits. The preview reads
-    /// only this, never a path from elsewhere.
-    pub fn waiting_file(&self, id: u64) -> Option<Attachment> {
+    /// The file of a proposal that still waits, with the bytes that go out after Goedkeuren; `None` when it has
+    /// none or no longer waits. The preview shows only this, never a path from elsewhere.
+    pub fn waiting_file(&self, id: u64) -> Option<(Attachment, Arc<[u8]>)> {
         let inner = self.lock();
         if !inner.pending.contains_key(&id) {
             return None;
         }
+        let sent = inner.files.get(&id)?.clone();
         inner
             .records
             .iter()
             .find(|d| d.record.proposal.id == id)
             .and_then(|d| d.record.proposal.file.clone())
+            .map(|file| (file, sent))
     }
 
     pub fn count(&self) -> usize {
@@ -799,6 +857,7 @@ impl Approvals {
         let mut lapsed = 0;
         let mut inner = self.lock();
         inner.pending.clear();
+        inner.files.clear();
         inner.records.clear();
         let mut highest = 0;
         for mut detail in snapshot.records {
@@ -935,8 +994,22 @@ mod tests {
         assert_eq!(
             file.kind.as_deref(),
             Some("application/pdf"),
-            "by extension, any case"
+            "by what the bytes are"
         );
+        assert!(file.openable, "a PDF by its extension, any case");
+        // A script that calls itself a PDF in the archive: no preview as a PDF, and Openen never runs it.
+        let script = Attachment::new(&dir.join("start.command"), "factuur.pdf", b"#!/bin/sh\n");
+        assert_eq!((script.kind.as_deref(), script.openable), (None, false));
+        // A PDF under another name is still shown as the PDF it is.
+        let renamed = Attachment::new(&dir.join("scan.dat"), "scan.dat", b"%PDF-1.7");
+        assert_eq!(
+            (renamed.kind.as_deref(), renamed.openable),
+            (Some("application/pdf"), false)
+        );
+        assert_eq!(sniff(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(sniff(b"\0\0\0\x18ftypheic\0\0\0\0"), Some("image/heic"));
+        assert_eq!(sniff(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sniff(b"naam;bedrag"), None);
         assert_eq!(media_type("bon.JPG"), Some("image/jpeg"));
         assert_eq!(media_type("export.csv"), None);
         assert_eq!(media_type("zonder-extensie"), None);
@@ -951,38 +1024,41 @@ mod tests {
             1,
         );
         let (without, _other) = approvals.ask(ask(Uuid::nil(), "Mutatie"), technical(), 1);
+        // The queue shows the file, without its bytes: those stay in the app.
+        let listed = approvals.list()[0].file.clone().unwrap();
+        assert_eq!(listed.sent, None);
         assert_eq!(
-            approvals.list()[0].file.as_ref(),
-            Some(&file),
+            Attachment {
+                sent: file.sent.clone(),
+                ..listed
+            },
+            file,
             "the queue shows it"
+        );
+        assert!(
+            !serde_json::to_string(&file).unwrap().contains("sent"),
+            "the bytes are never written out with the proposal"
         );
         assert_eq!(approvals.waiting_file(without.id), None);
 
-        let preview = approvals
-            .waiting_file(with_file.id)
-            .unwrap()
-            .read()
-            .unwrap();
-        assert!(!preview.changed);
-        assert_eq!(preview.data, "JVBERi0xLjQgZmFjdHV1cg==");
+        let preview = |approvals: &Approvals| {
+            let (file, sent) = approvals.waiting_file(with_file.id).unwrap();
+            file.preview(&sent)
+        };
+        assert!(!preview(&approvals).changed);
+        assert_eq!(preview(&approvals).data, "JVBERi0xLjQgZmFjdHV1cg==");
+        // The file changes on disk, or goes: the preview keeps showing what goes out, and says so.
         std::fs::write(&path, b"%PDF-1.4 iets anders").unwrap();
-        assert!(
-            approvals
-                .waiting_file(with_file.id)
-                .unwrap()
-                .read()
-                .unwrap()
-                .changed
+        let later = preview(&approvals);
+        assert!(later.changed);
+        assert_eq!(
+            (later.data.as_str(), later.size),
+            ("JVBERi0xLjQgZmFjdHV1cg==", 16)
         );
         std::fs::remove_file(&path).unwrap();
-        assert!(
-            approvals
-                .waiting_file(with_file.id)
-                .unwrap()
-                .read()
-                .unwrap_err()
-                .contains("zoals het was toen het voorstel kwam")
-        );
+        let gone = preview(&approvals);
+        assert!(gone.changed);
+        assert_eq!(gone.data, "JVBERi0xLjQgZmFjdHV1cg==");
 
         // Answered: the file is no longer shown, whatever the id.
         assert!(approvals.decide(with_file.id, false, 2));

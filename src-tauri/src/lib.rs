@@ -378,22 +378,23 @@ fn approvals_history(
 }
 
 /// One proposal with its technical data: the tool's arguments, the request body and the result.
-/// Akkoord: the file a waiting proposal sends along, as it is on disk now, for its preview. Only the file of a
-/// proposal that still waits; any other id is refused.
+/// Akkoord: the file a waiting proposal sends along, for its preview: the bytes the tool read, which are what
+/// goes out after Goedkeuren. Only the file of a proposal that still waits; any other id is refused.
 #[tauri::command]
 fn approval_file(
     app_state: Shared<'_, AppState>,
     id: u64,
 ) -> Result<approvals::FilePreview, String> {
-    app_state
+    let (file, sent) = app_state
         .approvals
         .waiting_file(id)
-        .ok_or_else(|| "Dit voorstel wacht niet meer of heeft geen bestand.".to_owned())?
-        .read()
+        .ok_or_else(|| "Dit voorstel wacht niet meer of heeft geen bestand.".to_owned())?;
+    Ok(file.preview(&sent))
 }
 
 /// Akkoord: opens the file of a waiting proposal in its own app (Voorvertoning, the PDF reader), or shows it in
-/// Finder or Explorer with `reveal`. Only the file of a proposal that still waits.
+/// Finder or Explorer with `reveal`. Only the file of a proposal that still waits, and opening only a PDF or
+/// an image: the AI client named the file, and opening anything else could run it.
 #[tauri::command]
 fn approval_file_open(
     app: AppHandle,
@@ -402,12 +403,18 @@ fn approval_file_open(
     reveal: bool,
 ) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
-    let file = app_state
+    let (file, _) = app_state
         .approvals
         .waiting_file(id)
         .ok_or_else(|| "Dit voorstel wacht niet meer of heeft geen bestand.".to_owned())?;
     if !std::path::Path::new(&file.path).is_file() {
         return Err(format!("{} staat niet meer op {}.", file.name, file.path));
+    }
+    if !reveal && !file.openable {
+        return Err(format!(
+            "{} is geen pdf of afbeelding: zo'n bestand opent EB MCP niet zelf. Bekijk het in zijn map.",
+            file.name
+        ));
     }
     if reveal {
         app.opener().reveal_item_in_dir(&file.path)

@@ -1088,8 +1088,15 @@ mod tests {
             .expect("the proposal has its file");
         assert_eq!((file.name.as_str(), file.size), ("bon.png", 8));
         assert_eq!(file.kind.as_deref(), Some("image/png"));
-        let preview = state.approvals.waiting_file(id).unwrap().read().unwrap();
+        assert!(file.openable);
+        assert_eq!(
+            file.sent, None,
+            "the bytes are not sent along with the proposal"
+        );
+        let (waiting, sent) = state.approvals.waiting_file(id).unwrap();
+        let preview = waiting.preview(&sent);
         assert!(!preview.changed);
+        assert_eq!(&sent[..], b"\x89PNG bon", "the preview is what goes out");
         assert!(seen.lock().unwrap().is_empty(), "nothing went out");
         let _ = std::fs::remove_dir_all(&dir);
     }

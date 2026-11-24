@@ -1,7 +1,8 @@
 <script setup lang="ts">
 // The file a waiting proposal sends along (archief_uploaden), shown on Akkoord before Goedkeuren: an image as is,
-// a PDF in the webview's own viewer, anything else by name with Openen. The app reads only the proposal's own file.
-import { onBeforeUnmount, ref, watch } from 'vue'
+// a PDF in the webview's own viewer, anything else by name. What is shown are the bytes the tool read when the
+// proposal came up, which are the bytes that go out: not the file as it is on disk now.
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 import { approvalFile, openApprovalFile, previewKind, type Attachment } from '../lib/approvals'
 import { size } from '../lib/log'
@@ -13,7 +14,18 @@ const url = ref<string | null>(null)
 const changed = ref(false)
 const error = ref<string | null>(null)
 const loading = ref(false)
-const shown = () => previewKind(props.file.kind)
+/** The webview could not draw the image (HEIC outside macOS). */
+const broken = ref(false)
+/** Which of the two buttons waits for the system. */
+const opening = ref<'open' | 'reveal' | null>(null)
+const kind = computed(() => previewKind(props.file.kind))
+/** What stands in the place of the preview while there is none. */
+const hint = computed(() => {
+  if (!kind.value) return `Van dit soort bestand is geen voorbeeld; ${props.file.openable ? 'open het om het te bekijken' : 'bekijk het in zijn map'}.`
+  if (broken.value) return `Dit voorbeeld kan hier niet worden getoond; ${props.file.openable ? 'open het bestand om het te bekijken' : 'bekijk het bestand in zijn map'}.`
+  if (loading.value) return 'Voorbeeld laden…'
+  return null
+})
 
 function clear() {
   if (url.value?.startsWith('blob:')) URL.revokeObjectURL(url.value)
@@ -24,8 +36,8 @@ async function load() {
   clear()
   changed.value = false
   error.value = null
-  const kind = shown()
-  if (!kind || !inApp()) return
+  broken.value = false
+  if (!kind.value || !inApp()) return
   const id = props.id
   loading.value = true
   try {
@@ -33,7 +45,7 @@ async function load() {
     if (id !== props.id) return
     changed.value = preview.changed
     const type = preview.kind ?? 'application/octet-stream'
-    if (kind === 'image') {
+    if (kind.value === 'image') {
       url.value = `data:${type};base64,${preview.data}`
     } else {
       // A PDF goes into a frame as a blob: the webview shows it with its own viewer.
@@ -48,11 +60,15 @@ async function load() {
 }
 
 async function open(reveal: boolean) {
+  if (opening.value) return
   error.value = null
+  opening.value = reveal ? 'reveal' : 'open'
   try {
     await openApprovalFile(props.id, reveal)
   } catch (e) {
     error.value = String(e)
+  } finally {
+    opening.value = null
   }
 }
 
@@ -67,16 +83,25 @@ onBeforeUnmount(clear)
       <span class="file-name selectable" :title="file.path">{{ file.name }}</span>
       <span class="file-size">{{ size(file.size) }}</span>
       <span class="file-actions">
-        <button type="button" class="btn small" @click="open(false)"><Icon name="external" :size="14" />Openen</button>
-        <button type="button" class="btn small" @click="open(true)">{{ revealName }}</button>
+        <!-- Only a PDF or an image is handed to its own app: opening anything else could run it. -->
+        <button v-if="file.openable" type="button" class="btn small" :disabled="!!opening" :aria-busy="opening === 'open'" @click="open(false)"><span class="btn-label"><Icon name="external" :size="14" />Openen</span></button>
+        <button type="button" class="btn small" :disabled="!!opening" :aria-busy="opening === 'reveal'" @click="open(true)"><span class="btn-label">{{ revealName }}</span></button>
       </span>
     </div>
-    <p v-if="changed" class="note warn" role="note">Het bestand is gewijzigd sinds het voorstel. Na Goedkeuren gaat de versie van toen naar e-Boekhouden.</p>
-    <p v-if="error" class="note bad" role="alert">{{ error }}</p>
-    <img v-if="url && shown() === 'image'" class="file-view image" :src="url" :alt="`Voorbeeld van ${file.name}`" />
-    <iframe v-else-if="url && shown() === 'pdf'" class="file-view pdf" :src="url" :title="`Voorbeeld van ${file.name}`" />
-    <p v-else-if="loading" class="file-hint">Voorbeeld laden…</p>
-    <p v-else-if="!shown()" class="file-hint">Van dit soort bestand is geen voorbeeld; open het om het te bekijken.</p>
+    <Transition name="accordion">
+      <div v-if="changed" class="accordion"><div><p class="note warn" role="note">Het bestand op deze computer is gewijzigd of weg sinds het voorstel. Je ziet hier de versie van toen: die gaat na Goedkeuren naar e-Boekhouden.</p></div></div>
+    </Transition>
+    <Transition name="accordion">
+      <div v-if="error" class="accordion"><div><p class="note bad" role="alert">{{ error }}</p></div></div>
+    </Transition>
+    <!-- The preview has a fixed place, so nothing shifts when it arrives: the hint fades into the image or the PDF. -->
+    <div v-if="kind || hint" class="file-stage" :class="{ tall: !!kind }">
+      <Transition name="fade" mode="out-in">
+        <img v-if="url && kind === 'image' && !broken" key="image" class="file-view image" :src="url" :alt="`Voorbeeld van ${file.name}`" @error="broken = true" />
+        <iframe v-else-if="url && kind === 'pdf'" key="pdf" class="file-view pdf" :src="url" :title="`Voorbeeld van ${file.name}`" />
+        <p v-else-if="hint" :key="hint" class="file-hint">{{ hint }}</p>
+      </Transition>
+    </div>
   </div>
 </template>
 
@@ -86,9 +111,11 @@ onBeforeUnmount(clear)
 .file-name { flex: 1; min-width: 0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .file-size { font-size: 11px; color: var(--muted); }
 .file-actions { display: flex; gap: 6px; }
-.file-view { width: 100%; border: 0.5px solid var(--line); border-radius: 10px; background: var(--sunken); }
-.file-view.image { max-height: 420px; object-fit: contain; }
-.file-view.pdf { height: 480px; }
+.file-stage { display: flex; align-items: center; justify-content: center; min-height: 18px; }
+.file-stage.tall { height: 420px; border: 0.5px solid var(--line); border-radius: 10px; background: var(--sunken); overflow: hidden; }
+.file-view { width: 100%; height: 100%; border: 0; }
+.file-view.image { object-fit: contain; }
 .file-hint { margin: 0; font-size: 12px; color: var(--muted); }
+.file-stage:not(.tall) { justify-content: flex-start; }
 .note { margin: 0; }
 </style>

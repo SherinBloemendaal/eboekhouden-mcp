@@ -1,4 +1,5 @@
 import { flushPromises, mount } from '@vue/test-utils'
+import { nextTick } from 'vue'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from '../App.vue'
 import AccountForm from '../components/AccountForm.vue'
@@ -170,7 +171,7 @@ describe('the queue', () => {
   })
 
   it('shows the file of an upload before Goedkeuren, and opens only the file of that proposal', async () => {
-    const file = { path: '/Users/jan/Downloads/bon.png', name: 'bon.png', size: 8, kind: 'image/png' }
+    const file = { path: '/Users/jan/Downloads/bon.png', name: 'bon.png', size: 8, kind: 'image/png', openable: true }
     waiting = [proposal({ tool: 'archief_uploaden', title: 'Bestand uploaden: bon.png', file }), proposal({ id: 8 })]
     await mountAt('/akkoord')
     expect(detail().textContent).toContain('Bestand')
@@ -179,10 +180,21 @@ describe('the queue', () => {
     const image = detail().querySelector<HTMLImageElement>('img.file-view')!
     expect(image.getAttribute('src')).toBe('data:image/png;base64,iVBORw==')
     expect(image.alt).toBe('Voorbeeld van bon.png')
-    expect(detail().textContent).not.toContain('gewijzigd sinds het voorstel')
-    buttons(detail(), 'Openen')[0]!.click()
-    buttons(detail(), 'Toon in Finder')[0]!.click()
+    expect(detail().textContent).not.toContain('sinds het voorstel')
+    // A button shows that it waits for the system, and the other one waits with it.
+    const [openen, toon] = [buttons(detail(), 'Openen')[0]!, buttons(detail(), 'Toon in Finder')[0]!]
+    openen.click()
+    await nextTick()
+    expect([openen.getAttribute('aria-busy'), openen.disabled, toon.disabled]).toEqual(['true', true, true])
     await flushPromises()
+    expect([openen.getAttribute('aria-busy'), openen.disabled, toon.disabled]).toEqual(['false', false, false])
+    toon.click()
+    await flushPromises()
+    // An image the webview cannot draw (HEIC on Windows) gives way to a sentence, in the same place.
+    image.dispatchEvent(new Event('error'))
+    await flushPromises()
+    expect(detail().querySelector('img.file-view')).toBeNull()
+    expect(detail().querySelector('.file-stage')?.textContent).toBe('Dit voorbeeld kan hier niet worden getoond; open het bestand om het te bekijken.')
     expect(invoke.mock.calls.filter((c) => c[0] === 'approval_file_open').map((c) => c[1])).toEqual([{ id: 7, reveal: false }, { id: 7, reveal: true }])
     // A proposal without a file has no preview, and nothing is read for it.
     await choose(8)
@@ -197,22 +209,25 @@ describe('the queue', () => {
     Object.defineProperty(URL, 'revokeObjectURL', { value: vi.fn(), configurable: true })
     onFile = async () => ({ name: 'factuur.pdf', kind: 'application/pdf', size: 16, changed: true, data: 'JVBERi0xLjQgZmFjdHV1cg==' })
     waiting = [
-      proposal({ tool: 'archief_uploaden', title: 'Bestand uploaden: factuur.pdf', file: { path: '/Users/jan/factuur.pdf', name: 'factuur.pdf', size: 16, kind: 'application/pdf' } }),
-      proposal({ id: 8, tool: 'archief_uploaden', title: 'Bestand uploaden: export.csv', file: { path: '/Users/jan/export.csv', name: 'export.csv', size: 2048, kind: null } }),
+      proposal({ tool: 'archief_uploaden', title: 'Bestand uploaden: factuur.pdf', file: { path: '/Users/jan/factuur.pdf', name: 'factuur.pdf', size: 16, kind: 'application/pdf', openable: true } }),
+      proposal({ id: 8, tool: 'archief_uploaden', title: 'Bestand uploaden: export.csv', file: { path: '/Users/jan/export.csv', name: 'export.csv', size: 2048, kind: null, openable: false } }),
     ]
     await mountAt('/akkoord')
     const frame = detail().querySelector<HTMLIFrameElement>('iframe.file-view')!
     expect(frame.getAttribute('src')).toBe('blob:voorbeeld')
     expect(created[0]!.type).toBe('application/pdf')
     expect(created[0]!.size).toBe(16)
-    expect(detail().textContent).toContain('Het bestand is gewijzigd sinds het voorstel. Na Goedkeuren gaat de versie van toen naar e-Boekhouden.')
+    expect(detail().textContent).toContain('Het bestand op deze computer is gewijzigd of weg sinds het voorstel. Je ziet hier de versie van toen: die gaat na Goedkeuren naar e-Boekhouden.')
     await choose(8)
     expect(detail().querySelector('.file-view')).toBeNull()
-    expect(detail().textContent).toContain('Van dit soort bestand is geen voorbeeld')
+    expect(detail().textContent).toContain('Van dit soort bestand is geen voorbeeld; bekijk het in zijn map.')
+    // No PDF and no image: it is never handed to its own app, only shown in its folder.
+    expect(buttons(detail(), 'Openen')).toHaveLength(0)
+    expect(buttons(detail(), 'Toon in Finder')).toHaveLength(1)
     expect(detail().querySelector('.file-size')?.textContent).toBe('2,0 kB')
     // A file that cannot be read says why, in the app's own words.
     onFile = async () => { throw 'bon.png is niet meer te lezen' }
-    waiting = [proposal({ id: 9, tool: 'archief_uploaden', title: 'Bestand uploaden: bon.png', file: { path: '/Users/jan/bon.png', name: 'bon.png', size: 8, kind: 'image/png' } })]
+    waiting = [proposal({ id: 9, tool: 'archief_uploaden', title: 'Bestand uploaden: bon.png', file: { path: '/Users/jan/bon.png', name: 'bon.png', size: 8, kind: 'image/png', openable: true } })]
     await refreshApprovals()
     await flushPromises()
     expect(detail().querySelector('[role="alert"]')?.textContent).toBe('bon.png is niet meer te lezen')
