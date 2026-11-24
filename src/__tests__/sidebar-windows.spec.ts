@@ -11,7 +11,7 @@ const invoke = vi.fn(async (command: string) => {
   switch (command) {
     case 'approvals_list': return []
     case 'accounts_list': return []
-    case 'settings_get': return { idleMinutes: 30, appearance: 'system', showInDock: true }
+    case 'settings_get': return { idleMinutes: 30, appearance: 'system', showInDock: true, waitForApproval: true, waitMinutes: 5 }
     case 'log_list': return []
     default: return undefined
   }

@@ -14,11 +14,17 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use std::sync::{Arc, Mutex};
+
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 const PROTOCOL_HEADER: &str = "mcp-protocol-version";
 const SESSION_HEADER: &str = "mcp-session-id";
+/// Sent with every request, so EB MCP knows its client gives up on a tool call after about a minute.
+const BRIDGE_HEADER: &str = "x-eb-mcp-bridge";
 /// EB MCP's bundle identifier, the name of its config folder.
 const APP_ID: &str = "dev.sherin.ebmcp";
 
@@ -53,118 +59,232 @@ async fn main() -> ExitCode {
         .no_proxy()
         .build()
         .expect("HTTP client");
-    let mut session: Option<String> = None;
-    let mut protocol: Option<String> = None;
-    // The client's own initialize, kept to start a new session with when EB MCP no longer knows this one.
-    let mut initialize: Option<String> = None;
+    let link = Arc::new(Link { http, url, token });
+    let shared = Arc::new(Shared::default());
+    // One writer for stdout, so answers of requests that run side by side never mix within a line.
+    let (out, mut lines_out) = mpsc::unbounded_channel::<String>();
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(line) = lines_out.recv().await {
+            if stdout
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            let _ = stdout.flush().await;
+        }
+    });
+    let mut running = JoinSet::new();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
 
     while let Ok(Some(line)) = lines.next_line().await {
-        let line = line.trim();
+        let line = line.trim().to_owned();
         if line.is_empty() {
             continue;
         }
-        let message: Option<Value> = serde_json::from_str(line).ok();
-        let id = message.as_ref().and_then(|m| m.get("id")).cloned();
+        let message: Option<Value> = serde_json::from_str(&line).ok();
+        let id = message
+            .as_ref()
+            .and_then(|m| m.get("id"))
+            .filter(|id| !id.is_null())
+            .cloned();
         let is_initialize = message
             .as_ref()
             .and_then(|m| m.get("method"))
             .and_then(Value::as_str)
             == Some("initialize");
-        if is_initialize {
-            initialize = Some(line.to_owned());
-            // A new start: whatever session there was is not sent along.
-            session = None;
+        let (link, shared, out) = (link.clone(), shared.clone(), out.clone());
+        let forward = forward(link, shared, out, line, id.clone(), is_initialize);
+        // A request runs on its own: a tool call that waits minutes for the user's approval in EB MCP must not
+        // hold up the client's other requests. The initialize and notifications go one by one, in order, so the
+        // session exists before anything else is sent on it.
+        if id.is_some() && !is_initialize {
+            running.spawn(forward);
+        } else {
+            forward.await;
         }
-        let link = Link {
-            http: &http,
-            url: &url,
-            token: &token,
-        };
-        let mut sent = link
-            .post(line, session.as_deref(), protocol.as_deref())
-            .await;
-        // 404 on a session id: EB MCP forgot the session (it was restarted, by an update for one, or the
-        // session sat unused for too long). The MCP rule for a client is to start a new session; the bridge
-        // is that client, so it does so with the client's own initialize and sends the request once more.
-        if let Ok(answer) = &sent
-            && answer.status == 404
-            && session.is_some()
-            && !is_initialize
-            && let Some(first) = initialize.as_deref()
-            && let Some(renewed) = link.new_session(first, protocol.as_deref()).await
-        {
-            session = Some(renewed);
-            sent = link
-                .post(line, session.as_deref(), protocol.as_deref())
-                .await;
-        }
-        let answers = match sent {
-            Err(()) => error_for(
-                id,
-                "EB MCP draait niet. Start EB MCP en probeer het opnieuw.",
-            ),
-            Ok(answer) => {
-                if let Some(s) = answer.session {
-                    session = Some(s);
-                }
-                if answer.status == 401 {
-                    error_for(
-                        id,
-                        "Het token klopt niet meer. Koppel EB MCP opnieuw met Claude.",
-                    )
-                } else if !(200..300).contains(&answer.status) {
-                    error_for(id, &format!("EB MCP gaf {}", answer.status))
-                } else if answer.stream {
-                    events(&answer.body)
-                } else if answer.body.trim().is_empty() {
-                    Vec::new()
-                } else {
-                    vec![answer.body.trim().to_owned()]
-                }
-            }
-        };
-        for answer in answers {
-            if protocol.is_none()
-                && let Ok(value) = serde_json::from_str::<Value>(&answer)
-                && let Some(v) = value
-                    .pointer("/result/protocolVersion")
-                    .and_then(Value::as_str)
-            {
-                protocol = Some(v.to_owned());
-            }
-            if stdout
-                .write_all(format!("{answer}\n").as_bytes())
-                .await
-                .is_err()
-            {
-                return ExitCode::SUCCESS;
-            }
-        }
-        let _ = stdout.flush().await;
     }
+    // The client closed stdin: what it asked still gets its answer before the bridge stops.
+    while running.join_next().await.is_some() {}
+    drop(out);
+    let _ = writer.await;
     ExitCode::SUCCESS
 }
 
-/// What EB MCP answered to one POST.
+/// What the requests share: the session and protocol, and the client's own initialize to start a new session
+/// with when EB MCP no longer knows this one.
+#[derive(Default)]
+struct Shared {
+    state: Mutex<Session>,
+    /// Held while a new session is started, so two requests that both hear 404 start only one.
+    renewing: tokio::sync::Mutex<()>,
+}
+
+#[derive(Clone, Default)]
+struct Session {
+    id: Option<String>,
+    protocol: Option<String>,
+    initialize: Option<String>,
+}
+
+impl Shared {
+    fn get(&self) -> Session {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn update(&self, change: impl FnOnce(&mut Session)) {
+        change(&mut self.state.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+}
+
+/// Sends one line to EB MCP and writes what comes back to `out`, each message as soon as it arrives.
+async fn forward(
+    link: Arc<Link>,
+    shared: Arc<Shared>,
+    out: mpsc::UnboundedSender<String>,
+    line: String,
+    id: Option<Value>,
+    is_initialize: bool,
+) {
+    if is_initialize {
+        // A new start: whatever session there was is not sent along.
+        shared.update(|s| {
+            s.initialize = Some(line.clone());
+            s.id = None;
+        });
+    }
+    let before = shared.get();
+    let mut sent = link
+        .post(&line, before.id.as_deref(), before.protocol.as_deref())
+        .await;
+    // 404 on a session id: EB MCP forgot the session (it was restarted, by an update for one, or the
+    // session sat unused for too long). The MCP rule for a client is to start a new session; the bridge
+    // is that client, so it does so with the client's own initialize and sends the request once more.
+    if let Ok(answer) = &sent
+        && answer.status == 404
+        && before.id.is_some()
+        && !is_initialize
+        && let Some(renewed) = renew(&link, &shared, before.id.as_deref()).await
+    {
+        let protocol = shared.get().protocol;
+        sent = link.post(&line, Some(&renewed), protocol.as_deref()).await;
+    }
+    let mut answer = match sent {
+        Err(()) => {
+            send_all(
+                &out,
+                error_for(
+                    id,
+                    "EB MCP draait niet. Start EB MCP en probeer het opnieuw.",
+                ),
+            );
+            return;
+        }
+        Ok(answer) => answer,
+    };
+    if let Some(s) = answer.session.clone() {
+        shared.update(|state| state.id = Some(s));
+    }
+    if answer.status == 401 {
+        send_all(
+            &out,
+            error_for(
+                id,
+                "Het token klopt niet meer. Koppel EB MCP opnieuw met Claude.",
+            ),
+        );
+        return;
+    }
+    if !(200..300).contains(&answer.status) {
+        send_all(
+            &out,
+            error_for(id, &format!("EB MCP gaf {}", answer.status)),
+        );
+        return;
+    }
+    let emit = |message: String| {
+        if shared.get().protocol.is_none()
+            && let Ok(value) = serde_json::from_str::<Value>(&message)
+            && let Some(v) = value
+                .pointer("/result/protocolVersion")
+                .and_then(Value::as_str)
+        {
+            let v = v.to_owned();
+            shared.update(|s| s.protocol = Some(v));
+        }
+        let _ = out.send(message);
+    };
+    if answer.stream {
+        // An event stream: each event goes to the client as it comes, so progress reaches it while a tool
+        // call still waits.
+        let mut stream = EventStream::default();
+        while let Some(chunk) = answer.chunk().await {
+            stream.push(&chunk).into_iter().for_each(&emit);
+        }
+        stream.finish().into_iter().for_each(&emit);
+    } else {
+        let body = answer.text().await;
+        if !body.trim().is_empty() {
+            emit(body.trim().to_owned());
+        }
+    }
+}
+
+/// Starts a new session unless another request did so already since `stale` was sent. The session to use.
+async fn renew(link: &Link, shared: &Shared, stale: Option<&str>) -> Option<String> {
+    let _one = shared.renewing.lock().await;
+    let now = shared.get();
+    if now.id.is_some() && now.id.as_deref() != stale {
+        return now.id;
+    }
+    let first = now.initialize?;
+    let renewed = link.new_session(&first, now.protocol.as_deref()).await?;
+    shared.update(|s| s.id = Some(renewed.clone()));
+    Some(renewed)
+}
+
+fn send_all(out: &mpsc::UnboundedSender<String>, lines: Vec<String>) {
+    for line in lines {
+        let _ = out.send(line);
+    }
+}
+
+/// What EB MCP answered to one POST; the body is read by `chunk` or `text`.
 struct Answer {
     status: u16,
     /// The session id the answer named, if any.
     session: Option<String>,
     /// Whether the body is an event stream (else plain JSON, or nothing).
     stream: bool,
-    body: String,
+    response: reqwest::Response,
+}
+
+impl Answer {
+    /// The next piece of the body; `None` at its end, or when the connection broke.
+    async fn chunk(&mut self) -> Option<Vec<u8>> {
+        self.response
+            .chunk()
+            .await
+            .ok()
+            .flatten()
+            .map(|b| b.to_vec())
+    }
+
+    async fn text(self) -> String {
+        self.response.text().await.unwrap_or_default()
+    }
 }
 
 /// The way to EB MCP's HTTP server.
-struct Link<'a> {
-    http: &'a reqwest::Client,
-    url: &'a str,
-    token: &'a str,
+struct Link {
+    http: reqwest::Client,
+    url: String,
+    token: String,
 }
 
-impl Link<'_> {
+impl Link {
     /// One JSON-RPC line as one POST. `Err` when EB MCP cannot be reached at all.
     async fn post(
         &self,
@@ -174,8 +294,11 @@ impl Link<'_> {
     ) -> Result<Answer, ()> {
         let mut request = self
             .http
-            .post(self.url)
-            .bearer_auth(self.token)
+            .post(&self.url)
+            .bearer_auth(&self.token)
+            // Tells EB MCP the call comes through the bridge, whose client gives up on a tool call after about a
+            // minute: a change that waits for the user's approval waits less than that (tools.rs, BRIDGE_WAIT).
+            .header(BRIDGE_HEADER, "1")
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .body(line.to_owned());
@@ -196,12 +319,11 @@ impl Link<'_> {
         let session = header(SESSION_HEADER);
         let stream = header("content-type").is_some_and(|c| c.starts_with("text/event-stream"));
         let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
         Ok(Answer {
             status,
             session,
             stream,
-            body,
+            response,
         })
     }
 
@@ -296,22 +418,59 @@ fn error_for(id: Option<Value>, message: &str) -> Vec<String> {
 }
 
 /// The `data:` payloads of a server-sent event stream, one per event.
+#[cfg(test)]
 fn events(body: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut data = String::new();
-    for line in body.lines().chain(std::iter::once("")) {
+    let mut stream = EventStream::default();
+    let mut out = stream.push(body.as_bytes());
+    out.extend(stream.finish());
+    out
+}
+
+/// Reads a server-sent event stream piece by piece and gives each event's `data:` payload once the event is
+/// complete. Only payloads that are JSON are kept.
+#[derive(Default)]
+struct EventStream {
+    /// Bytes after the last line break, not a whole line yet.
+    pending: Vec<u8>,
+    data: String,
+}
+
+impl EventStream {
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.pending.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        while let Some(at) = self.pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=at).collect();
+            let line = String::from_utf8_lossy(&line);
+            self.line(line.trim_end_matches(['\n', '\r']), &mut out);
+        }
+        out
+    }
+
+    /// The end of the stream: a last event without its blank line still counts.
+    fn finish(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        let rest = String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned();
+        if !rest.is_empty() {
+            self.line(rest.trim_end_matches('\r'), &mut out);
+        }
+        self.line("", &mut out);
+        out
+    }
+
+    fn line(&mut self, line: &str, out: &mut Vec<String>) {
         if let Some(rest) = line.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
+            if !self.data.is_empty() {
+                self.data.push('\n');
             }
-            data.push_str(rest.trim_start());
-        } else if line.is_empty() && !data.is_empty() {
-            out.push(std::mem::take(&mut data));
+            self.data.push_str(rest.trim_start());
+        } else if line.is_empty() && !self.data.is_empty() {
+            let data = std::mem::take(&mut self.data);
+            if serde_json::from_str::<Value>(&data).is_ok() {
+                out.push(data);
+            }
         }
     }
-    out.into_iter()
-        .filter(|d| serde_json::from_str::<Value>(d).is_ok())
-        .collect()
 }
 
 #[cfg(test)]
@@ -323,6 +482,27 @@ mod tests {
         let body = "id: 1\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n: ping\n\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"x\"}\n";
         assert_eq!(events(body).len(), 2);
         assert_eq!(events("data: \n\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn reads_an_event_split_over_pieces_as_soon_as_it_is_whole() {
+        let mut stream = EventStream::default();
+        assert!(
+            stream
+                .push(b"event: message\r\ndata: {\"jsonrpc\":")
+                .is_empty()
+        );
+        assert!(
+            stream.push(b"\"2.0\",\"id\":1}\r\n").is_empty(),
+            "not whole before the blank line"
+        );
+        assert_eq!(stream.push(b"\r\ndata: {\"a\"").len(), 1);
+        assert_eq!(stream.push(b":1}").len(), 0);
+        assert_eq!(
+            stream.finish(),
+            vec!["{\"a\":1}".to_owned()],
+            "a last event without its blank line"
+        );
     }
 
     #[test]

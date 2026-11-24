@@ -868,11 +868,15 @@ fn settings_get(settings: Shared<'_, SettingsStore>) -> Settings {
 fn settings_set(
     app: AppHandle,
     settings: Shared<'_, SettingsStore>,
+    app_state: Shared<'_, AppState>,
     value: Settings,
 ) -> Result<(), String> {
     let before = settings.get();
     let (appearance, dock) = (value.appearance, value.show_in_dock);
+    let wait = approval_wait(&value);
     settings.set(value)?;
+    // Tool calls that start from now on wait this long; a call that waits already keeps its own limit.
+    app_state.set_approval_wait(wait);
     // Only what changed: setting the Dock policy deactivates the app and brings the window back
     // (apply_dock), which should not happen when only the idle time changed.
     if appearance != before.appearance {
@@ -882,6 +886,13 @@ fn settings_set(
         apply_dock(&app, dock);
     }
     Ok(())
+}
+
+/// How long a tool call waits for the user's approval under these settings (state.rs, tools.rs).
+fn approval_wait(settings: &Settings) -> Option<Duration> {
+    settings
+        .wait_for_approval
+        .then(|| Duration::from_secs(u64::from(settings.wait_minutes) * 60))
 }
 
 /// macOS: with the Dock icon EB MCP is a regular app (Dock, Cmd+Tab); without it only the menu-bar
@@ -1520,6 +1531,7 @@ pub fn run() {
             // server takes its first call. What still waited for an answer when EB MCP stopped lapses.
             app_state.log.open(logstore::log_file(&dir));
             app_state.approvals.open(approvals::history_file(&dir));
+            app_state.set_approval_wait(approval_wait(&settings.get()));
             // Calls logged by 0.4.0 carry no wait yet: their proposals' records know when it began and ended.
             for detail in app_state.approvals.since(0) {
                 let record = &detail.record;
@@ -1578,7 +1590,7 @@ pub fn run() {
 
             // Forward state changes to every window. A change of the queue or the history also updates the
             // count in the menu bar, may lead to a notification and is saved. The app never takes the focus
-            // for it: the AI client does not wait for the answer.
+            // for it: the user answers when it suits them, also when an AI client waits in its call.
             let mut events = app_state.events.subscribe();
             let handle = app.handle().clone();
             let watching = app_state.clone();

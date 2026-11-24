@@ -94,7 +94,7 @@ impl EbMcp {
 #[tool_router(router = verkoop_router, vis = "pub(super)")]
 impl EbMcp {
     #[tool(
-        description = "Een offerte per e-mail versturen vanuit e-Boekhouden, standaard met de offerte als pdf in de bijlage. Onderwerp en bericht komen uit een e-mailsjabloon voor offertes (sjabloon_id) of geef je zelf mee; zonder ontvanger gaat de mail naar het e-mailadres van de relatie. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de ontvanger, het onderwerp en het bericht. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een offerte per e-mail versturen vanuit e-Boekhouden, standaard met de offerte als pdf in de bijlage. Onderwerp en bericht komen uit een e-mailsjabloon voor offertes (sjabloon_id) of geef je zelf mee; zonder ontvanger gaat de mail naar het e-mailadres van de relatie. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de ontvanger, het onderwerp en het bericht. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Offerte mailen",
             read_only_hint = false,
@@ -144,7 +144,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een verkoopfactuur maken van een offerte, zoals Factuur maken op de offerte in e-Boekhouden: van alle regels, van een paar regels (regel_ids uit de tool offerte), van een percentage van het offertebedrag of van een bepaald bedrag. De factuur krijgt het offertenummer als kenmerk en hoort daarna bij de offerte. Zonder nummer krijgt de factuur het volgende nummer van e-Boekhouden; standaard wordt hij meteen geboekt. De factuur wordt niet verstuurd. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de factuur eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een verkoopfactuur maken van een offerte, zoals Factuur maken op de offerte in e-Boekhouden: van alle regels, van een paar regels (regel_ids uit de tool offerte), van een percentage van het offertebedrag of van een bepaald bedrag. De factuur krijgt het offertenummer als kenmerk en hoort daarna bij de offerte. Zonder nummer krijgt de factuur het volgende nummer van e-Boekhouden; standaard wordt hij meteen geboekt. De factuur wordt niet verstuurd. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de factuur eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Offerte factureren",
             read_only_hint = false,
@@ -268,7 +268,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een voortgangsregel aan een offerte toevoegen, zoals het tabblad Voortgang in e-Boekhouden: een soort (bijvoorbeeld Telefoon, Akkoord of Afgewezen, zoals offerte_voortgang ze noemt), een onderwerp en eventueel een bericht. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een voortgangsregel aan een offerte toevoegen, zoals het tabblad Voortgang in e-Boekhouden: een soort (bijvoorbeeld Telefoon, Akkoord of Afgewezen, zoals offerte_voortgang ze noemt), een onderwerp en eventueel een bericht. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Offerte voortgang toevoegen",
             read_only_hint = false,
@@ -304,7 +304,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een voortgangsregel van een offerte wijzigen, op offerte_id en id (uit offerte_voortgang). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een voortgangsregel van een offerte wijzigen, op offerte_id en id (uit offerte_voortgang). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Offerte voortgang wijzigen",
             read_only_hint = false,
@@ -349,7 +349,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een voortgangsregel van een offerte verwijderen, op offerte_id en id (uit offerte_voortgang). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een voortgangsregel van een offerte verwijderen, op offerte_id en id (uit offerte_voortgang). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Offerte voortgang verwijderen",
             read_only_hint = false,
@@ -414,7 +414,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een afspraak of vervolgactie in de agenda van een offerte zetten, zoals het tabblad Agenda in e-Boekhouden: datum, tijd, onderwerp, eventueel een bericht en een medewerker (standaard de ingelogde gebruiker). De eerstvolgende open afspraak is de volgende actie van de offerte. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een afspraak of vervolgactie in de agenda van een offerte zetten, zoals het tabblad Agenda in e-Boekhouden: datum, tijd, onderwerp, eventueel een bericht en een medewerker (standaard de ingelogde gebruiker). De eerstvolgende open afspraak is de volgende actie van de offerte. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Offerte agenda toevoegen",
             read_only_hint = false,
@@ -453,7 +453,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een afspraak in de agenda van een offerte wijzigen, op offerte_id en id (uit offerte_agenda): datum, tijd, onderwerp, bericht, medewerker of afgehandeld (een lege tekst maakt hem weer open). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een afspraak in de agenda van een offerte wijzigen, op offerte_id en id (uit offerte_agenda): datum, tijd, onderwerp, bericht, medewerker of afgehandeld (een lege tekst maakt hem weer open). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Offerte agenda wijzigen",
             read_only_hint = false,
@@ -496,7 +496,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een afspraak uit de agenda van een offerte verwijderen, op offerte_id en id (uit offerte_agenda). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een afspraak uit de agenda van een offerte verwijderen, op offerte_id en id (uit offerte_agenda). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Offerte agenda verwijderen",
             read_only_hint = false,
@@ -532,7 +532,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Het SEPA-incassobestand maken voor alle facturen die in e-Boekhouden klaarstaan voor automatische incasso, zoals Facturen > Incassobestand. Gebruikt de IBAN en het incassocontract-ID die in e-Boekhouden zijn ingesteld (EB MCP wijzigt die niet). Het bestand wordt op deze computer opgeslagen, standaard in de map Downloads; het geld wordt pas geïncasseerd als iemand het bestand bij de bank aanbiedt. De facturen staan daarna niet meer klaar voor incasso. Dit is een betaalopdracht: de gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar elke factuur en het totaal. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Het SEPA-incassobestand maken voor alle facturen die in e-Boekhouden klaarstaan voor automatische incasso, zoals Facturen > Incassobestand. Gebruikt de IBAN en het incassocontract-ID die in e-Boekhouden zijn ingesteld (EB MCP wijzigt die niet). Het bestand wordt op deze computer opgeslagen, standaard in de map Downloads; het geld wordt pas geïncasseerd als iemand het bestand bij de bank aanbiedt. De facturen staan daarna niet meer klaar voor incasso. Dit is een betaalopdracht: de gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar elke factuur en het totaal. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Incassobestand maken",
             read_only_hint = false,
@@ -602,7 +602,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Eén verkoopfactuur via Peppol versturen, op id (uit facturen), zoals de P in het factuuroverzicht van e-Boekhouden. Kan alleen als de relatie een Peppol-ID heeft, de administratie op Peppol is aangesloten en de factuur nog niet eerder via Peppol ging: een factuur kan maar één keer via Peppol. De factuur verlaat e-Boekhouden; dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de factuur en de ontvanger. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Eén verkoopfactuur via Peppol versturen, op id (uit facturen), zoals de P in het factuuroverzicht van e-Boekhouden. Kan alleen als de relatie een Peppol-ID heeft, de administratie op Peppol is aangesloten en de factuur nog niet eerder via Peppol ging: een factuur kan maar één keer via Peppol. De factuur verlaat e-Boekhouden; dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de factuur en de ontvanger. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Factuur via Peppol",
             read_only_hint = false,
@@ -651,7 +651,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Meerdere verkoopfacturen per e-mail versturen (hoogstens 50), elk naar het factuur- of e-mailadres van zijn eigen relatie en met de eigen factuur als pdf in de bijlage. Onderwerp en bericht komen uit een e-mailsjabloon voor facturen (sjabloon_id), per factuur zoals e-Boekhouden het invult, of geef je zelf mee; eigen tekst gaat zoals hij is naar elke ontvanger, dus zonder codes zoals [FACTNUMMER]. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar elke factuur met zijn ontvanger, onderwerp en bericht. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Meerdere verkoopfacturen per e-mail versturen (hoogstens 50), elk naar het factuur- of e-mailadres van zijn eigen relatie en met de eigen factuur als pdf in de bijlage. Onderwerp en bericht komen uit een e-mailsjabloon voor facturen (sjabloon_id), per factuur zoals e-Boekhouden het invult, of geef je zelf mee; eigen tekst gaat zoals hij is naar elke ontvanger, dus zonder codes zoals [FACTNUMMER]. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar elke factuur met zijn ontvanger, onderwerp en bericht. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Facturen mailen",
             read_only_hint = false,
@@ -783,7 +783,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een bestand in het digitaal archief loskoppelen: van één mutatie (mutatie_nr) of van alles waar het aan hangt (alles: true, ook bankregels, relaties en offertes). Het bestand zelf blijft; e-Boekhouden verwijdert een gekoppeld bestand niet, dus koppel het eerst los als het weg moet (archief_verwijderen). Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP, en altijd als er een koppeling met een bankregel, relatie of offerte verdwijnt (die kan EB MCP niet terugzetten). Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een bestand in het digitaal archief loskoppelen: van één mutatie (mutatie_nr) of van alles waar het aan hangt (alles: true, ook bankregels, relaties en offertes). Het bestand zelf blijft; e-Boekhouden verwijdert een gekoppeld bestand niet, dus koppel het eerst los als het weg moet (archief_verwijderen). Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP, en altijd als er een koppeling met een bankregel, relatie of offerte verdwijnt (die kan EB MCP niet terugzetten). Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Bestand ontkoppelen",
             read_only_hint = false,

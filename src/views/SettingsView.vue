@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// Instellingen (Cmd+,): appearance and when sessions end. Changes save at once, as in macOS settings.
+// Instellingen (Cmd+,): appearance, when sessions end and how a change that needs approval reaches the AI client. Changes save at once, as in macOS settings.
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import Icon from '../components/Icon.vue'
 import TraceView from '../components/TraceView.vue'
@@ -8,11 +8,11 @@ import {
 } from '../lib/accounts'
 import { autostartGet, autostartSet, isMac, openLogDir } from '../lib/server'
 
-type Card = 'general' | 'view'
+type Card = 'general' | 'view' | 'approval'
 
 const settings = ref<Settings | null>(null)
 /** Each card shows its own errors. */
-const errors = ref<Record<Card, string | null>>({ general: null, view: null })
+const errors = ref<Record<Card, string | null>>({ general: null, view: null, approval: null })
 const autostart = ref(false)
 
 const traces = ref<Trace[]>([])
@@ -123,6 +123,25 @@ const appearances: { value: Appearance; label: string }[] = [
       <p class="hint">Afsluiten vergeet altijd alle sessies; EB MCP bewaart ze nergens. Na een update log je zelf opnieuw in{{ settings.keepSignedIn ? ', en ook als e-Boekhouden een sessie toch beëindigt' : '' }}.</p>
       <Transition name="accordion">
         <div v-if="errors.view" class="accordion"><div><p class="error" role="alert">{{ errors.view }}</p></div></div>
+      </Transition>
+    </section>
+    <h2 class="section">Akkoord</h2>
+    <section class="group card">
+      <div class="row">
+        <span class="text"><strong>Wacht op akkoord in de aanroep</strong><small>De AI-client wacht op je antwoord en gaat daarna zelf verder. Uit: hij hoort meteen dat de wijziging wacht en vraagt de uitkomst later op.</small></span>
+        <button type="button" role="switch" class="switch" :aria-checked="settings.waitForApproval" aria-label="Wacht op akkoord in de aanroep" @click="save({ waitForApproval: !settings.waitForApproval }, 'approval')"><span /></button>
+      </div>
+      <div class="row" :class="{ muted: !settings.waitForApproval }">
+        <span class="text"><strong>Hoogstens wachten</strong><small>{{ settings.waitForApproval ? 'Daarna wacht de wijziging gewoon verder op Akkoord. Claude Desktop wacht hooguit 50 seconden.' : 'Staat uit zolang Wacht op akkoord in de aanroep uit staat.' }}</small></span>
+        <select class="select" :value="settings.waitMinutes" :disabled="!settings.waitForApproval" aria-label="Hoogstens wachten" @change="save({ waitMinutes: Number(($event.target as HTMLSelectElement).value) }, 'approval')">
+          <option :value="1">1 minuut</option>
+          <option :value="2">2 minuten</option>
+          <option :value="5">5 minuten</option>
+          <option :value="10">10 minuten</option>
+        </select>
+      </div>
+      <Transition name="accordion">
+        <div v-if="errors.approval" class="accordion"><div><p class="error" role="alert">{{ errors.approval }}</p></div></div>
       </Transition>
     </section>
     <h2 class="section">Diagnose</h2>

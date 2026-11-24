@@ -1,7 +1,8 @@
 //! Changes AI clients asked for: the ones that wait for the user's word, and the history of all of them.
 //!
-//! A tool that would change an account's books puts its proposal here (`ask`) and its MCP call answers at
-//! once that the change waits (tools.rs, `write_tool`). The change itself waits in a background task on the
+//! A tool that would change an account's books puts its proposal here (`ask`) and its MCP call answers that
+//! the change waits (tools.rs, `write_tool`): at once, or, with Wacht op akkoord in de aanroep on, only when the
+//! user did not answer within the set time; an answer before that gives the call the outcome itself. The change itself waits in a background task on the
 //! receiver `ask` returns, and only "Goedkeuren" lets its requests go to e-Boekhouden. A proposal waits until
 //! the user answers, the account is removed or set to read-only (refused), the account's sign-in details
 //! change or EB MCP stops (lapsed). There is no time limit.

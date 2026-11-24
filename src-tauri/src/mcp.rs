@@ -1011,6 +1011,154 @@ mod tests {
         answer_of(body)
     }
 
+    /// With "Wacht op akkoord in de aanroep" on, the call stays open until the user answered and then gives the
+    /// outcome itself; a client that asked for progress hears meanwhile that it waits. When the user takes longer
+    /// than the setting allows, the call answers that the change waits, and the change still runs after Goedkeuren.
+    #[tokio::test]
+    async fn a_change_can_wait_in_the_call_for_the_users_answer() {
+        use crate::accounts::{AccountInput, Rights, Store};
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jar = Arc::new(crate::state::testing::FakeJar::default());
+        let state = Arc::new(crate::state::testing::state_with(
+            jar.clone(),
+            &eboekhouden(seen.clone()).await,
+        ));
+        let account = state
+            .accounts
+            .add(AccountInput {
+                label: "Studio Noord".into(),
+                username: "lisa@studionoord.example".into(),
+                store: Store::System,
+                op_ref: None,
+                op_title: None,
+                op_vault: None,
+                rights: Rights::ASK,
+            })
+            .unwrap();
+        state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
+        state.add_session(account.id, &account.label, "sessie");
+        state.set_approval_wait(Some(std::time::Duration::from_secs(30)));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mcp = router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
+        tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{PATH}");
+        let post = |body: serde_json::Value, session: Option<String>| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&body);
+            if let Some(s) = session {
+                request = request.header("mcp-session-id", s);
+            }
+            request.send()
+        };
+        let init = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "title": "Claude", "version": "1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        // A booking as its own task, so the test can answer for the user while the call waits.
+        let book = |id: u32| {
+            let call = post(
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+                    "name": "mutatie_toevoegen",
+                    "arguments": {
+                        "soort": "geld_uitgegeven", "datum": "2026-11-06", "rekening": "1010", "omschrijving": "Parkeergarage",
+                        "regels": [{"tegenrekening": "4550", "bedrag": 2}]
+                    },
+                    "_meta": {"progressToken": format!("boeking-{id}")}
+                }}),
+                session.clone(),
+            );
+            tokio::spawn(async move { call.await.unwrap().text().await.unwrap() })
+        };
+        let up = |known: usize| {
+            let state = state.clone();
+            async move {
+                for _ in 0..200 {
+                    if state.approvals.history(None).len() > known
+                        && let Some(p) = state.approvals.list().first()
+                    {
+                        return p.id;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("no proposal came up");
+            }
+        };
+
+        // Approved after a while: the call answers with the outcome, as a change without approval would.
+        let call = book(2);
+        let id = up(0).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(!call.is_finished(), "the call waits for the user");
+        assert!(state.approvals.decide(id, true, crate::state::now_ms()));
+        let body = call.await.unwrap();
+        assert!(
+            body.contains("notifications/progress")
+                && body.contains(&format!("Voorstel {id} wacht")),
+            "the client heard that the call waits: {body}"
+        );
+        let (is_error, text) = answer_of(body);
+        assert!(!is_error, "{text}");
+        assert!(
+            text.contains("3908") && text.contains("Mutatie toegevoegd"),
+            "{text}"
+        );
+        assert!(!text.contains("\"status\":\"wacht\""), "{text}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "booked once");
+
+        // Refused: the call says so, and nothing goes out.
+        let call = book(3);
+        let id = up(1).await;
+        assert!(state.approvals.decide(id, false, crate::state::now_ms()));
+        let (is_error, text) = answer_of(call.await.unwrap());
+        assert!(is_error && text.contains("geweigerd"), "{text}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "nothing more was sent");
+
+        // The user takes longer than the setting allows: the call answers that the change waits and asks not to
+        // call again; the change still runs after Goedkeuren.
+        state.set_approval_wait(Some(std::time::Duration::from_secs(1)));
+        let call = book(4);
+        let id = up(2).await;
+        let (is_error, text) = answer_of(call.await.unwrap());
+        assert!(!is_error, "{text}");
+        assert!(text.contains("\"status\":\"wacht\""), "{text}");
+        assert!(text.contains(&format!("\"voorstel_id\":{id}")), "{text}");
+        assert!(text.contains("binnen 1 seconde niet geantwoord"), "{text}");
+        assert!(text.contains("niet opnieuw"), "{text}");
+        assert_eq!(state.approvals.count(), 1, "the change still waits");
+        assert!(state.approvals.decide(id, true, crate::state::now_ms()));
+        let record = settled(&state, id).await;
+        assert_eq!(record.status, crate::approvals::Status::Done);
+        assert_eq!(seen.lock().unwrap().len(), 2, "booked after Goedkeuren");
+
+        // Waiting off: the call answers at once, as before.
+        state.set_approval_wait(None);
+        let call = book(5);
+        let (_, text) = answer_of(call.await.unwrap());
+        assert!(
+            text.contains("\"status\":\"wacht\"") && text.contains("Je hoeft niet te wachten"),
+            "{text}"
+        );
+    }
+
     fn answer_of(body: String) -> (bool, String) {
         let answer = serde_json::from_str::<serde_json::Value>(&body)
             .ok()

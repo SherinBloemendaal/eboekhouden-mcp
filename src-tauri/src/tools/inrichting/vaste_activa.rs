@@ -908,7 +908,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een vast actief aanmaken, zoals Vaste activa toevoegen in e-Boekhouden. Nodig: omschrijving, aanschafdatum, aanschafwaarde en restwaarde; groep_id als er meer dan één groep is (vaste_activa_groepen). Aantal jaren en de twee rekeningen komen standaard van de groep. e-Boekhouden maakt er een afschrijfschema bij; de aanschaf zelf wordt hiermee niet geboekt en de afschrijvingen pas met afschrijvingen_boeken. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een vast actief aanmaken, zoals Vaste activa toevoegen in e-Boekhouden. Nodig: omschrijving, aanschafdatum, aanschafwaarde en restwaarde; groep_id als er meer dan één groep is (vaste_activa_groepen). Aantal jaren en de twee rekeningen komen standaard van de groep. e-Boekhouden maakt er een afschrijfschema bij; de aanschaf zelf wordt hiermee niet geboekt en de afschrijvingen pas met afschrijvingen_boeken. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Vast actief toevoegen",
             read_only_hint = false,
@@ -941,7 +941,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een vast actief wijzigen, op id (uit vaste_activa). Wat je niet noemt blijft zoals het is. Het afschrijfschema blijft staan, tenzij schema_opnieuw true is: dan maakt e-Boekhouden het opnieuw op met de nieuwe gegevens, zoals het vinkje Afschrijfschema opnieuw opmaken. Dat vervangt het hele schema, ook regels die al geboekt of met de hand aangepast zijn, en vraagt daarom altijd het akkoord van de gebruiker; de goedkeuring toont het huidige schema. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een vast actief wijzigen, op id (uit vaste_activa). Wat je niet noemt blijft zoals het is. Het afschrijfschema blijft staan, tenzij schema_opnieuw true is: dan maakt e-Boekhouden het opnieuw op met de nieuwe gegevens, zoals het vinkje Afschrijfschema opnieuw opmaken. Dat vervangt het hele schema, ook regels die al geboekt of met de hand aangepast zijn, en vraagt daarom altijd het akkoord van de gebruiker; de goedkeuring toont het huidige schema. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Vast actief wijzigen",
             read_only_hint = false,
@@ -988,7 +988,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een vast actief verwijderen, op id (uit vaste_activa). De goedkeuring laat zien hoeveel van het afschrijfschema al geboekt is. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een vast actief verwijderen, op id (uit vaste_activa). De goedkeuring laat zien hoeveel van het afschrijfschema al geboekt is. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Vast actief verwijderen",
             read_only_hint = false,
@@ -1023,7 +1023,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Alle afschrijvingen boeken die klaarstaan, zoals Afschrijvingen boeken in e-Boekhouden: elke klaarstaande afschrijving van elk vast actief wordt in één keer als mutatie geboekt. Eén vast actief kiezen kan niet; vaste_activa zegt hoeveel er klaarstaan. De goedkeuring toont per vast actief de regels uit het afschrijfschema met een datum tot en met vandaag die nog niet geboekt zijn, met datum, bedrag en totaal. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Alle afschrijvingen boeken die klaarstaan, zoals Afschrijvingen boeken in e-Boekhouden: elke klaarstaande afschrijving van elk vast actief wordt in één keer als mutatie geboekt. Eén vast actief kiezen kan niet; vaste_activa zegt hoeveel er klaarstaan. De goedkeuring toont per vast actief de regels uit het afschrijfschema met een datum tot en met vandaag die nog niet geboekt zijn, met datum, bedrag en totaal. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Afschrijvingen boeken",
             read_only_hint = false,

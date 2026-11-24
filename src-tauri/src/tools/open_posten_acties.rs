@@ -340,7 +340,7 @@ impl EbMcp {
 #[tool_router(router = open_posten_acties_router, vis = "pub(super)")]
 impl EbMcp {
     #[tool(
-        description = "Een herinnering of aanmaning per e-mail versturen vanuit e-Boekhouden, voor één of meer open posten van debiteuren (uit open_posten), zoals Aanmanen per e-mail op de open posten in e-Boekhouden. De tekst komt uit een aanmaansjabloon per e-mail (sjablonen met soort aanmaan; maak er een met sjabloon_toevoegen); e-Boekhouden vult de codes per relatie en factuur in en kiest zelf naar welk e-mailadres van de relatie de mail gaat. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de relaties met de e-mailadressen die EB MCP van ze kent, het sjabloon met onderwerp en tekst, en de facturen met hun openstaande bedragen. Is de uitkomst onbekend, kijk dan eerst met aanmaning_historie of de herinnering al is verstuurd voordat je het opnieuw probeert. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een herinnering of aanmaning per e-mail versturen vanuit e-Boekhouden, voor één of meer open posten van debiteuren (uit open_posten), zoals Aanmanen per e-mail op de open posten in e-Boekhouden. De tekst komt uit een aanmaansjabloon per e-mail (sjablonen met soort aanmaan; maak er een met sjabloon_toevoegen); e-Boekhouden vult de codes per relatie en factuur in en kiest zelf naar welk e-mailadres van de relatie de mail gaat. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de relaties met de e-mailadressen die EB MCP van ze kent, het sjabloon met onderwerp en tekst, en de facturen met hun openstaande bedragen. Is de uitkomst onbekend, kijk dan eerst met aanmaning_historie of de herinnering al is verstuurd voordat je het opnieuw probeert. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Herinnering versturen",
             read_only_hint = false,
@@ -443,7 +443,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een of meer open posten afboeken (wegboeken), zoals Afboeken op de open posten in e-Boekhouden: het openstaande bedrag gaat naar een tegenrekening, standaard Betalingsverschillen, en de factuur staat daarna niet meer open. Bij één open post kan een eigen bedrag; bij meer wordt elk hele openstaande bedrag afgeboekt. Dit schrijft een vordering of schuld af. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar per factuur het bedrag en de grootboekrekening waar het heen gaat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een of meer open posten afboeken (wegboeken), zoals Afboeken op de open posten in e-Boekhouden: het openstaande bedrag gaat naar een tegenrekening, standaard Betalingsverschillen, en de factuur staat daarna niet meer open. Bij één open post kan een eigen bedrag; bij meer wordt elk hele openstaande bedrag afgeboekt. Dit schrijft een vordering of schuld af. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar per factuur het bedrag en de grootboekrekening waar het heen gaat. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Open post afboeken",
             read_only_hint = false,
@@ -534,7 +534,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Berichten in het postvak markeren als gelezen, op id (uit berichten), zoals Markeren als gelezen in e-Boekhouden. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Berichten in het postvak markeren als gelezen, op id (uit berichten), zoals Markeren als gelezen in e-Boekhouden. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Bericht gelezen",
             read_only_hint = false,
@@ -558,7 +558,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Berichten uit het postvak naar het archief verplaatsen, op id (uit berichten), zoals Verplaatsen naar het archief in e-Boekhouden. In het archief zijn ze nog te lezen (berichten met map archief). Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Berichten uit het postvak naar het archief verplaatsen, op id (uit berichten), zoals Verplaatsen naar het archief in e-Boekhouden. In het archief zijn ze nog te lezen (berichten met map archief). Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Bericht archiveren",
             read_only_hint = false,
@@ -582,7 +582,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een bericht versturen aan de accountant van de administratie, via e-Boekhouden (Overig > Berichten), of een bericht beantwoorden (antwoord_op). Alleen voor een administratie die aan een accountant gekoppeld is, niet voor de login van een accountant; het bericht gaat altijd naar die accountant. Bij antwoord_op leest EB MCP eerst het oorspronkelijke bericht, zoals e-Boekhouden doet als je het opent. Dit verstuurt een bericht en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de ontvanger, het onderwerp en de tekst. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een bericht versturen aan de accountant van de administratie, via e-Boekhouden (Overig > Berichten), of een bericht beantwoorden (antwoord_op). Alleen voor een administratie die aan een accountant gekoppeld is, niet voor de login van een accountant; het bericht gaat altijd naar die accountant. Bij antwoord_op leest EB MCP eerst het oorspronkelijke bericht, zoals e-Boekhouden doet als je het opent. Dit verstuurt een bericht en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de ontvanger, het onderwerp en de tekst. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Bericht versturen",
             read_only_hint = false,
@@ -709,7 +709,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "De accountant vragen een maand of kwartaal te controleren (een controle-opdracht), met een opmerking erbij. Alleen voor een administratie die aan een accountant gekoppeld is, niet voor de login van een accountant. Dit stuurt een verzoek naar de accountant en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de accountant, de periode en de opmerking. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "De accountant vragen een maand of kwartaal te controleren (een controle-opdracht), met een opmerking erbij. Alleen voor een administratie die aan een accountant gekoppeld is, niet voor de login van een accountant. Dit stuurt een verzoek naar de accountant en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de accountant, de periode en de opmerking. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Controle-opdracht aanvragen",
             read_only_hint = false,
@@ -766,7 +766,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Als accountant een controle-opdracht van een klant goedkeuren of afkeuren, met een opmerking voor de klant, op id (uit controleopdrachten met als_accountant). Alleen voor een account van een accountant. De klant ziet het besluit; het is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Als accountant een controle-opdracht van een klant goedkeuren of afkeuren, met een opmerking voor de klant, op id (uit controleopdrachten met als_accountant). Alleen voor een account van een accountant. De klant ziet het besluit; het is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Controle-opdracht beoordelen",
             read_only_hint = false,

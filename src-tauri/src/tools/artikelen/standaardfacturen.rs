@@ -390,7 +390,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een standaard factuur maken: een naam, het factuursjabloon (standaard dat uit de factuurinstellingen), eventueel een e-mailsjabloon, en vaste regels zoals op een factuur (prijs per stuk incl of excl btw, btw op code, omzetrekening op code). Er wordt geen factuur gemaakt of verstuurd. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de standaard factuur eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een standaard factuur maken: een naam, het factuursjabloon (standaard dat uit de factuurinstellingen), eventueel een e-mailsjabloon, en vaste regels zoals op een factuur (prijs per stuk incl of excl btw, btw op code, omzetrekening op code). Er wordt geen factuur gemaakt of verstuurd. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de standaard factuur eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Standaard factuur toevoegen",
             read_only_hint = false,
@@ -423,7 +423,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een standaard factuur wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. Facturen die al met deze standaard factuur gemaakt zijn veranderen niet. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een standaard factuur wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. Facturen die al met deze standaard factuur gemaakt zijn veranderen niet. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Standaard factuur wijzigen",
             read_only_hint = false,
@@ -457,7 +457,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een standaard factuur verwijderen, op id. Facturen die er al mee gemaakt zijn blijven staan. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een standaard factuur verwijderen, op id. Facturen die er al mee gemaakt zijn blijven staan. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Standaard factuur verwijderen",
             read_only_hint = false,

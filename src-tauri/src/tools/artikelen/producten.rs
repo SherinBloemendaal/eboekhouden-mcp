@@ -918,7 +918,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een product of dienst toevoegen aan Factureren > Producten en diensten. Code, omschrijving, verkoopprijs (incl of excl btw), btw-code voor verkoop en tegenrekening (op code) zijn nodig; groep en eenheid op id (uit artikelgroepen en eenheden). De andere prijs rekent EB MCP uit zoals het formulier van e-Boekhouden. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het product eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een product of dienst toevoegen aan Factureren > Producten en diensten. Code, omschrijving, verkoopprijs (incl of excl btw), btw-code voor verkoop en tegenrekening (op code) zijn nodig; groep en eenheid op id (uit artikelgroepen en eenheden). De andere prijs rekent EB MCP uit zoals het formulier van e-Boekhouden. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het product eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Product toevoegen",
             read_only_hint = false,
@@ -951,7 +951,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een product of dienst wijzigen, op id. Wat je niet noemt blijft zoals het is. Een nieuwe prijs of btw-code rekent de andere prijs opnieuw uit. Met doorvoeren gaat de wijziging (alles, of alleen de prijs) ook naar de bestaande abonnementen met dit product; dat vraagt altijd het akkoord van de gebruiker. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een product of dienst wijzigen, op id. Wat je niet noemt blijft zoals het is. Een nieuwe prijs of btw-code rekent de andere prijs opnieuw uit. Met doorvoeren gaat de wijziging (alles, of alleen de prijs) ook naar de bestaande abonnementen met dit product; dat vraagt altijd het akkoord van de gebruiker. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Product wijzigen",
             read_only_hint = false,
@@ -995,7 +995,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een product of dienst verwijderen, op id. Eventueel ingevoerde voorraad van het product verdwijnt mee. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een product of dienst verwijderen, op id. Eventueel ingevoerde voorraad van het product verdwijnt mee. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Product verwijderen",
             read_only_hint = false,
@@ -1046,7 +1046,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een eenheid voor producten en diensten toevoegen, met enkelvoud en meervoud (bijvoorbeeld uur en uren). Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de eenheid eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een eenheid voor producten en diensten toevoegen, met enkelvoud en meervoud (bijvoorbeeld uur en uren). Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de eenheid eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Eenheid toevoegen",
             read_only_hint = false,
@@ -1078,7 +1078,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een eenheid wijzigen, op id (uit eenheden). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een eenheid wijzigen, op id (uit eenheden). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Eenheid wijzigen",
             read_only_hint = false,
@@ -1113,7 +1113,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een eenheid verwijderen, op id (uit eenheden). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een eenheid verwijderen, op id (uit eenheden). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Eenheid verwijderen",
             read_only_hint = false,
@@ -1162,7 +1162,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een groep voor producten en diensten toevoegen, met code en omschrijving. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de groep eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een groep voor producten en diensten toevoegen, met code en omschrijving. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de groep eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Productgroep toevoegen",
             read_only_hint = false,
@@ -1194,7 +1194,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een groep van producten en diensten wijzigen, op id (uit artikelgroepen). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een groep van producten en diensten wijzigen, op id (uit artikelgroepen). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Productgroep wijzigen",
             read_only_hint = false,
@@ -1229,7 +1229,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een groep van producten en diensten verwijderen, op id (uit artikelgroepen). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een groep van producten en diensten verwijderen, op id (uit artikelgroepen). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Productgroep verwijderen",
             read_only_hint = false,

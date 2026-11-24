@@ -73,7 +73,7 @@ beforeEach(() => {
       case 'approvals_export': return onExport()
       case 'log_export_reveal': return onReveal(args!.path as string)
       case 'accounts_list': return []
-      case 'settings_get': return { idleMinutes: 30, appearance: 'system', showInDock: true }
+      case 'settings_get': return { idleMinutes: 30, appearance: 'system', showInDock: true, waitForApproval: true, waitMinutes: 5 }
       case 'log_list': return []
       default: return undefined
     }

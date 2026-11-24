@@ -723,7 +723,7 @@ impl EbMcp {
     // ------------------------------------------------------------ hours
 
     #[tool(
-        description = "Een urenregel toevoegen: datum, project, activiteit, en uren of kilometers (of beide), met opmerkingen. Zoek project en activiteit eerst op met projecten en activiteiten; ze moeten actief zijn. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een urenregel toevoegen: datum, project, activiteit, en uren of kilometers (of beide), met opmerkingen. Zoek project en activiteit eerst op met projecten en activiteiten; ze moeten actief zijn. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Uren toevoegen",
             read_only_hint = false,
@@ -786,7 +786,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een urenregel wijzigen, op id (uit uren). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een urenregel wijzigen, op id (uit uren). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Uren wijzigen",
             read_only_hint = false,
@@ -850,7 +850,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een urenregel verwijderen, op id (uit uren). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een urenregel verwijderen, op id (uit uren). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Uren verwijderen",
             read_only_hint = false,
@@ -908,7 +908,7 @@ impl EbMcp {
     // ------------------------------------------------------------ projects
 
     #[tool(
-        description = "Een project voor de urenregistratie aanmaken bij een relatie. Naam en relatie zijn nodig. Standaard mogen alle gebruikers er uren op schrijven, zoals in e-Boekhouden. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een project voor de urenregistratie aanmaken bij een relatie. Naam en relatie zijn nodig. Standaard mogen alle gebruikers er uren op schrijven, zoals in e-Boekhouden. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Project toevoegen",
             read_only_hint = false,
@@ -952,7 +952,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een project wijzigen, op id (uit projecten): naam, relatie, omschrijving, facturabel, actief of de gebruikers die er uren op mogen schrijven. Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een project wijzigen, op id (uit projecten): naam, relatie, omschrijving, facturabel, actief of de gebruikers die er uren op mogen schrijven. Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Project wijzigen",
             read_only_hint = false,
@@ -1013,7 +1013,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een project verwijderen, op id (uit projecten). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een project verwijderen, op id (uit projecten). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Project verwijderen",
             read_only_hint = false,
@@ -1077,7 +1077,7 @@ impl EbMcp {
     // ------------------------------------------------------------ activities
 
     #[tool(
-        description = "Een activiteit voor de urenregistratie aanmaken, met uur- en kilometertarief. Een facturabele activiteit heeft een tarief, een omzetrekening (tegenrekening, standaard 8000) en bij een btw-plichtige administratie een btw-code voor de verkoop nodig. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een activiteit voor de urenregistratie aanmaken, met uur- en kilometertarief. Een facturabele activiteit heeft een tarief, een omzetrekening (tegenrekening, standaard 8000) en bij een btw-plichtige administratie een btw-code voor de verkoop nodig. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Activiteit toevoegen",
             read_only_hint = false,
@@ -1110,7 +1110,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een activiteit wijzigen, op id (uit activiteiten): naam, omschrijving, tarieven, facturabel, factuuromschrijving, btw-code, tegenrekening of actief. Wat je niet noemt blijft zoals het is, ook de kostenplaats. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een activiteit wijzigen, op id (uit activiteiten): naam, omschrijving, tarieven, facturabel, factuuromschrijving, btw-code, tegenrekening of actief. Wat je niet noemt blijft zoals het is, ook de kostenplaats. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Activiteit wijzigen",
             read_only_hint = false,
@@ -1184,7 +1184,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een activiteit verwijderen, op id (uit activiteiten). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een activiteit verwijderen, op id (uit activiteiten). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Activiteit verwijderen",
             read_only_hint = false,
@@ -1251,7 +1251,7 @@ impl EbMcp {
     // ------------------------------------------------------------ invoicing hours
 
     #[tool(
-        description = "Facturen maken van uren, zoals Uren > Factureren in e-Boekhouden: voor de nog niet gefactureerde uren van de periode en filters (standaard deze maand), of alleen de urenregels in uur_ids, maakt e-Boekhouden per relatie één factuur, met een factuurregel per project en activiteit. Bekijk eerst met uren_te_factureren wat er gefactureerd wordt. De factuurinstellingen (uren_factuurinstellingen) bepalen het sjabloon en of de facturen meteen verwerkt, voor post of e-mail klaargezet of geïncasseerd worden. Na het akkoord leest EB MCP de uren opnieuw; zijn ze intussen gewijzigd of gefactureerd, dan gebeurt er niets. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet per relatie wat er gefactureerd wordt. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Facturen maken van uren, zoals Uren > Factureren in e-Boekhouden: voor de nog niet gefactureerde uren van de periode en filters (standaard deze maand), of alleen de urenregels in uur_ids, maakt e-Boekhouden per relatie één factuur, met een factuurregel per project en activiteit. Bekijk eerst met uren_te_factureren wat er gefactureerd wordt. De factuurinstellingen (uren_factuurinstellingen) bepalen het sjabloon en of de facturen meteen verwerkt, voor post of e-mail klaargezet of geïncasseerd worden. Na het akkoord leest EB MCP de uren opnieuw; zijn ze intussen gewijzigd of gefactureerd, dan gebeurt er niets. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet per relatie wat er gefactureerd wordt. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Uren factureren",
             read_only_hint = false,
@@ -1313,7 +1313,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Urenregels op een bestaande factuur zetten, zoals Factureren > Toevoegen aan bestaande factuur in e-Boekhouden: de uren komen als regels op die factuur. Geef het factuurnummer en de ids van de urenregels (uit uren_te_factureren). De uren moeten nog niet gefactureerd zijn en bij een project van de relatie van die factuur horen. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Urenregels op een bestaande factuur zetten, zoals Factureren > Toevoegen aan bestaande factuur in e-Boekhouden: de uren komen als regels op die factuur. Geef het factuurnummer en de ids van de urenregels (uit uren_te_factureren). De uren moeten nog niet gefactureerd zijn en bij een project van de relatie van die factuur horen. Dit is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Uren bij factuur",
             read_only_hint = false,
@@ -1447,7 +1447,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "De factuurinstellingen van het menu Uren wijzigen: eenheid voor uren en kilometers, factuursjabloon, opmaak van de factuurregel, betalingstermijn, en of facturen klaargezet worden voor post of e-mail, geïncasseerd en meteen verwerkt worden. Wat je niet noemt blijft zoals het is. Het factuursjabloon en verwerken gelden ook voor facturen die factuur_toevoegen maakt. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "De factuurinstellingen van het menu Uren wijzigen: eenheid voor uren en kilometers, factuursjabloon, opmaak van de factuurregel, betalingstermijn, en of facturen klaargezet worden voor post of e-mail, geïncasseerd en meteen verwerkt worden. Wat je niet noemt blijft zoals het is. Het factuursjabloon en verwerken gelden ook voor facturen die factuur_toevoegen maakt. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Factuurinstellingen uren wijzigen",
             read_only_hint = false,

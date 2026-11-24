@@ -345,3 +345,125 @@ async fn says_to_start_eb_mcp_when_there_is_no_token() {
     );
     std::fs::remove_dir_all(&home).unwrap();
 }
+
+/// A tool call that waits (for the user's approval in EB MCP) sends progress events and answers much later; a
+/// request sent after it must get its answer first, and the progress must reach the client before the answer.
+#[tokio::test]
+async fn a_waiting_call_holds_up_nothing_and_its_progress_comes_through_at_once() {
+    use axum::body::Body;
+    let bridged = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = bridged.clone();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let released = Arc::new(tokio::sync::Mutex::new(Some(released)));
+    let app = Router::new().route(
+        "/mcp",
+        post(move |headers: HeaderMap, body: String| {
+            let (seen, released) = (seen.clone(), released.clone());
+            async move {
+                seen.lock().unwrap().push(
+                    headers
+                        .get("x-eb-mcp-bridge")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                let message: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let id = message["id"].clone();
+                let sse = |body: Body| {
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .header("mcp-session-id", "s-1")
+                        .body(body)
+                        .unwrap()
+                };
+                match message["method"].as_str() {
+                    Some("initialize") => sse(Body::from(format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2025-06-18"}})
+                    ))),
+                    Some("tools/call") => {
+                        // First a progress event at once, then the answer once the test releases it.
+                        let wait = released.lock().await.take().unwrap();
+                        let progress = format!(
+                            "data: {}\n\n",
+                            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progressToken": "p", "progress": 15}})
+                        );
+                        let answer = format!(
+                            "data: {}\n\n",
+                            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"content": []}})
+                        );
+                        let chunks = async_stream(progress, wait, answer);
+                        sse(Body::from_stream(chunks))
+                    }
+                    _ => sse(Body::from(format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"tools": []}})
+                    ))),
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let url = format!("http://127.0.0.1:{}/mcp", addr.port());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_eb-mcp-bridge"))
+        .args(["--url", &url])
+        .env("EB_MCP_TOKEN", "t0k3n")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap()).lines();
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+        .await
+        .unwrap();
+    assert!(out.next_line().await.unwrap().unwrap().contains("\"id\":1"));
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"mutatie_toevoegen\"}}\n")
+        .await
+        .unwrap();
+    let progress = out.next_line().await.unwrap().unwrap();
+    assert!(progress.contains("notifications/progress"), "{progress}");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"}\n")
+        .await
+        .unwrap();
+    let list = out.next_line().await.unwrap().unwrap();
+    assert!(
+        list.contains("\"id\":3"),
+        "the later request is not held up: {list}"
+    );
+    release.send(()).unwrap();
+    let call = out.next_line().await.unwrap().unwrap();
+    assert!(call.contains("\"id\":2"), "{call}");
+    drop(stdin);
+    child.wait().await.unwrap();
+    assert!(
+        bridged.lock().unwrap().iter().all(|h| h == "1"),
+        "every request says it comes through the bridge"
+    );
+}
+
+/// The body of the waiting call: `first`, then `last` once `wait` is released.
+fn async_stream(
+    first: String,
+    wait: tokio::sync::oneshot::Receiver<()>,
+    last: String,
+) -> impl futures_util::Stream<Item = Result<String, std::convert::Infallible>> {
+    futures_util::stream::unfold(
+        (Some(first), Some(wait), Some(last)),
+        |(first, wait, last)| async move {
+            if let Some(first) = first {
+                return Some((Ok(first), (None, wait, last)));
+            }
+            if let Some(wait) = wait {
+                let _ = wait.await;
+            }
+            last.map(|last| (Ok(last), (None, None, None)))
+        },
+    )
+}

@@ -383,7 +383,7 @@ impl EbMcp {
     // ------------------------------------------------------------ grootboekrekeningen
 
     #[tool(
-        description = "Een grootboekrekening aan het rekeningschema toevoegen, zoals Beheer > Inrichting > Grootboekrekeningen in e-Boekhouden: code (uniek, hoogstens 10 tekens), omschrijving, categorie (standaard VW, winst en verlies; zie grootboekrekening_categorieen) en eventueel een rekeninggroep. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de rekening eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een grootboekrekening aan het rekeningschema toevoegen, zoals Beheer > Inrichting > Grootboekrekeningen in e-Boekhouden: code (uniek, hoogstens 10 tekens), omschrijving, categorie (standaard VW, winst en verlies; zie grootboekrekening_categorieen) en eventueel een rekeninggroep. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de rekening eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Grootboekrekening toevoegen",
             read_only_hint = false,
@@ -419,7 +419,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een grootboekrekening wijzigen, op id of code: nieuwe code, omschrijving, categorie, rekeninggroep of inactief. Wat je niet noemt blijft zoals het is. Een andere code of categorie geldt ook voor alle boekingen die al op de rekening staan; zo'n wijziging vraagt daarom altijd het akkoord van de gebruiker. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een grootboekrekening wijzigen, op id of code: nieuwe code, omschrijving, categorie, rekeninggroep of inactief. Wat je niet noemt blijft zoals het is. Een andere code of categorie geldt ook voor alle boekingen die al op de rekening staan; zo'n wijziging vraagt daarom altijd het akkoord van de gebruiker. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Grootboekrekening wijzigen",
             read_only_hint = false,
@@ -467,7 +467,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een grootboekrekening uit het rekeningschema verwijderen, op id of code. Dit is niet terug te draaien; staan er nog boekingen op de rekening, dan kan e-Boekhouden weigeren. Wil je hem alleen niet meer gebruiken, zet hem dan op inactief met grootboekrekening_wijzigen. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een grootboekrekening uit het rekeningschema verwijderen, op id of code. Dit is niet terug te draaien; staan er nog boekingen op de rekening, dan kan e-Boekhouden weigeren. Wil je hem alleen niet meer gebruiken, zet hem dan op inactief met grootboekrekening_wijzigen. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Grootboekrekening verwijderen",
             read_only_hint = false,
@@ -507,7 +507,7 @@ impl EbMcp {
     // ------------------------------------------------------------ rekeninggroepen
 
     #[tool(
-        description = "Een rekeninggroep toevoegen, met code (uniek) en naam, elk hoogstens 50 tekens. Daarna kun je grootboekrekeningen in de groep zetten met grootboekrekening_wijzigen. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de groep eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een rekeninggroep toevoegen, met code (uniek) en naam, elk hoogstens 50 tekens. Daarna kun je grootboekrekeningen in de groep zetten met grootboekrekening_wijzigen. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de groep eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Rekeninggroep toevoegen",
             read_only_hint = false,
@@ -540,7 +540,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een rekeninggroep wijzigen, op id (uit rekeninggroepen): code of naam. Een andere code vraagt altijd het akkoord van de gebruiker, omdat de rekeningen van de groep er met die code naar verwijzen. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een rekeninggroep wijzigen, op id (uit rekeninggroepen): code of naam. Een andere code vraagt altijd het akkoord van de gebruiker, omdat de rekeningen van de groep er met die code naar verwijzen. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Rekeninggroep wijzigen",
             read_only_hint = false,
@@ -579,7 +579,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een rekeninggroep verwijderen, op id (uit rekeninggroepen). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een rekeninggroep verwijderen, op id (uit rekeninggroepen). Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Rekeninggroep verwijderen",
             read_only_hint = false,
@@ -619,7 +619,7 @@ impl EbMcp {
     // ------------------------------------------------------------ kostenplaatsen
 
     #[tool(
-        description = "Een kostenplaats toevoegen, bovenaan of onder een andere (onder_id, uit kostenplaatsen), zoals Boekhouden > Kostenplaatsen in e-Boekhouden. Onder een inactieve kostenplaats kan dat niet. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de kostenplaats eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een kostenplaats toevoegen, bovenaan of onder een andere (onder_id, uit kostenplaatsen), zoals Boekhouden > Kostenplaatsen in e-Boekhouden. Onder een inactieve kostenplaats kan dat niet. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de kostenplaats eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Kostenplaats toevoegen",
             read_only_hint = false,
@@ -652,7 +652,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een kostenplaats wijzigen, op id (uit kostenplaatsen): omschrijving of inactief. De plaats in de boom blijft. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een kostenplaats wijzigen, op id (uit kostenplaatsen): omschrijving of inactief. De plaats in de boom blijft. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Kostenplaats wijzigen",
             read_only_hint = false,
@@ -685,7 +685,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een kostenplaats verwijderen, op id (uit kostenplaatsen). Dit is niet terug te draaien; het akkoordvenster noemt de kostenplaatsen die eronder staan. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een kostenplaats verwijderen, op id (uit kostenplaatsen). Dit is niet terug te draaien; het akkoordvenster noemt de kostenplaatsen die eronder staan. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan wacht de aanroep tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft dan de uitkomst. Komt er toch status wacht met een voorstel_id terug, doe de aanroep dan niet opnieuw: de wijziging gaat door zodra de gebruiker goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk.",
         annotations(
             title = "Kostenplaats verwijderen",
             read_only_hint = false,
