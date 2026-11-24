@@ -624,6 +624,35 @@ fn notification_text(fresh: &[approvals::Proposal]) -> (String, String) {
     (title, lines.join("\n"))
 }
 
+/// Where each notification of this run leads, by the id it was shown with, so a click on an older one opens
+/// its own proposal and not that of the newest. Only the last few are kept; a click the system reports
+/// without its notification, or on one that is no longer kept, leads to the Akkoord page with all that wait.
+#[derive(Default)]
+struct NotificationRoutes {
+    next: i32,
+    routes: std::collections::VecDeque<(i32, String)>,
+}
+
+impl NotificationRoutes {
+    const KEPT: usize = 32;
+
+    /// Keeps the route of a notification that is about to show and gives the id to show it with.
+    fn add(&mut self, route: String) -> i32 {
+        self.next = self.next.checked_add(1).unwrap_or(1);
+        if self.routes.len() == Self::KEPT {
+            self.routes.pop_front();
+        }
+        self.routes.push_back((self.next, route));
+        self.next
+    }
+
+    /// The route of the notification with this id.
+    fn route(&self, id: Option<i32>) -> String {
+        id.and_then(|id| self.routes.iter().find(|(kept, _)| *kept == id))
+            .map_or_else(|| APPROVALS_ROUTE.to_owned(), |(_, route)| route.clone())
+    }
+}
+
 /// Where a click on the notification for `fresh` leads: the proposal itself when there is one, else the
 /// Akkoord page with all that wait.
 fn notification_route(fresh: &[approvals::Proposal]) -> String {
@@ -643,7 +672,7 @@ fn any_window_focused(app: &AppHandle) -> bool {
 
 /// A system notification for proposals that came up. When notifications are not allowed or not available,
 /// nothing happens: the count in the menu bar and the app itself show what waits.
-fn notify_waiting(app: &AppHandle, fresh: &[approvals::Proposal]) {
+fn notify_waiting(app: &AppHandle, fresh: &[approvals::Proposal], id: i32) {
     use tauri::plugin::PermissionState;
     use tauri_plugin_notification::NotificationExt;
     let notification = app.notification();
@@ -660,7 +689,7 @@ fn notify_waiting(app: &AppHandle, fresh: &[approvals::Proposal]) {
         return;
     }
     let (title, body) = notification_text(fresh);
-    if let Err(e) = notification.builder().title(title).body(body).show() {
+    if let Err(e) = notification.builder().id(id).title(title).body(body).show() {
         log::info!("no notification for a waiting change: {e}");
     }
 }
@@ -1563,13 +1592,16 @@ pub fn run() {
             });
 
             // A click on a notification of a waiting change opens the main window at Akkoord, on the proposal
-            // when the last notification was about one.
-            let clicked = Arc::new(std::sync::Mutex::new(APPROVALS_ROUTE.to_owned()));
+            // when that notification was about one. An older notification still leads to its own proposal.
+            let clicked = Arc::new(std::sync::Mutex::new(NotificationRoutes::default()));
             {
                 use tauri_plugin_notification::NotificationExt;
                 let (handle, clicked) = (app.handle().clone(), clicked.clone());
-                let _ = app.notification().on_action(move |_| {
-                    let route = clicked.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let _ = app.notification().on_action(move |performed| {
+                    let route = clicked
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .route(performed.notification().map(|n| n.id()));
                     open_main(handle.clone(), Some(route));
                 });
             }
@@ -1594,9 +1626,11 @@ pub fn run() {
                         && choices.get().notify_approvals
                         && !any_window_focused(&handle)
                     {
-                        *clicked.lock().unwrap_or_else(|e| e.into_inner()) =
-                            notification_route(&fresh);
-                        notify_waiting(&handle, &fresh);
+                        let id = clicked
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .add(notification_route(&fresh));
+                        notify_waiting(&handle, &fresh, id);
                     }
                 }
             });
@@ -1936,6 +1970,21 @@ mod tests {
         // A click opens the one proposal, or the page with all of them.
         assert_eq!(notification_route(&one), "/akkoord?open=8");
         assert_eq!(notification_route(&many), "/akkoord");
+        // Each notification keeps its own route: a click on an older one opens its own proposal.
+        let mut routes = NotificationRoutes::default();
+        let first = routes.add("/akkoord?open=8".into());
+        let second = routes.add("/akkoord?open=9".into());
+        assert_ne!(first, second);
+        assert_eq!(routes.route(Some(first)), "/akkoord?open=8");
+        assert_eq!(routes.route(Some(second)), "/akkoord?open=9");
+        // A click without its notification, or on one long gone, opens the page with all that wait.
+        assert_eq!(routes.route(None), "/akkoord");
+        assert_eq!(routes.route(Some(999)), "/akkoord");
+        for n in 0..NotificationRoutes::KEPT {
+            routes.add(format!("/akkoord?open={}", 100 + n));
+        }
+        assert_eq!(routes.route(Some(first)), "/akkoord");
+        assert_eq!(routes.routes.len(), NotificationRoutes::KEPT);
     }
 
     #[test]
