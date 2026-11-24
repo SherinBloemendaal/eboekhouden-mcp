@@ -270,6 +270,8 @@ mod tests {
             "btw",
             "uren",
             "digitaal_archief",
+            "mutatie_bijlagen",
+            "bijlage_downloaden",
             "get",
             "mutatie",
             "facturen",
@@ -363,7 +365,7 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            28 + writes.len() + part_reads.len() + part_writes.len()
+            30 + writes.len() + part_reads.len() + part_writes.len()
         );
         assert_eq!(crate::tools::tool_count(), names.len());
 
@@ -1099,6 +1101,36 @@ mod tests {
                 }),
             )
             .route(
+                // The files linked to mutatie 16; mutatie 17 has none, and the answer is then empty. Any other
+                // query is an error, so the tool must ask exactly as e-Boekhouden's archive grid does.
+                "/v1/api/folder/gekoppeldgridtable",
+                get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                    let asked = |key: &str| q.get(key).map(String::as_str);
+                    if asked("koppelSoort") != Some("MUT") || asked("sortDirection") != Some("0") {
+                        return axum::http::StatusCode::BAD_REQUEST.into_response();
+                    }
+                    match asked("koppelId") {
+                        Some("16") => axum::Json(json!({
+                            "colMetadata": [{"name": "id"}, {"name": "koppelId"}, {"name": "naam"}, {"name": "soort"}, {"name": "datum"}, {"name": "grootte"}, {"name": "guid"}],
+                            "data": [[5, 16, "bon-5.jpg", "F", "2026-11-03T10:00:00", 4, "0f3c"]],
+                            "rowCount": 1
+                        }))
+                        .into_response(),
+                        Some("17") => axum::http::StatusCode::NO_CONTENT.into_response(),
+                        _ => axum::http::StatusCode::BAD_REQUEST.into_response(),
+                    }
+                }),
+            )
+            .route(
+                "/v1/api/folder/{id}/download",
+                get(|Path(id): Path<u64>| async move {
+                    (
+                        [(axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=bon-{id}.jpg"))],
+                        vec![0xFFu8, 0xD8, 0xFF, 0xE0],
+                    )
+                }),
+            )
+            .route(
                 "/v1/api/folder/{id}",
                 get(|Path(id): Path<u64>| async move { axum::Json(json!({"id": id, "naam": format!("bon-{id}.pdf"), "soort": "F", "isDeleted": id == 3, "koppelCount": 0})) }).delete(
                     move |Path(id): Path<u64>| {
@@ -1148,6 +1180,142 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://127.0.0.1:{port}/v1/api/")
+    }
+
+    #[tokio::test]
+    async fn the_files_of_a_mutatie_are_listed_and_saved_on_a_read_only_account() {
+        use crate::accounts::{AccountInput, Rights, Store};
+        let changes: Changes = Arc::default();
+        let jar = Arc::new(crate::state::testing::FakeJar::default());
+        let state = Arc::new(crate::state::testing::state_with(
+            jar,
+            &books_mock(changes.clone()).await,
+        ));
+        let account = state
+            .accounts
+            .add(AccountInput {
+                label: "Studio Noord".into(),
+                username: "lisa@studionoord.example".into(),
+                store: Store::System,
+                op_ref: None,
+                op_title: None,
+                op_vault: None,
+                rights: Rights::OFF,
+            })
+            .unwrap();
+        state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
+        state.add_session(account.id, &account.label, "sessie");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mcp = router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
+        tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{PATH}");
+        let post = |body: serde_json::Value, session: Option<String>| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&body);
+            if let Some(s) = session {
+                request = request.header("mcp-session-id", s);
+            }
+            request.send()
+        };
+        let init = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        let call = |tool: &'static str, arguments: serde_json::Value| {
+            let request = post(
+                serde_json::json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}),
+                session.clone(),
+            );
+            async move {
+                let body = request.await.unwrap().text().await.unwrap();
+                let answer = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .unwrap_or_else(|| {
+                        body.lines()
+                            .filter_map(|l| l.strip_prefix("data:"))
+                            .filter_map(|d| {
+                                serde_json::from_str::<serde_json::Value>(d.trim()).ok()
+                            })
+                            .find(|v| v.get("id").is_some())
+                            .unwrap_or_else(|| panic!("no JSON-RPC answer in {body}"))
+                    });
+                (
+                    answer["result"]["isError"] == true,
+                    answer["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            }
+        };
+
+        // Listing asks by mutatienummer with koppelSoort MUT (the mock refuses anything else).
+        let (is_error, text) = call("mutatie_bijlagen", serde_json::json!({"nr": 16})).await;
+        assert!(!is_error, "{text}");
+        let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            answer["data"]["data"],
+            serde_json::json!([{"id": 5, "naam": "bon-5.jpg", "datum": "2026-11-03T10:00:00", "grootte": 4}])
+        );
+        assert_eq!(answer["bron"], "folder/gekoppeldgridtable");
+        // A mutatie without files: an empty list, not an error.
+        let (is_error, text) = call("mutatie_bijlagen", serde_json::json!({"nr": 17})).await;
+        assert!(!is_error, "{text}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["data"]["data"],
+            serde_json::json!([])
+        );
+
+        // Downloading saves the file in the folder given, never over another one, and answers where it is.
+        let dir = std::env::temp_dir().join(format!("ebmcp-bijlage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for want in ["bon-5.jpg", "bon-5 (2).jpg"] {
+            let (is_error, text) = call(
+                "bijlage_downloaden",
+                serde_json::json!({"id": 5, "map": dir.to_str().unwrap()}),
+            )
+            .await;
+            assert!(!is_error, "{text}");
+            let saved = &serde_json::from_str::<serde_json::Value>(&text).unwrap()["data"];
+            assert_eq!(saved["bestandsnaam"], want);
+            assert_eq!(saved["content_type"], "image/jpeg");
+            assert_eq!(saved["bytes"], 4);
+            assert_eq!(saved["pad"], dir.join(want).to_str().unwrap());
+            assert_eq!(
+                std::fs::read(dir.join(want)).unwrap(),
+                [0xFF, 0xD8, 0xFF, 0xE0]
+            );
+        }
+        let (is_error, text) = call(
+            "bijlage_downloaden",
+            serde_json::json!({"id": 5, "map": "Downloads"}),
+        )
+        .await;
+        assert!(is_error && text.contains("volledig pad"), "{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Both are reads: no approval, and nothing changed at e-Boekhouden.
+        assert_eq!(state.approvals.count(), 0);
+        assert!(changes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

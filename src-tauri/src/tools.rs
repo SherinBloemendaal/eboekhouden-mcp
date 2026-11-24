@@ -860,6 +860,26 @@ pub struct ArchiefArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct MutatieBijlagenArgs {
+    /// Mutatienummer (het nummer uit mutaties en mutatie, niet het interne id).
+    pub nr: u64,
+    /// Aantal bestanden, 1 tot 200 (standaard 50).
+    pub limit: Option<u32>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BijlageDownloadenArgs {
+    /// Id van het bestand in het digitaal archief (uit mutatie_bijlagen of digitaal_archief).
+    pub id: u64,
+    /// Map op deze computer om het bestand in te zetten, als volledig pad naar een bestaande map (standaard Downloads/EB MCP/<administratie>, die EB MCP zo nodig aanmaakt).
+    pub map: Option<String>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GetArgs {
     /// Pad onder /v1/api/, bijvoorbeeld "relatie/gridtable". Alleen leesbare paden van de API-kaart.
     pub pad: String,
@@ -1716,6 +1736,57 @@ impl EbMcp {
         ))
     }
 
+    /// Fetches one file of the digitaal archief and saves it on this computer, next to whatever is there already.
+    /// Only GETs go to e-Boekhouden; the file goes nowhere but the folder.
+    async fn save_bijlage(&self, run: &Run, id: u64, map: Option<&str>) -> Result<Value, String> {
+        let info = self.fetch(run, &format!("folder/{id}"), Vec::new()).await?;
+        let naam = info.get("naam").and_then(Value::as_str).map(str::to_owned);
+        if info.get("soort").and_then(Value::as_str) != Some("F") {
+            return Err(format!(
+                "{} is een map, geen bestand",
+                naam.as_deref().unwrap_or("Dit id")
+            ));
+        }
+        let dir = match map.map(str::trim).filter(|m| !m.is_empty()) {
+            Some(named) => download_dir(Some(named))?,
+            None => {
+                let dir = bijlagen_dir(
+                    &download_dir(None)?,
+                    run.account.administration.as_deref(),
+                    &run.account.label,
+                );
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| format!("De map {} is niet aan te maken: {e}", dir.display()))?;
+                dir
+            }
+        };
+        let path = format!("folder/{id}/download");
+        let (call, file) = self
+            .state
+            .api_download(run.account.id, &path, Some(run.id), &run.client)
+            .await;
+        let (bytes, header_name) = match file {
+            Some(file) if call.ok() => file,
+            _ => {
+                return Err(call
+                    .error
+                    .unwrap_or_else(|| format!("e-Boekhouden gaf {} op {path}", call.status)));
+            }
+        };
+        let content_type = sniff_type(&bytes, header_name.as_deref().or(naam.as_deref()));
+        let name = bijlage_name(header_name.as_deref(), naam.as_deref(), id, content_type);
+        let target = write_new(&dir, &name, &bytes)
+            .map_err(|e| format!("Het bestand is niet op te slaan in {}: {e}", dir.display()))?;
+        Ok(json!({
+            "id": id,
+            "pad": target.to_string_lossy(),
+            "bestandsnaam": target.file_name().map(|n| n.to_string_lossy().into_owned()),
+            "naam_in_archief": naam,
+            "bytes": bytes.len(),
+            "content_type": content_type,
+        }))
+    }
+
     /// The answer of a pdf tool: where the file was saved, and the pdf itself as an embedded resource, so an AI
     /// client without access to this computer's files can read it too. The log keeps the first part only.
     fn end_pdf(
@@ -2176,6 +2247,153 @@ fn write_new(
         }
     }
     Err(std::io::Error::other("te veel bestanden met deze naam"))
+}
+
+/// The query for `folder/gekoppeldgridtable`: the files linked to mutatie `nr` (its number, not its id), as
+/// e-Boekhouden's own archive grid asks for them (`sortDirection=0`, seen in the browser on 2026-11-24).
+fn bijlagen_query(nr: u64, limit: Option<u32>) -> Result<Vec<(String, String)>, String> {
+    let mut query = grid(limit, None)?;
+    for (key, value) in query.iter_mut() {
+        if key == "sortDirection" {
+            *value = "0".into();
+        }
+    }
+    query.push(("koppelId".into(), nr.to_string()));
+    query.push(("koppelSoort".into(), "MUT".into()));
+    Ok(query)
+}
+
+/// The linked files as `mutatie_bijlagen` gives them: per row id, naam, datum and grootte. The grid also has
+/// koppelId (the mutatienummer asked for), soort and guid, which say nothing new.
+fn bijlagen(grid: Value) -> Value {
+    let mut grid = named_rows(grid);
+    if let Some(rows) = grid.get_mut("data").and_then(Value::as_array_mut) {
+        for row in rows.iter_mut() {
+            if let Some(o) = row.as_object() {
+                *row = json!({
+                    "id": o.get("id"),
+                    "naam": o.get("naam"),
+                    "datum": o.get("datum"),
+                    "grootte": o.get("grootte"),
+                });
+            }
+        }
+    }
+    grid
+}
+
+/// A name that is safe as one file or folder name on macOS and Windows: no folder separators, no characters
+/// Windows refuses, no control characters, no leading or trailing dots or spaces, at most 150 characters.
+fn safe_name(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if cleaned.is_empty() {
+        return None;
+    }
+    const MAX: usize = 150;
+    if cleaned.chars().count() <= MAX {
+        return Some(cleaned.to_owned());
+    }
+    // Too long: shorten the part before the extension, so the file still opens with the right app.
+    let (stem, ext) = match cleaned.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ext.chars().count() <= 10 => {
+            (stem, format!(".{ext}"))
+        }
+        _ => (cleaned, String::new()),
+    };
+    let keep = MAX - ext.chars().count();
+    Some(format!(
+        "{}{ext}",
+        stem.chars().take(keep).collect::<String>().trim_end()
+    ))
+}
+
+/// The default folder for archive files: Downloads/EB MCP/<administratie>, or the account's label when the
+/// administration has no usable name.
+fn bijlagen_dir(
+    downloads: &std::path::Path,
+    administration: Option<&str>,
+    label: &str,
+) -> std::path::PathBuf {
+    let folder = administration
+        .and_then(safe_name)
+        .or_else(|| safe_name(label))
+        .unwrap_or_else(|| "administratie".to_owned());
+    downloads.join("EB MCP").join(folder)
+}
+
+/// What kind of file the bytes are, by their first bytes, else by the extension of its name.
+fn sniff_type(bytes: &[u8], name: Option<&str>) -> &'static str {
+    if bytes.starts_with(b"%PDF") {
+        return "application/pdf";
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "image/jpeg";
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return "image/png";
+    }
+    if bytes.starts_with(b"GIF8") {
+        return "image/gif";
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return "image/webp";
+    }
+    if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        return "image/tiff";
+    }
+    let ext = name
+        .and_then(|n| n.rsplit_once('.'))
+        .map(|(_, ext)| ext.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("pdf") => "application/pdf",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("heic") => "image/heic",
+        Some("xml") => "application/xml",
+        Some("txt") => "text/plain",
+        Some("csv") => "text/csv",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        _ => "application/octet-stream",
+    }
+}
+
+/// The extension that goes with a content type, for a name that has none.
+fn extension_of(content_type: &str) -> Option<&'static str> {
+    Some(match content_type {
+        "application/pdf" => "pdf",
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/tiff" => "tif",
+        "image/heic" => "heic",
+        _ => return None,
+    })
+}
+
+/// The name an archive file is saved under: e-Boekhouden's download name, else its name in the archive, else
+/// bijlage-<id>; made safe, and with an extension when it had none.
+fn bijlage_name(header: Option<&str>, naam: Option<&str>, id: u64, content_type: &str) -> String {
+    let name = header
+        .and_then(safe_name)
+        .or_else(|| naam.and_then(safe_name))
+        .unwrap_or_else(|| format!("bijlage-{id}"));
+    let has_extension = name
+        .rsplit_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty() && ext.len() <= 5);
+    match extension_of(content_type) {
+        Some(ext) if !has_extension => format!("{name}.{ext}"),
+        _ => name,
+    }
 }
 
 /// The folder a tool may save a download in: the one named (a full path to an existing folder) or Downloads.
@@ -2961,6 +3179,62 @@ impl EbMcp {
                 .await
             }
         }
+    }
+
+    #[tool(
+        description = "De bestanden uit het digitaal archief die aan een mutatie gekoppeld zijn (bonnen, facturen), op mutatienummer: id, naam, datum en grootte. Haal een bestand op met bijlage_downloaden.",
+        annotations(title = "Bijlagen van een mutatie", read_only_hint = true)
+    )]
+    async fn mutatie_bijlagen(
+        &self,
+        Parameters(args): Parameters<MutatieBijlagenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const PATH: &str = "folder/gekoppeldgridtable";
+        let run = match self.begin(&context, "mutatie_bijlagen", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let query = match bijlagen_query(args.nr, args.limit) {
+            Ok(query) => query,
+            Err(message) => return Ok(self.refuse(run, message)),
+        };
+        let call = self
+            .state
+            .api_get(run.account.id, PATH, &query, Some(run.id), &run.client)
+            .await;
+        let result = match (call.ok(), call.json) {
+            (true, Some(json)) => Ok(bijlagen(json)),
+            // An empty answer is read as a mutatie without files, not as an unknown id.
+            (true, None) => Ok(json!({ "data": [] })),
+            _ => Err(call
+                .error
+                .unwrap_or_else(|| format!("e-Boekhouden gaf {} op {PATH}", call.status))),
+        };
+        Ok(self.end(run, PATH, result))
+    }
+
+    #[tool(
+        description = "Een bestand uit het digitaal archief (een bon of factuur, meestal pdf of jpg) op deze computer opslaan, op id (uit mutatie_bijlagen of digitaal_archief). Standaard in de map Downloads/EB MCP/<administratie>. Het antwoord geeft het volledige pad, de bestandsnaam, de grootte en het soort bestand; het bestand zelf gaat nergens anders heen. Verandert niets in e-Boekhouden. Bestaande bestanden worden niet overschreven.",
+        annotations(title = "Bijlage downloaden", read_only_hint = true)
+    )]
+    async fn bijlage_downloaden(
+        &self,
+        Parameters(args): Parameters<BijlageDownloadenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let run = match self.begin(
+            &context,
+            "bijlage_downloaden",
+            &args,
+            args.account.as_deref(),
+        ) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let path = format!("folder/{}/download", args.id);
+        let result = self.save_bijlage(&run, args.id, args.map.as_deref()).await;
+        Ok(self.end(run, &path, result))
     }
 
     #[tool(
@@ -5190,7 +5464,7 @@ mod tests {
     fn counts_its_tools_on_the_router() {
         // The tools of this file, plus what each part names in its own module.
         let [reads, writes, _] = part_tools();
-        assert_eq!(tool_count(), 57 + reads.len() + writes.len());
+        assert_eq!(tool_count(), 59 + reads.len() + writes.len());
     }
 
     #[test]
@@ -5446,6 +5720,86 @@ mod tests {
         );
         assert!(download_dir(Some(dir.join("weg").to_str().unwrap())).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn asks_for_the_files_of_a_mutatie_by_its_number() {
+        let query = bijlagen_query(2894, None).unwrap();
+        for want in [
+            ("offset", "0"),
+            ("limit", "50"),
+            ("orderBy", ""),
+            ("sortDirection", "0"),
+            ("koppelId", "2894"),
+            ("koppelSoort", "MUT"),
+        ] {
+            assert!(
+                query.contains(&(want.0.into(), want.1.into())),
+                "{want:?} in {query:?}"
+            );
+        }
+        assert!(bijlagen_query(1, Some(0)).is_err());
+        let rows = bijlagen(json!({
+            "colMetadata": [{"name": "id"}, {"name": "koppelId"}, {"name": "naam"}, {"name": "soort"}, {"name": "datum"}, {"name": "grootte"}, {"name": "guid"}],
+            "data": [[51, 2894, "bon.jpg", "F", "2026-11-03T10:00:00", 48213, "abc"]],
+            "rowCount": 1
+        }));
+        assert_eq!(
+            rows["data"],
+            json!([{"id": 51, "naam": "bon.jpg", "datum": "2026-11-03T10:00:00", "grootte": 48213}])
+        );
+        assert_eq!(rows["rowCount"], 1);
+    }
+
+    #[test]
+    fn names_a_saved_archive_file_safely() {
+        assert_eq!(safe_name("../../etc/passwd"), Some("_.._etc_passwd".into()));
+        assert_eq!(safe_name("  .verborgen. "), Some("verborgen".into()));
+        assert_eq!(safe_name("a:b*c?.pdf"), Some("a_b_c_.pdf".into()));
+        assert_eq!(safe_name(".."), None);
+        assert_eq!(safe_name(""), None);
+        let long = format!("{}.pdf", "x".repeat(300));
+        let short = safe_name(&long).unwrap();
+        assert_eq!(short.chars().count(), 150);
+        assert!(short.ends_with(".pdf"));
+
+        assert_eq!(
+            bijlage_name(Some("bon 1.jpg"), Some("anders.pdf"), 5, "image/jpeg"),
+            "bon 1.jpg"
+        );
+        assert_eq!(
+            bijlage_name(None, Some("Factuur KPN"), 5, "application/pdf"),
+            "Factuur KPN.pdf"
+        );
+        assert_eq!(bijlage_name(None, None, 5, "image/png"), "bijlage-5.png");
+        assert_eq!(
+            bijlage_name(Some(".."), None, 7, "application/octet-stream"),
+            "bijlage-7"
+        );
+
+        assert_eq!(sniff_type(b"%PDF-1.7", Some("x.jpg")), "application/pdf");
+        assert_eq!(sniff_type(&[0xFF, 0xD8, 0xFF, 0xE0], None), "image/jpeg");
+        assert_eq!(sniff_type(b"\x89PNG\r\n\x1a\nrest", None), "image/png");
+        assert_eq!(sniff_type(b"onbekend", Some("Bon.JPEG")), "image/jpeg");
+        assert_eq!(sniff_type(b"onbekend", None), "application/octet-stream");
+
+        let downloads = std::path::Path::new("/Users/lisa/Downloads");
+        assert_eq!(
+            bijlagen_dir(downloads, Some("Studio Noord B.V."), "Studio"),
+            downloads.join("EB MCP").join("Studio Noord B.V")
+        );
+        assert_eq!(
+            bijlagen_dir(downloads, Some("A/B"), "Studio"),
+            downloads.join("EB MCP").join("A_B")
+        );
+        assert_eq!(
+            bijlagen_dir(downloads, None, "Studio"),
+            downloads.join("EB MCP").join("Studio")
+        );
+        assert_eq!(
+            bijlagen_dir(downloads, Some(" "), ".."),
+            downloads.join("EB MCP").join("administratie")
+        );
     }
 
     #[test]
