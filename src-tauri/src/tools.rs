@@ -895,9 +895,18 @@ struct WriteRun {
     queued: Mutex<Option<oneshot::Sender<u64>>>,
     /// The change's record in the history (approvals.rs), once `approve` made one.
     proposal: Mutex<Option<u64>>,
+    /// The file the change sends along, set by the tool before `approve` (`Run::attach`), for the preview.
+    file: Mutex<Option<approvals::Attachment>>,
 }
 
 impl Run {
+    /// The file this change sends along, so its proposal can show it (Akkoord, preview).
+    fn attach(&self, file: approvals::Attachment) {
+        if let Some(write) = &self.write {
+            *write.file.lock().unwrap_or_else(|e| e.into_inner()) = Some(file);
+        }
+    }
+
     fn proposal(&self) -> Option<u64> {
         self.write
             .as_ref()
@@ -1270,8 +1279,12 @@ fn rights_value(rights: Rights) -> Value {
     })
 }
 
-/// A file from this computer for the digitaal archief: its name and its bytes in base64, as `folder/upload` takes them.
-fn read_upload(path: &str, name: Option<&str>) -> Result<(String, String, u64), String> {
+/// A file from this computer for the digitaal archief: its name and its bytes in base64, as `folder/upload` takes them,
+/// and what the proposal shows of it.
+fn read_upload(
+    path: &str,
+    name: Option<&str>,
+) -> Result<(String, String, u64, approvals::Attachment), String> {
     use base64::Engine;
     /// The web app's own limit.
     const MAX: u64 = 5120 * 1024;
@@ -1302,10 +1315,12 @@ fn read_upload(path: &str, name: Option<&str>) -> Result<(String, String, u64), 
         return Err("De bestandsnaam is te lang of bevat een schuine streep".into());
     }
     let bytes = std::fs::read(path).map_err(|_| format!("{} is niet te lezen", path.display()))?;
+    let attachment = approvals::Attachment::new(path, &file_name, &bytes);
     Ok((
         file_name,
-        base64::engine::general_purpose::STANDARD.encode(bytes),
-        meta.len(),
+        base64::engine::general_purpose::STANDARD.encode(&bytes),
+        bytes.len() as u64,
+        attachment,
     ))
 }
 
@@ -1365,6 +1380,7 @@ impl EbMcp {
             gate: gate.clone(),
             queued: Mutex::new(Some(queued)),
             proposal: Mutex::new(None),
+            file: Mutex::new(None),
         });
         let run = Arc::new(run);
         let mut task = tokio::spawn({
@@ -1512,6 +1528,7 @@ impl EbMcp {
             title: built.title.clone(),
             lines: built.lines.clone(),
             danger,
+            file: write.file.lock().unwrap_or_else(|e| e.into_inner()).take(),
         };
         let technical = Technical {
             args: write.args.clone(),
@@ -3119,7 +3136,8 @@ impl EbMcp {
         const TOOL: &str = "archief_uploaden";
         let account = args.account.clone();
         self.write_tool(&context, TOOL, account.as_deref(), args, "Bestand geüpload", move |this, run, args| async move {
-            let (name, data, size) = read_upload(&args.pad, args.naam.as_deref())?;
+            let (name, data, size, file) = read_upload(&args.pad, args.naam.as_deref())?;
+            run.attach(file);
             let mut lines = vec![
                 line("Bestand", args.pad.trim()),
                 line("Naam in het archief", &name),
@@ -5303,8 +5321,10 @@ mod tests {
         let file = dir.join("bon.pdf");
         std::fs::write(&file, b"%PDF-1.4 proef").unwrap();
         let path = file.to_str().unwrap();
-        let (name, data, size) = read_upload(path, None).unwrap();
+        let (name, data, size, attachment) = read_upload(path, None).unwrap();
         assert_eq!((name.as_str(), size), ("bon.pdf", 14));
+        assert_eq!(attachment.path, path);
+        assert_eq!(attachment.kind.as_deref(), Some("application/pdf"));
         // base64 of the bytes, without a data: prefix: what folder/upload takes.
         assert_eq!(data, "JVBERi0xLjQgcHJvZWY=");
         assert_eq!(

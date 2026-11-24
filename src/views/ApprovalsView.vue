@@ -8,6 +8,7 @@ import { useRoute } from 'vue-router'
 import Alert from '../components/Alert.vue'
 import EmptyState from '../components/EmptyState.vue'
 import ExportNotice from '../components/ExportNotice.vue'
+import FilePreview from '../components/FilePreview.vue'
 import Icon from '../components/Icon.vue'
 import JsonView from '../components/JsonView.vue'
 import { store } from '../lib/accounts'
@@ -443,6 +444,10 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
                         </div>
                       </dl>
                     </div>
+                    <div v-if="chosen.file" class="q-file">
+                      <h3 class="section-label">Bestand</h3>
+                      <FilePreview :id="chosen.id" :file="chosen.file" />
+                    </div>
                   </div>
                   <footer class="q-foot">
                     <span class="q-pos">Voorstel #{{ chosen.id }}, {{ position }} van {{ queue.length }} in de wachtrij</span>
@@ -669,6 +674,8 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
 .q-body .note { display: flex; align-items: flex-start; gap: 8px; line-height: 17px; }
 .q-changes { display: flex; flex-direction: column; }
 .q-changes .section-label { padding-bottom: 6px; }
+.q-file { display: flex; flex-direction: column; margin-top: 16px; }
+.q-file .section-label { padding-bottom: 6px; }
 .q-lines { margin: 0; border-bottom: 0.5px solid var(--line); }
 .q-line { display: grid; grid-template-columns: 150px minmax(0, 1fr); column-gap: 16px; padding: 9px 0; border-top: 0.5px solid var(--line); }
 .q-line dt { color: var(--muted); overflow-wrap: anywhere; }

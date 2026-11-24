@@ -59,6 +59,7 @@ let onGet: (id: number) => Promise<ApprovalDetail> = async (id) => ({
 })
 let onExport: () => Promise<string> = async () => '/Users/jan/Downloads/eb-mcp-akkoord.jsonl.gz'
 let onReveal: (path: string) => Promise<void> = async () => {}
+let onFile: (id: number) => Promise<unknown> = async () => ({ name: 'bon.png', kind: 'image/png', size: 8, changed: false, data: 'iVBORw==' })
 
 const mounted: { unmount(): void }[] = []
 beforeEach(() => {
@@ -72,6 +73,7 @@ beforeEach(() => {
       case 'approval_get': return onGet(args!.id as number)
       case 'approvals_export': return onExport()
       case 'log_export_reveal': return onReveal(args!.path as string)
+      case 'approval_file': return onFile(args!.id as number)
       case 'accounts_list': return []
       case 'settings_get': return { idleMinutes: 30, appearance: 'system', showInDock: true }
       case 'log_list': return []
@@ -96,6 +98,7 @@ afterEach(() => {
   onGet = async (id) => ({ ...history.find((r) => r.id === id)!, args: { omschrijving: 'Bankkosten' }, body: { Rekening: '1010' }, result: { MutatieNr: 812 } })
   onExport = async () => '/Users/jan/Downloads/eb-mcp-akkoord.jsonl.gz'
   onReveal = async () => {}
+  onFile = async () => ({ name: 'bon.png', kind: 'image/png', size: 8, changed: false, data: 'iVBORw==' })
 })
 
 // The whole window, as in the app: the toolbar's Teleport target, the sidebar and the banner live in the shell.
@@ -164,6 +167,55 @@ describe('the queue', () => {
     expect(buttons(detail(), 'Goedkeuren')).toHaveLength(1)
     expect(buttons(detail(), 'Weigeren')).toHaveLength(1)
     expect(buttons(document.querySelector('.q-list')!, 'Goedkeuren')).toHaveLength(0)
+  })
+
+  it('shows the file of an upload before Goedkeuren, and opens only the file of that proposal', async () => {
+    const file = { path: '/Users/jan/Downloads/bon.png', name: 'bon.png', size: 8, kind: 'image/png' }
+    waiting = [proposal({ tool: 'archief_uploaden', title: 'Bestand uploaden: bon.png', file }), proposal({ id: 8 })]
+    await mountAt('/akkoord')
+    expect(detail().textContent).toContain('Bestand')
+    expect(detail().querySelector('.file-name')?.textContent).toBe('bon.png')
+    expect(detail().querySelector('.file-size')?.textContent).toBe('8 B')
+    const image = detail().querySelector<HTMLImageElement>('img.file-view')!
+    expect(image.getAttribute('src')).toBe('data:image/png;base64,iVBORw==')
+    expect(image.alt).toBe('Voorbeeld van bon.png')
+    expect(detail().textContent).not.toContain('gewijzigd sinds het voorstel')
+    buttons(detail(), 'Openen')[0]!.click()
+    buttons(detail(), 'Toon in Finder')[0]!.click()
+    await flushPromises()
+    expect(invoke.mock.calls.filter((c) => c[0] === 'approval_file_open').map((c) => c[1])).toEqual([{ id: 7, reveal: false }, { id: 7, reveal: true }])
+    // A proposal without a file has no preview, and nothing is read for it.
+    await choose(8)
+    expect(detail().querySelector('.file-preview')).toBeNull()
+    expect(invoke.mock.calls.filter((c) => c[0] === 'approval_file').map((c) => c[1])).toEqual([{ id: 7 }])
+  })
+
+  it('says when the file changed since the proposal, shows a PDF in a frame and other files by name', async () => {
+    const created: Blob[] = []
+    const createObjectURL = vi.fn((blob: Blob) => (created.push(blob), 'blob:voorbeeld'))
+    Object.defineProperty(URL, 'createObjectURL', { value: createObjectURL, configurable: true })
+    Object.defineProperty(URL, 'revokeObjectURL', { value: vi.fn(), configurable: true })
+    onFile = async () => ({ name: 'factuur.pdf', kind: 'application/pdf', size: 16, changed: true, data: 'JVBERi0xLjQgZmFjdHV1cg==' })
+    waiting = [
+      proposal({ tool: 'archief_uploaden', title: 'Bestand uploaden: factuur.pdf', file: { path: '/Users/jan/factuur.pdf', name: 'factuur.pdf', size: 16, kind: 'application/pdf' } }),
+      proposal({ id: 8, tool: 'archief_uploaden', title: 'Bestand uploaden: export.csv', file: { path: '/Users/jan/export.csv', name: 'export.csv', size: 2048, kind: null } }),
+    ]
+    await mountAt('/akkoord')
+    const frame = detail().querySelector<HTMLIFrameElement>('iframe.file-view')!
+    expect(frame.getAttribute('src')).toBe('blob:voorbeeld')
+    expect(created[0]!.type).toBe('application/pdf')
+    expect(created[0]!.size).toBe(16)
+    expect(detail().textContent).toContain('Het bestand is gewijzigd sinds het voorstel. Na Goedkeuren gaat de versie van toen naar e-Boekhouden.')
+    await choose(8)
+    expect(detail().querySelector('.file-view')).toBeNull()
+    expect(detail().textContent).toContain('Van dit soort bestand is geen voorbeeld')
+    expect(detail().querySelector('.file-size')?.textContent).toBe('2,0 kB')
+    // A file that cannot be read says why, in the app's own words.
+    onFile = async () => { throw 'bon.png is niet meer te lezen' }
+    waiting = [proposal({ id: 9, tool: 'archief_uploaden', title: 'Bestand uploaden: bon.png', file: { path: '/Users/jan/bon.png', name: 'bon.png', size: 8, kind: 'image/png' } })]
+    await refreshApprovals()
+    await flushPromises()
+    expect(detail().querySelector('[role="alert"]')?.textContent).toBe('bon.png is niet meer te lezen')
   })
 
   it('shows the proposal whose row is clicked', async () => {

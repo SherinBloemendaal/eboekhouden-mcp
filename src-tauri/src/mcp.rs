@@ -1011,6 +1011,89 @@ mod tests {
         answer_of(body)
     }
 
+    /// An upload to the digitaal archief puts its file on the proposal, so Akkoord can show it before Goedkeuren.
+    #[tokio::test]
+    async fn an_upload_shows_its_file_on_the_proposal() {
+        use crate::accounts::{AccountInput, Rights, Store};
+        let jar = Arc::new(crate::state::testing::FakeJar::default());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = Arc::new(crate::state::testing::state_with(
+            jar.clone(),
+            &eboekhouden(seen.clone()).await,
+        ));
+        let account = state
+            .accounts
+            .add(AccountInput {
+                label: "Studio Noord".into(),
+                username: "lisa@studionoord.example".into(),
+                store: Store::System,
+                op_ref: None,
+                op_title: None,
+                op_vault: None,
+                rights: Rights::ASK,
+            })
+            .unwrap();
+        state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
+        state.add_session(account.id, &account.label, "sessie");
+        let dir = std::env::temp_dir().join(format!("ebmcp-upload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bon = dir.join("bon.png");
+        std::fs::write(&bon, b"\x89PNG bon").unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mcp = router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
+        tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{PATH}");
+        let post = |body: serde_json::Value, session: Option<String>| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&body);
+            if let Some(s) = session {
+                request = request.header("mcp-session-id", s);
+            }
+            request.send()
+        };
+        let init = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "title": "Claude", "version": "1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        let call = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "archief_uploaden", "arguments": {"pad": bon.to_string_lossy()}}}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        let (_, text) = answer_of(call.text().await.unwrap());
+        let id = waiting_id(&text);
+        let file = state.approvals.list()[0]
+            .file
+            .clone()
+            .expect("the proposal has its file");
+        assert_eq!((file.name.as_str(), file.size), ("bon.png", 8));
+        assert_eq!(file.kind.as_deref(), Some("image/png"));
+        let preview = state.approvals.waiting_file(id).unwrap().read().unwrap();
+        assert!(!preview.changed);
+        assert!(seen.lock().unwrap().is_empty(), "nothing went out");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn answer_of(body: String) -> (bool, String) {
         let answer = serde_json::from_str::<serde_json::Value>(&body)
             .ok()

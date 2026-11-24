@@ -97,6 +97,9 @@ pub struct Proposal {
     /// says which kind of change this is (`accounts::Kind::of`).
     pub danger: bool,
     pub asked_at: u64,
+    /// The file the change sends along (an upload to the digitaal archief), for its preview on Akkoord.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<Attachment>,
 }
 
 /// What a tool hands in; the registry adds the id and the time.
@@ -108,6 +111,87 @@ pub struct Ask {
     pub title: String,
     pub lines: Vec<Line>,
     pub danger: bool,
+    pub file: Option<Attachment>,
+}
+
+/// A file from this computer that a change sends to e-Boekhouden. The tool read it when the proposal came up, and
+/// that read is what goes out after Goedkeuren; `fingerprint` lets the preview say when the file on disk changed
+/// since.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Attachment {
+    pub path: String,
+    /// The name it gets in the archive.
+    pub name: String,
+    pub size: u64,
+    /// The media type when the preview can show it ("application/pdf", "image/png"); else only Openen.
+    pub kind: Option<String>,
+    pub fingerprint: String,
+}
+
+impl Attachment {
+    pub fn new(path: &Path, name: &str, bytes: &[u8]) -> Self {
+        Self {
+            path: path.to_string_lossy().into_owned(),
+            name: name.to_owned(),
+            size: bytes.len() as u64,
+            kind: media_type(name).map(str::to_owned),
+            fingerprint: fingerprint(bytes),
+        }
+    }
+
+    /// The file as it is on disk now, for the preview. `changed`: it is not the file the proposal read.
+    pub fn read(&self) -> Result<FilePreview, String> {
+        use base64::Engine;
+        let bytes = std::fs::read(&self.path).map_err(|_| {
+            format!(
+                "{} is niet meer te lezen op {}. Wat na Goedkeuren wordt geüpload, is het bestand zoals het was toen het voorstel kwam.",
+                self.name, self.path
+            )
+        })?;
+        Ok(FilePreview {
+            name: self.name.clone(),
+            kind: self.kind.clone(),
+            size: bytes.len() as u64,
+            changed: fingerprint(&bytes) != self.fingerprint,
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        })
+    }
+}
+
+/// A file's contents for the preview on Akkoord (`approval_file`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilePreview {
+    pub name: String,
+    pub kind: Option<String>,
+    pub size: u64,
+    /// The file on disk differs from what the proposal read, which is what will be uploaded.
+    pub changed: bool,
+    /// Base64.
+    pub data: String,
+}
+
+/// The media type of the files the preview shows, by extension.
+pub fn media_type(name: &str) -> Option<&'static str> {
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        _ => return None,
+    })
+}
+
+/// Tells two versions of a file apart (not a security check: the path is fixed by the proposal).
+fn fingerprint(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("{}-{:016x}", bytes.len(), hasher.finish())
 }
 
 /// The technical side of a proposal, kept in the history but left out of its list.
@@ -400,6 +484,7 @@ impl Approvals {
                     lines: ask.lines,
                     danger: ask.danger,
                     asked_at: now,
+                    file: ask.file,
                 },
                 decided_at: auto.then_some(now),
                 decision: auto.then_some(Decision::Auto),
@@ -625,6 +710,20 @@ impl Approvals {
             .collect()
     }
 
+    /// The file of a proposal that still waits; `None` when it has none or no longer waits. The preview reads
+    /// only this, never a path from elsewhere.
+    pub fn waiting_file(&self, id: u64) -> Option<Attachment> {
+        let inner = self.lock();
+        if !inner.pending.contains_key(&id) {
+            return None;
+        }
+        inner
+            .records
+            .iter()
+            .find(|d| d.record.proposal.id == id)
+            .and_then(|d| d.record.proposal.file.clone())
+    }
+
     pub fn count(&self) -> usize {
         self.lock().pending.len()
     }
@@ -822,7 +921,73 @@ mod tests {
             title: title.into(),
             lines: vec![line("Bedrag", "2,00")],
             danger: false,
+            file: None,
         }
+    }
+
+    #[test]
+    fn shows_the_file_of_a_waiting_proposal_only_and_says_when_it_changed() {
+        let dir = std::env::temp_dir().join(format!("ebmcp-preview-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Factuur 42.PDF");
+        std::fs::write(&path, b"%PDF-1.4 factuur").unwrap();
+        let file = Attachment::new(&path, "Factuur 42.PDF", b"%PDF-1.4 factuur");
+        assert_eq!(
+            file.kind.as_deref(),
+            Some("application/pdf"),
+            "by extension, any case"
+        );
+        assert_eq!(media_type("bon.JPG"), Some("image/jpeg"));
+        assert_eq!(media_type("export.csv"), None);
+        assert_eq!(media_type("zonder-extensie"), None);
+
+        let approvals = Approvals::default();
+        let (with_file, _answer) = approvals.ask(
+            Ask {
+                file: Some(file.clone()),
+                ..ask(Uuid::nil(), "Bestand uploaden: Factuur 42.PDF")
+            },
+            technical(),
+            1,
+        );
+        let (without, _other) = approvals.ask(ask(Uuid::nil(), "Mutatie"), technical(), 1);
+        assert_eq!(
+            approvals.list()[0].file.as_ref(),
+            Some(&file),
+            "the queue shows it"
+        );
+        assert_eq!(approvals.waiting_file(without.id), None);
+
+        let preview = approvals
+            .waiting_file(with_file.id)
+            .unwrap()
+            .read()
+            .unwrap();
+        assert!(!preview.changed);
+        assert_eq!(preview.data, "JVBERi0xLjQgZmFjdHV1cg==");
+        std::fs::write(&path, b"%PDF-1.4 iets anders").unwrap();
+        assert!(
+            approvals
+                .waiting_file(with_file.id)
+                .unwrap()
+                .read()
+                .unwrap()
+                .changed
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            approvals
+                .waiting_file(with_file.id)
+                .unwrap()
+                .read()
+                .unwrap_err()
+                .contains("zoals het was toen het voorstel kwam")
+        );
+
+        // Answered: the file is no longer shown, whatever the id.
+        assert!(approvals.decide(with_file.id, false, 2));
+        assert_eq!(approvals.waiting_file(with_file.id), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn technical() -> Technical {
@@ -991,6 +1156,7 @@ mod tests {
                     lines: vec![],
                     danger: false,
                     asked_at: 1,
+                    file: None,
                 },
                 decided_at: Some(2),
                 decision: Some(Decision::Approved),

@@ -19,6 +19,27 @@ export interface Proposal {
   /** Cannot be undone: asked even for an account that needs no approval otherwise. */
   danger: boolean
   askedAt: number
+  /** The file the change sends along (an upload to the digitaal archief), shown before Goedkeuren. */
+  file?: Attachment
+}
+
+/** A file from this computer that a change sends to e-Boekhouden (approvals.rs, `Attachment`). */
+export interface Attachment {
+  path: string
+  name: string
+  size: number
+  /** 'application/pdf' or an image type when the preview can show it; null: only Openen. */
+  kind: string | null
+}
+
+/** The file as it is on disk now (`approval_file`); `changed`: not the version the proposal read, which is what goes out. */
+export interface FilePreview {
+  name: string
+  kind: string | null
+  size: number
+  changed: boolean
+  /** Base64. */
+  data: string
 }
 
 export type ApprovalStatus = 'waiting' | 'running' | 'done' | 'failed' | 'refused' | 'lapsed' | 'withdrawn'
@@ -269,4 +290,15 @@ export function stamp(ms: number, full = false): string {
   return full
     ? new Date(ms).toLocaleString('nl-NL', { dateStyle: 'long', timeStyle: 'medium' })
     : new Date(ms).toLocaleString('nl-NL', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+}
+
+/** The file of a proposal that still waits, for its preview. Rejects with a Dutch sentence. */
+export const approvalFile = (id: number): Promise<FilePreview> => invoke<FilePreview>('approval_file', { id })
+/** Opens the file of a waiting proposal in its own app, or shows it in Finder or Explorer with `reveal`. */
+export const openApprovalFile = (id: number, reveal = false): Promise<void> => invoke<void>('approval_file_open', { id, reveal })
+
+/** What the preview can show of a file: an image, a PDF, or nothing (only Openen). */
+export function previewKind(kind: string | null | undefined): 'image' | 'pdf' | null {
+  if (kind === 'application/pdf') return 'pdf'
+  return kind?.startsWith('image/') ? 'image' : null
 }
