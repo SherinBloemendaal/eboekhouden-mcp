@@ -1425,6 +1425,85 @@ impl EbMcp {
         CallToolResult::success(vec![ContentBlock::text(value.to_string())])
     }
 
+    /// Puts a file in the digitaal archief (`folder/upload`) after the approval. Its id there.
+    async fn upload(
+        &self,
+        run: &Run,
+        name: &str,
+        data: String,
+        overwrite: bool,
+        folder: u64,
+    ) -> Result<u64, Halt> {
+        let body =
+            json!({"fileName": name, "data": data, "overwrite": overwrite, "folderId": folder});
+        let uploaded = self
+            .change(run, "POST", "folder/upload", Some(&body))
+            .await?;
+        if let Some(error) = uploaded
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .filter(|e| !e.is_empty())
+        {
+            return Err(Halt::Error(format!(
+                "e-Boekhouden weigert het bestand: {error}"
+            )));
+        }
+        uploaded
+            .get("folderId")
+            .and_then(Value::as_u64)
+            .filter(|_| uploaded.get("saved").and_then(Value::as_bool) != Some(false))
+            .ok_or_else(|| Halt::Error("e-Boekhouden heeft het bestand niet opgeslagen".into()))
+    }
+
+    /// Links a file in the archive to mutatie `nr`, after the approval.
+    async fn link_file(&self, run: &Run, id: u64, nr: u64) -> Result<Value, Halt> {
+        let link =
+            json!({"koppelId": nr, "folders": [{"id": id, "soort": "F"}], "koppelType": "MUT"});
+        self.change_done(run, "POST", "folderkoppel/koppel/item", Some(&link))
+            .await
+    }
+
+    /// The attachment of a new mutatie (`mutatie_toevoegen` with `bijlage`): uploaded to the Basismap and
+    /// linked to the mutatie that was just booked. Never an error of the call: the booking stands, so a failed
+    /// upload or link is told in the answer, with how to put only the file right.
+    async fn attach_to_mutatie(
+        &self,
+        run: &Run,
+        booked: &Value,
+        name: &str,
+        data: String,
+    ) -> Value {
+        let Some(nr) = booked.get("mutNr").and_then(Value::as_u64) else {
+            return json!({
+                "naam": name,
+                "gekoppeld_aan_mutatie": Value::Null,
+                "fout": "e-Boekhouden gaf geen mutatienummer terug, dus de bijlage is niet geüpload.",
+                "let_op": "De mutatie is wel geboekt: boek haar niet opnieuw. Zoek haar op met mutaties en zet de bijlage er met archief_uploaden en mutatie_nr bij.",
+            });
+        };
+        let id = match self.upload(run, name, data, false, 0).await {
+            Ok(id) => id,
+            Err(Halt::Error(message) | Halt::Refused(message)) => {
+                return json!({
+                    "naam": name,
+                    "gekoppeld_aan_mutatie": Value::Null,
+                    "fout": message,
+                    "let_op": format!("Mutatie {nr} is geboekt, de bijlage niet. Boek de mutatie niet opnieuw; zet alleen de bijlage erbij met archief_uploaden en mutatie_nr {nr}."),
+                });
+            }
+        };
+        match self.link_file(run, id, nr).await {
+            Ok(_) => json!({"bestand_id": id, "naam": name, "gekoppeld_aan_mutatie": nr}),
+            Err(Halt::Error(message) | Halt::Refused(message)) => json!({
+                "bestand_id": id,
+                "naam": name,
+                "gekoppeld_aan_mutatie": Value::Null,
+                "fout": message,
+                "let_op": format!("Mutatie {nr} is geboekt en de bijlage staat in het archief (id {id}), maar ze zijn niet gekoppeld. Koppel ze met archief_koppelen (bestand_id {id}, mutatie_nr {nr}); boek en upload niets opnieuw."),
+            }),
+        }
+    }
+
     /// The rekeningschema and btw codes of the account's administration.
     /// The unprocessed bank line with this id, read fresh from `import/gridtable`. A line that is not there is
     /// refused: it does not exist, belongs to another administration, or was processed already, and booking
@@ -3017,7 +3096,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een mutatie boeken, zoals op de schermen Invoeren > Facturen, Afschrift/bonnetjes en Memoriaal: factuur ontvangen of verstuurd, factuurbetaling ontvangen of verstuurd, geld ontvangen of uitgegeven, of memoriaal. Met bankregel_id wordt een onverwerkte bankregel daarmee verwerkt, bij elke soort, ook een factuurbetaling: geef de bankrekening, de datum en het bedrag van de regel, zodat hij niet nog eens geboekt hoeft te worden. Het voorstel toont de bankregel en zegt het als rekening, richting of totaal ervan afwijken. Zonder bankregel_id blijft de bankregel open staan. Rekeningen gaan op code (zie grootboek), btw op code (GEEN, HOOG_VERK_21, HOOG_INK_21, LAAG_VERK_9, ...); e-Boekhouden rekent de btw zelf uit. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de boeking eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een mutatie boeken, zoals op de schermen Invoeren > Facturen, Afschrift/bonnetjes en Memoriaal: factuur ontvangen of verstuurd, factuurbetaling ontvangen of verstuurd, geld ontvangen of uitgegeven, of memoriaal. Met bankregel_id wordt een onverwerkte bankregel daarmee verwerkt, bij elke soort, ook een factuurbetaling: geef de bankrekening, de datum en het bedrag van de regel, zodat hij niet nog eens geboekt hoeft te worden. Het voorstel toont de bankregel en zegt het als rekening, richting of totaal ervan afwijken. Zonder bankregel_id blijft de bankregel open staan. Met bijlage (het volledige pad van de factuur of bon op deze computer, hoogstens 5 MB) zet EB MCP het bestand na de boeking in het digitaal archief en koppelt het aan de nieuwe mutatie, met hetzelfde akkoord: één aanroep in plaats van mutatie_toevoegen plus archief_uploaden. Mislukt de boeking, dan wordt er niets geüpload; mislukt alleen de bijlage, dan staat de boeking en zegt bijlage.let_op hoe je alleen het bestand alsnog toevoegt. Rekeningen gaan op code (zie grootboek), btw op code (GEEN, HOOG_VERK_21, HOOG_INK_21, LAAG_VERK_9, ...); e-Boekhouden rekent de btw zelf uit. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de boeking eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
         annotations(
             title = "Mutatie toevoegen",
             read_only_hint = false,
@@ -3051,10 +3130,35 @@ impl EbMcp {
                     Some(id) => Some(this.bankregel(&run, id).await?),
                     None => None,
                 };
-                let built = write::mutatie_nieuw(&args, &books, bankregel.as_ref())?;
+                // The attachment is read before the user is asked anything: a wrong path or a file that is too
+                // big is refused now, not after the booking.
+                let bijlage = match args.bijlage.as_deref() {
+                    Some(pad) => Some(read_upload(pad, args.bijlage_naam.as_deref())?),
+                    None => None,
+                };
+                let mut built = write::mutatie_nieuw(&args, &books, bankregel.as_ref())?;
+                if let Some((name, _, size)) = &bijlage {
+                    built.lines.push(line(
+                        "Bijlage",
+                        format!(
+                            "{name} ({} kB), komt na de boeking in het digitaal archief en wordt aan de mutatie gekoppeld",
+                            size.div_ceil(1024)
+                        ),
+                    ));
+                }
                 this.approve(&run, TOOL, &built, false).await?;
-                this.change(&run, "POST", "mutatie", Some(&built.body))
-                    .await
+                let mut booked = this
+                    .change(&run, "POST", "mutatie", Some(&built.body))
+                    .await?;
+                if let Some((name, data, _)) = bijlage {
+                    let attached = this.attach_to_mutatie(&run, &booked, &name, data).await;
+                    if let Value::Object(map) = &mut booked {
+                        map.insert("bijlage".into(), attached);
+                    } else {
+                        booked = json!({"mutatie": booked, "bijlage": attached});
+                    }
+                }
+                Ok(booked)
             },
         )
         .await
@@ -3136,20 +3240,10 @@ impl EbMcp {
             }
             let built = Built { body: Value::Null, title: format!("Bestand uploaden: {name}"), lines };
             this.approve(&run, TOOL, &built, false).await?;
-            let body = json!({"fileName": name, "data": data, "overwrite": args.overschrijven.unwrap_or(false), "folderId": args.map_id.unwrap_or(0)});
-            let uploaded = this.change(&run, "POST", "folder/upload", Some(&body)).await?;
-            if let Some(error) = uploaded.get("errorMessage").and_then(Value::as_str).filter(|e| !e.is_empty()) {
-                return Err(Halt::Error(format!("e-Boekhouden weigert het bestand: {error}")));
-            }
-            let id = uploaded
-                .get("folderId")
-                .and_then(Value::as_u64)
-                .filter(|_| uploaded.get("saved").and_then(Value::as_bool) != Some(false))
-                .ok_or_else(|| Halt::Error("e-Boekhouden heeft het bestand niet opgeslagen".into()))?;
+            let id = this.upload(&run, &name, data, args.overschrijven.unwrap_or(false), args.map_id.unwrap_or(0)).await?;
             let mut done = json!({"bestand_id": id, "naam": name, "gekoppeld_aan_mutatie": Value::Null});
             if let Some(nr) = args.mutatie_nr {
-                let link = json!({"koppelId": nr, "folders": [{"id": id, "soort": "F"}], "koppelType": "MUT"});
-                match this.change_done(&run, "POST", "folderkoppel/koppel/item", Some(&link)).await {
+                match this.link_file(&run, id, nr).await {
                     Ok(_) => done["gekoppeld_aan_mutatie"] = json!(nr),
                     Err(Halt::Error(message) | Halt::Refused(message)) => {
                         return Err(Halt::Error(format!(
@@ -4952,6 +5046,7 @@ impl ServerHandler for EbMcp {
                  Klopt een voorstel dat nog wacht niet, of is het niet meer nodig, trek het dan zelf in met akkoord_intrekken (met een korte reden) in plaats van de gebruiker te vragen het te weigeren; na goedkeuring kan dat niet meer. \
                  Een geïmporteerde bankregel verwerken kan: bankregels geeft de onverwerkte regels met hun id, en mutatie_toevoegen met bankregel_id boekt de mutatie en verwerkt de regel in één keer, bij elke soort, ook een factuurbetaling. \
                  Boek geld van een bankregel nooit zonder bankregel_id: dan blijft de regel open staan en dreigt een dubbele boeking. \
+                 Hoort er een factuur of bon bij die op deze computer staat, geef die dan mee als bijlage van mutatie_toevoegen: dan staat hij na hetzelfde akkoord in het archief en gekoppeld aan de mutatie. \
                  Een btw-aangifte, ICP-opgave of suppletie versturen, indienen of betalen kan EB MCP niet: dat doet de gebruiker zelf. \
                  Wel kan btwaangifte_betaallink de iDEAL-link van een verstuurde aangifte opzoeken: toon die link aan de gebruiker om zelf te openen, open of volg hem nooit zelf. \
                  Zegt een tool dat de uitkomst onbekend is (een mail of bestand dat mogelijk al weg is), probeer het dan niet opnieuw maar laat de gebruiker eerst kijken. \

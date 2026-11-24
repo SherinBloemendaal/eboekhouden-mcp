@@ -496,6 +496,10 @@ pub struct MutatieToevoegenArgs {
     pub boekstuk: Option<String>,
     /// Id van een onverwerkte bankregel (uit bankregels): die is daarmee verwerkt. EB MCP zoekt de regel eerst op en weigert een id dat niet (meer) bij de onverwerkte regels staat. Zonder omschrijving krijgt de boeking de tekst van de bankregel.
     pub bankregel_id: Option<u64>,
+    /// Volledig pad van een bestand op deze computer (de factuur of bon, hoogstens 5 MB): na de boeking zet EB MCP het in het digitaal archief (Basismap) en koppelt het aan de nieuwe mutatie, met hetzelfde akkoord. Zelfde regels als archief_uploaden.
+    pub bijlage: Option<String>,
+    /// Naam van de bijlage in het archief. Standaard de bestandsnaam.
+    pub bijlage_naam: Option<String>,
     /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
 }
@@ -2972,6 +2976,8 @@ mod tests {
             betalingen: None,
             boekstuk: None,
             bankregel_id: None,
+            bijlage: None,
+            bijlage_naam: None,
             account: None,
         }
     }

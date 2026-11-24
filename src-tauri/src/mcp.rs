@@ -1030,6 +1030,241 @@ mod tests {
         )
     }
 
+    /// A stand-in for e-Boekhouden with the calls a booking with an attachment needs: a mutatie with the
+    /// description "Fout" fails, a file whose name begins with "weigeren" is refused by the archive. Every call
+    /// that changes something is kept as (path, body).
+    async fn eboekhouden_with_archive(
+        seen: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    ) -> String {
+        use axum::routing::{get, post};
+        let (mutaties, uploads, links) = (seen.clone(), seen.clone(), seen);
+        let app = axum::Router::new()
+            .route(
+                "/v1/api/grootboekrekening/gridtable",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "colMetadata": [{"name": "id"}, {"name": "code"}, {"name": "omschrijving"}, {"name": "categorie"}, {"name": "inactief"}],
+                        "data": [[11, "1010", "Bank", "Betalingsmiddelen", false], [45, "4550", "Bankkosten", "Winst en Verlies", false]]
+                    }))
+                }),
+            )
+            .route(
+                "/v1/api/btwinfo/all",
+                get(|| async { axum::Json(serde_json::json!([{"code": "GEEN", "omschrijving": "Geen btw", "percentage": 0, "soort": ""}])) }),
+            )
+            .route(
+                "/v1/api/mutatie",
+                post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let seen = mutaties.clone();
+                    async move {
+                        let fails = body["mutatie"]["omschrijving"] == "Fout";
+                        seen.lock().unwrap().push(("mutatie".into(), body));
+                        if fails {
+                            (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"message": "Rekening ontbreekt"})))
+                        } else {
+                            (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"mutNr": 3908, "mutId": 4770877556u64})))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/api/folder/upload",
+                post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let seen = uploads.clone();
+                    async move {
+                        let refused = body["fileName"].as_str().unwrap_or_default().starts_with("weigeren");
+                        seen.lock().unwrap().push(("folder/upload".into(), body));
+                        axum::Json(if refused {
+                            serde_json::json!({"errorMessage": "Dit bestandstype is niet toegestaan"})
+                        } else {
+                            serde_json::json!({"folderId": 77, "saved": true})
+                        })
+                    }
+                }),
+            )
+            .route(
+                "/v1/api/folderkoppel/koppel/item",
+                post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let seen = links.clone();
+                    async move {
+                        seen.lock().unwrap().push(("folderkoppel/koppel/item".into(), body));
+                        axum::Json(serde_json::json!(true))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://127.0.0.1:{port}/v1/api/")
+    }
+
+    /// mutatie_toevoegen with a bijlage: one proposal that names the file, and after Goedkeuren the booking,
+    /// the upload and the link in that order. A failed booking uploads nothing; a refused upload leaves the
+    /// booking standing and says how to add only the file.
+    #[tokio::test]
+    async fn a_booking_can_bring_its_invoice_along() {
+        use crate::accounts::{AccountInput, Rights, Store};
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jar = Arc::new(crate::state::testing::FakeJar::default());
+        let state = Arc::new(crate::state::testing::state_with(
+            jar.clone(),
+            &eboekhouden_with_archive(seen.clone()).await,
+        ));
+        let account = state
+            .accounts
+            .add(AccountInput {
+                label: "Studio Noord".into(),
+                username: "lisa@studionoord.example".into(),
+                store: Store::System,
+                op_ref: None,
+                op_title: None,
+                op_vault: None,
+                rights: Rights::ASK,
+            })
+            .unwrap();
+        state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
+        state.add_session(account.id, &account.label, "sessie");
+        let dir = std::env::temp_dir().join(format!("ebmcp-bijlage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let factuur = dir.join("factuur-2026-0042.pdf");
+        std::fs::write(&factuur, b"%PDF-1.4 factuur").unwrap();
+        let geweigerd = dir.join("weigeren.exe");
+        std::fs::write(&geweigerd, b"MZ").unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mcp = router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
+        tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{PATH}");
+        let post = |body: serde_json::Value, session: Option<String>| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&body);
+            if let Some(s) = session {
+                request = request.header("mcp-session-id", s);
+            }
+            request.send()
+        };
+        let init = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "title": "Claude", "version": "1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        let book = |id: u32, omschrijving: &str, bijlage: &std::path::Path| {
+            let call = post(
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "mutatie_toevoegen", "arguments": {
+                    "soort": "geld_uitgegeven", "datum": "2026-11-06", "rekening": "1010", "omschrijving": omschrijving,
+                    "regels": [{"tegenrekening": "4550", "bedrag": 2}], "bijlage": bijlage.to_string_lossy()
+                }}}),
+                session.clone(),
+            );
+            async move { answer_of(call.await.unwrap().text().await.unwrap()) }
+        };
+        let paths = || {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // A path that is not there is refused before the user is asked anything.
+        let (is_error, text) = book(2, "Parkeergarage", &dir.join("weg.pdf")).await;
+        assert!(is_error && text.contains("Geen bestand gevonden"), "{text}");
+        assert!(
+            state.approvals.history(None).is_empty(),
+            "nothing was asked"
+        );
+
+        // One proposal that names the file; after Goedkeuren the booking, the upload and the link.
+        let (_, text) = book(3, "Parkeergarage", &factuur).await;
+        let id = waiting_id(&text);
+        let proposal = state.approvals.list().into_iter().next().unwrap();
+        assert!(
+            proposal.lines.iter().any(
+                |l| l.label == "Bijlage" && l.value.starts_with("factuur-2026-0042.pdf (1 kB)")
+            ),
+            "{:?}",
+            proposal.lines
+        );
+        assert!(paths().is_empty(), "nothing goes out before Goedkeuren");
+        assert!(state.approvals.decide(id, true, crate::state::now_ms()));
+        let record = settled(&state, id).await;
+        assert_eq!(record.status, crate::approvals::Status::Done);
+        assert_eq!(
+            paths(),
+            vec!["mutatie", "folder/upload", "folderkoppel/koppel/item"]
+        );
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[1].1["fileName"], "factuur-2026-0042.pdf");
+            assert_eq!(seen[1].1["folderId"], 0, "the Basismap");
+            assert_eq!(
+                seen[2].1,
+                serde_json::json!({"koppelId": 3908, "folders": [{"id": 77, "soort": "F"}], "koppelType": "MUT"})
+            );
+        }
+        let result = state.approvals.get(id).unwrap().result.unwrap();
+        assert_eq!(result["data"]["mutNr"], 3908);
+        assert_eq!(
+            result["data"]["bijlage"],
+            serde_json::json!({"bestand_id": 77, "naam": "factuur-2026-0042.pdf", "gekoppeld_aan_mutatie": 3908})
+        );
+
+        // The booking fails: nothing is uploaded.
+        seen.lock().unwrap().clear();
+        let (_, text) = book(4, "Fout", &factuur).await;
+        let id = waiting_id(&text);
+        assert!(state.approvals.decide(id, true, crate::state::now_ms()));
+        assert_eq!(
+            settled(&state, id).await.status,
+            crate::approvals::Status::Failed
+        );
+        assert_eq!(paths(), vec!["mutatie"], "no upload after a failed booking");
+
+        // The archive refuses the file: the booking stands, and the answer says how to add only the file.
+        seen.lock().unwrap().clear();
+        let (_, text) = book(5, "Parkeergarage", &geweigerd).await;
+        let id = waiting_id(&text);
+        assert!(state.approvals.decide(id, true, crate::state::now_ms()));
+        assert_eq!(
+            settled(&state, id).await.status,
+            crate::approvals::Status::Done
+        );
+        assert_eq!(paths(), vec!["mutatie", "folder/upload"]);
+        let bijlage = state.approvals.get(id).unwrap().result.unwrap()["data"]["bijlage"].clone();
+        assert_eq!(bijlage["gekoppeld_aan_mutatie"], serde_json::Value::Null);
+        assert!(
+            bijlage["fout"]
+                .as_str()
+                .unwrap()
+                .contains("niet toegestaan"),
+            "{bijlage}"
+        );
+        let let_op = bijlage["let_op"].as_str().unwrap();
+        assert!(
+            let_op.contains("Mutatie 3908 is geboekt")
+                && let_op.contains("archief_uploaden en mutatie_nr 3908"),
+            "{let_op}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The proposal id of a "waiting" answer.
     fn waiting_id(text: &str) -> u64 {
         let value: serde_json::Value =
