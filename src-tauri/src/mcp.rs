@@ -1126,6 +1126,13 @@ mod tests {
             .route(
                 "/v1/api/folder/{id}/download",
                 get(|Path(id): Path<u64>| async move {
+                    // File 66 is a script someone put in the archive; every other file is a photo of a receipt.
+                    if id == 66 {
+                        return (
+                            [(axum::http::header::CONTENT_DISPOSITION, "attachment; filename=start.command".to_owned())],
+                            b"#!/bin/sh\n".to_vec(),
+                        );
+                    }
                     (
                         [(axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=bon-{id}.jpg; filename*=UTF-8''bon-{id}.jpg"))],
                         vec![0xFFu8, 0xD8, 0xFF, 0xE0],
@@ -1314,6 +1321,18 @@ mod tests {
         )
         .await;
         assert!(is_error && text.contains("volledig pad"), "{text}");
+        // A file that is no document is refused in a folder the client named, and nothing is written there.
+        let before = std::fs::read_dir(&dir).unwrap().count();
+        let (is_error, text) = call(
+            "bijlage_downloaden",
+            serde_json::json!({"id": 66, "map": dir.to_str().unwrap()}),
+        )
+        .await;
+        assert!(
+            is_error && text.contains("start.command") && text.contains("Laat map weg"),
+            "{text}"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before);
         std::fs::remove_dir_all(&dir).unwrap();
 
         // Both are reads: no approval, and nothing changed at e-Boekhouden.

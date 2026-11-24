@@ -873,7 +873,7 @@ pub struct MutatieBijlagenArgs {
 pub struct BijlageDownloadenArgs {
     /// Id van het bestand in het digitaal archief (uit mutatie_bijlagen of digitaal_archief).
     pub id: u64,
-    /// Map op deze computer om het bestand in te zetten, als volledig pad naar een bestaande map (standaard Downloads/EB MCP/<administratie>, die EB MCP zo nodig aanmaakt).
+    /// Map op deze computer om het bestand in te zetten, als volledig pad naar een bestaande map (standaard Downloads/EB MCP/<administratie>, die EB MCP zo nodig aanmaakt). Een eigen map kan alleen voor een pdf, afbeelding, xml, txt, csv, xlsx of docx; elk ander soort bestand gaat alleen naar de standaardmap.
     pub map: Option<String>,
     /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
     pub account: Option<String>,
@@ -1747,7 +1747,8 @@ impl EbMcp {
                 naam.as_deref().unwrap_or("Dit id")
             ));
         }
-        let dir = match map.map(str::trim).filter(|m| !m.is_empty()) {
+        let named = map.map(str::trim).filter(|m| !m.is_empty());
+        let dir = match named {
             Some(named) => download_dir(Some(named))?,
             None => {
                 let dir = bijlagen_dir(
@@ -1775,6 +1776,13 @@ impl EbMcp {
         };
         let content_type = sniff_type(&bytes, header_name.as_deref().or(naam.as_deref()));
         let name = bijlage_name(header_name.as_deref(), naam.as_deref(), id, content_type);
+        // The archive decides the name and the bytes, and this tool asks no approval: in a folder the client
+        // picked, only a document may land, never something the system would run or load from there.
+        if named.is_some() && !is_document(&name) {
+            return Err(format!(
+                "{name} is geen pdf, afbeelding, xml, txt, csv, xlsx of docx: zo'n bestand zet EB MCP alleen in Downloads/EB MCP. Laat map weg."
+            ));
+        }
         let target = write_new(&dir, &name, &bytes)
             .map_err(|e| format!("Het bestand is niet op te slaan in {}: {e}", dir.display()))?;
         Ok(json!({
@@ -2297,6 +2305,13 @@ fn safe_name(name: &str) -> Option<String> {
     if cleaned.is_empty() {
         return None;
     }
+    // Windows keeps these names for devices, with any extension: "NUL.pdf" is the device, not a file.
+    let cleaned = if is_device_name(cleaned) {
+        format!("_{cleaned}")
+    } else {
+        cleaned.to_owned()
+    };
+    let cleaned = cleaned.as_str();
     const MAX: usize = 150;
     if cleaned.chars().count() <= MAX {
         return Some(cleaned.to_owned());
@@ -2313,6 +2328,35 @@ fn safe_name(name: &str) -> Option<String> {
         "{}{ext}",
         stem.chars().take(keep).collect::<String>().trim_end()
     ))
+}
+
+/// Whether Windows reads this name as a device (CON, PRN, AUX, NUL, COM1 to COM9, LPT1 to LPT9): the part
+/// before the first dot decides, whatever its case and whatever spaces follow it.
+fn is_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    let upper = stem.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    match upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+    {
+        Some(rest) => rest.len() == 1 && matches!(rest.as_bytes()[0], b'1'..=b'9'),
+        None => false,
+    }
+}
+
+/// Whether a file of this name is a plain document: the kinds a receipt or invoice comes in. Only these may be
+/// saved in a folder the AI client names; the last extension decides, as it does for the system.
+fn is_document(name: &str) -> bool {
+    const DOCUMENTS: [&str; 14] = [
+        "pdf", "jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "heic", "xml", "txt", "csv",
+        "xlsx", "docx",
+    ];
+    name.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty() && DOCUMENTS.contains(&ext.to_ascii_lowercase().as_str())
+    })
 }
 
 /// The default folder for archive files: Downloads/EB MCP/<administratie>, or the account's label when the
@@ -3219,7 +3263,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een bestand uit het digitaal archief (een bon of factuur, meestal pdf of jpg) op deze computer opslaan, op id (uit mutatie_bijlagen of digitaal_archief). Standaard in de map Downloads/EB MCP/<administratie>. Het antwoord geeft het volledige pad, de bestandsnaam, de grootte en het soort bestand; het bestand zelf gaat nergens anders heen. Verandert niets in e-Boekhouden. Bestaande bestanden worden niet overschreven.",
+        description = "Een bestand uit het digitaal archief (een bon of factuur, meestal pdf of jpg) op deze computer opslaan, op id (uit mutatie_bijlagen of digitaal_archief). Standaard in de map Downloads/EB MCP/<administratie>; een eigen map kan alleen voor een pdf, afbeelding, xml, txt, csv, xlsx of docx. Het antwoord geeft het volledige pad, de bestandsnaam, de grootte en het soort bestand; het bestand zelf gaat nergens anders heen. Verandert niets in e-Boekhouden. Bestaande bestanden worden niet overschreven.",
         annotations(title = "Bijlage downloaden", read_only_hint = true)
     )]
     async fn bijlage_downloaden(
@@ -5762,6 +5806,37 @@ mod tests {
         assert_eq!(safe_name("a:b*c?.pdf"), Some("a_b_c_.pdf".into()));
         assert_eq!(safe_name(".."), None);
         assert_eq!(safe_name(""), None);
+        // Windows device names get a prefix, with or without an extension and in any case.
+        assert_eq!(safe_name("NUL"), Some("_NUL".into()));
+        assert_eq!(safe_name("con.pdf"), Some("_con.pdf".into()));
+        assert_eq!(safe_name("Com1 .txt"), Some("_Com1 .txt".into()));
+        assert_eq!(safe_name("LPT9.tar.gz"), Some("_LPT9.tar.gz".into()));
+        assert_eq!(safe_name("COM0.pdf"), Some("COM0.pdf".into()));
+        assert_eq!(safe_name("COM10.pdf"), Some("COM10.pdf".into()));
+        assert_eq!(safe_name("Consult.pdf"), Some("Consult.pdf".into()));
+        assert_eq!(safe_name("nul bon.pdf"), Some("nul bon.pdf".into()));
+        // Only plain documents may go to a folder the client named; the last extension decides.
+        for name in [
+            "bon.pdf",
+            "Bon.JPEG",
+            "scan.heic",
+            "ubl.xml",
+            "a.b.csv",
+            "start.command.pdf",
+        ] {
+            assert!(is_document(name), "{name}");
+        }
+        for name in [
+            "start.command",
+            "bon.pdf.app",
+            "x.plist",
+            "setup.exe",
+            "bijlage-5",
+            ".pdf",
+            "a.sh",
+        ] {
+            assert!(!is_document(name), "{name}");
+        }
         let long = format!("{}.pdf", "x".repeat(300));
         let short = safe_name(&long).unwrap();
         assert_eq!(short.chars().count(), 150);
