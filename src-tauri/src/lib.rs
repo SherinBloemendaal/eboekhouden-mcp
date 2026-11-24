@@ -605,18 +605,32 @@ impl Arrivals {
     }
 }
 
-/// The notification for proposals that came up together: its title and its text.
+/// The notification for proposals that came up together: its title and its text, each change with its
+/// account.
 fn notification_text(fresh: &[approvals::Proposal]) -> (String, String) {
     const SHOWN: usize = 3;
     let title = match fresh.len() {
         1 => "EB MCP: 1 wijziging wacht op je akkoord".to_owned(),
         n => format!("EB MCP: {n} wijzigingen wachten op je akkoord"),
     };
-    let mut lines: Vec<String> = fresh.iter().take(SHOWN).map(|p| p.title.clone()).collect();
+    let mut lines: Vec<String> = fresh
+        .iter()
+        .take(SHOWN)
+        .map(|p| format!("{} ({})", p.title, p.account))
+        .collect();
     if fresh.len() > SHOWN {
         lines.push(format!("en nog {}", fresh.len() - SHOWN));
     }
     (title, lines.join("\n"))
+}
+
+/// Where a click on the notification for `fresh` leads: the proposal itself when there is one, else the
+/// Akkoord page with all that wait.
+fn notification_route(fresh: &[approvals::Proposal]) -> String {
+    match fresh {
+        [one] => format!("{APPROVALS_ROUTE}?open={}", one.id),
+        _ => APPROVALS_ROUTE.to_owned(),
+    }
 }
 
 /// Whether one of EB MCP's windows has the focus: then the user sees the proposal in the app already.
@@ -1548,19 +1562,23 @@ pub fn run() {
                 }
             });
 
-            // A click on a notification of a waiting change opens the main window at Akkoord.
+            // A click on a notification of a waiting change opens the main window at Akkoord, on the proposal
+            // when the last notification was about one.
+            let clicked = Arc::new(std::sync::Mutex::new(APPROVALS_ROUTE.to_owned()));
             {
                 use tauri_plugin_notification::NotificationExt;
-                let handle = app.handle().clone();
-                let _ = app
-                    .notification()
-                    .on_action(move |_| open_main(handle.clone(), Some(APPROVALS_ROUTE.into())));
+                let (handle, clicked) = (app.handle().clone(), clicked.clone());
+                let _ = app.notification().on_action(move |_| {
+                    let route = clicked.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    open_main(handle.clone(), Some(route));
+                });
             }
 
             // Proposals that came up while no EB MCP window had the focus get a notification; those close
             // together share one.
             let (arrived, mut arrivals) = tokio::sync::mpsc::unbounded_channel::<()>();
-            let (handle, notifying) = (app.handle().clone(), app_state.clone());
+            let (handle, notifying, choices) =
+                (app.handle().clone(), app_state.clone(), settings.clone());
             tauri::async_runtime::spawn(async move {
                 let mut seen = Arrivals {
                     seen: notifying.approvals.last_id(),
@@ -1570,7 +1588,14 @@ pub fn run() {
                     while arrivals.try_recv().is_ok() {}
                     let fresh =
                         seen.fresh(&notifying.approvals.list(), notifying.approvals.last_id());
-                    if !fresh.is_empty() && !any_window_focused(&handle) {
+                    // Off in Instellingen: what came up is still marked as seen, so turning it on again
+                    // does not announce old proposals.
+                    if !fresh.is_empty()
+                        && choices.get().notify_approvals
+                        && !any_window_focused(&handle)
+                    {
+                        *clicked.lock().unwrap_or_else(|e| e.into_inner()) =
+                            notification_route(&fresh);
                         notify_waiting(&handle, &fresh);
                     }
                 }
@@ -1891,7 +1916,7 @@ mod tests {
             notification_text(&fresh),
             (
                 "EB MCP: 2 wijzigingen wachten op je akkoord".to_owned(),
-                "Eerste\nTweede".to_owned()
+                "Eerste (Studio Noord)\nTweede (Studio Noord)".to_owned()
             )
         );
         assert!(seen.fresh(&waiting, 7).is_empty(), "announced once");
@@ -1900,11 +1925,17 @@ mod tests {
             notification_text(&one),
             (
                 "EB MCP: 1 wijziging wacht op je akkoord".to_owned(),
-                "Derde".to_owned()
+                "Derde (Studio Noord)".to_owned()
             )
         );
         let many: Vec<_> = (10..15).map(|n| proposal(n, &format!("Nr {n}"))).collect();
-        assert_eq!(notification_text(&many).1, "Nr 10\nNr 11\nNr 12\nen nog 2");
+        assert_eq!(
+            notification_text(&many).1,
+            "Nr 10 (Studio Noord)\nNr 11 (Studio Noord)\nNr 12 (Studio Noord)\nen nog 2"
+        );
+        // A click opens the one proposal, or the page with all of them.
+        assert_eq!(notification_route(&one), "/akkoord?open=8");
+        assert_eq!(notification_route(&many), "/akkoord");
     }
 
     #[test]

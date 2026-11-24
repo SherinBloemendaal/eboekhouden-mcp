@@ -268,7 +268,7 @@ describe('instellingen', () => {
   it('offers Openen bij inloggen and Toon in Dock as switches', async () => {
     const wrapper = await mountAt('/instellingen')
     const switches = wrapper.findAll('[role="switch"]').map((s) => s.attributes('aria-label'))
-    expect(switches).toEqual(['Openen bij inloggen', 'Toon in Dock', 'Blijf ingelogd'])
+    expect(switches).toEqual(['Openen bij inloggen', 'Toon in Dock', 'Blijf ingelogd', 'Melding bij een nieuw voorstel'])
     // On by default (Sherin, 2026-11-10).
     expect(wrapper.find('[aria-label="Toon in Dock"]').attributes('aria-checked')).toBe('true')
     wrapper.unmount()
@@ -279,6 +279,13 @@ describe('instellingen', () => {
     expect(wrapper.find('[aria-label="Blijf ingelogd"]').attributes('aria-checked')).toBe('false')
     expect(wrapper.find('select[aria-label="Uitloggen na stilte"]').attributes('disabled')).toBeUndefined()
     expect(wrapper.text()).toContain('houdt elke sessie op de achtergrond actief')
+    wrapper.unmount()
+  })
+
+  it('has Melding bij een nieuw voorstel on until the user turns it off', async () => {
+    const wrapper = await mountAt('/instellingen')
+    expect(wrapper.find('[aria-label="Melding bij een nieuw voorstel"]').attributes('aria-checked')).toBe('true')
+    expect(wrapper.text()).toContain('met de wijziging en het account')
     wrapper.unmount()
   })
 
