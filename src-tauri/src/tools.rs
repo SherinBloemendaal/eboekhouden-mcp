@@ -2366,32 +2366,36 @@ fn sniff_type(bytes: &[u8], name: Option<&str>) -> &'static str {
     }
 }
 
-/// The extension that goes with a content type, for a name that has none.
-fn extension_of(content_type: &str) -> Option<&'static str> {
-    Some(match content_type {
-        "application/pdf" => "pdf",
-        "image/jpeg" => "jpg",
-        "image/png" => "png",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        "image/tiff" => "tif",
-        "image/heic" => "heic",
-        _ => return None,
-    })
+/// The extensions that go with a content type the bytes gave away, the usual one first.
+fn extensions_of(content_type: &str) -> &'static [&'static str] {
+    match content_type {
+        "application/pdf" => &["pdf"],
+        "image/jpeg" => &["jpg", "jpeg"],
+        "image/png" => &["png"],
+        "image/gif" => &["gif"],
+        "image/webp" => &["webp"],
+        "image/tiff" => &["tif", "tiff"],
+        _ => &[],
+    }
 }
 
 /// The name an archive file is saved under: e-Boekhouden's download name, else its name in the archive, else
-/// bijlage-<id>; made safe, and with an extension when it had none.
+/// bijlage-<id>; made safe, and ending in the extension of what the file is when that is known. A name like
+/// "Factuur 12.11.2026" has dots but no extension, so the end of the name is compared, not just looked for.
 fn bijlage_name(header: Option<&str>, naam: Option<&str>, id: u64, content_type: &str) -> String {
     let name = header
         .and_then(safe_name)
         .or_else(|| naam.and_then(safe_name))
         .unwrap_or_else(|| format!("bijlage-{id}"));
-    let has_extension = name
-        .rsplit_once('.')
-        .is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty() && ext.len() <= 5);
-    match extension_of(content_type) {
-        Some(ext) if !has_extension => format!("{name}.{ext}"),
+    let extensions = extensions_of(content_type);
+    let lower = name.to_lowercase();
+    let fits = extensions.iter().any(|ext| {
+        lower
+            .strip_suffix(ext)
+            .is_some_and(|rest| rest.ends_with('.') && rest.len() > 1)
+    });
+    match extensions.first() {
+        Some(ext) if !fits => format!("{name}.{ext}"),
         _ => name,
     }
 }
@@ -5772,6 +5776,18 @@ mod tests {
             "Factuur KPN.pdf"
         );
         assert_eq!(bijlage_name(None, None, 5, "image/png"), "bijlage-5.png");
+        assert_eq!(
+            bijlage_name(None, Some("Factuur 12.11.2026"), 5, "application/pdf"),
+            "Factuur 12.11.2026.pdf"
+        );
+        assert_eq!(
+            bijlage_name(None, Some("Bon.JPEG"), 5, "image/jpeg"),
+            "Bon.JPEG"
+        );
+        assert_eq!(
+            bijlage_name(None, Some("scan.heic"), 5, "image/heic"),
+            "scan.heic"
+        );
         assert_eq!(
             bijlage_name(Some(".."), None, 7, "application/octet-stream"),
             "bijlage-7"

@@ -1101,7 +1101,7 @@ mod tests {
                 }),
             )
             .route(
-                // The files linked to mutatie 16; mutatie 17 has none, and the answer is then empty. Any other
+                // The files linked to mutatie 16; mutaties 17 and 18 have none. Any other
                 // query is an error, so the tool must ask exactly as e-Boekhouden's archive grid does.
                 "/v1/api/folder/gekoppeldgridtable",
                 get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
@@ -1116,7 +1116,9 @@ mod tests {
                             "rowCount": 1
                         }))
                         .into_response(),
-                        Some("17") => axum::http::StatusCode::NO_CONTENT.into_response(),
+                        // As the real API answers for a mutatie without files (seen 2026-11-24).
+                        Some("17") => axum::Json(json!({"colMetadata": [{"name": "id"}, {"name": "koppelId"}, {"name": "naam"}, {"name": "soort"}, {"name": "datum"}, {"name": "grootte"}, {"name": "guid"}], "data": [], "rowCount": 0})).into_response(),
+                        Some("18") => axum::http::StatusCode::NO_CONTENT.into_response(),
                         _ => axum::http::StatusCode::BAD_REQUEST.into_response(),
                     }
                 }),
@@ -1125,7 +1127,7 @@ mod tests {
                 "/v1/api/folder/{id}/download",
                 get(|Path(id): Path<u64>| async move {
                     (
-                        [(axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=bon-{id}.jpg"))],
+                        [(axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=bon-{id}.jpg; filename*=UTF-8''bon-{id}.jpg"))],
                         vec![0xFFu8, 0xD8, 0xFF, 0xE0],
                     )
                 }),
@@ -1277,13 +1279,14 @@ mod tests {
             serde_json::json!([{"id": 5, "naam": "bon-5.jpg", "datum": "2026-11-03T10:00:00", "grootte": 4}])
         );
         assert_eq!(answer["bron"], "folder/gekoppeldgridtable");
-        // A mutatie without files: an empty list, not an error.
-        let (is_error, text) = call("mutatie_bijlagen", serde_json::json!({"nr": 17})).await;
-        assert!(!is_error, "{text}");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&text).unwrap()["data"]["data"],
-            serde_json::json!([])
-        );
+        // A mutatie without files: an empty list, not an error. Also when the answer has no body at all.
+        for nr in [17, 18] {
+            let (is_error, text) = call("mutatie_bijlagen", serde_json::json!({"nr": nr})).await;
+            assert!(!is_error, "{text}");
+            let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(answer["data"]["data"], serde_json::json!([]), "{nr}");
+            assert_eq!(answer["rijen"], 0, "{nr}");
+        }
 
         // Downloading saves the file in the folder given, never over another one, and answers where it is.
         let dir = std::env::temp_dir().join(format!("ebmcp-bijlage-{}", uuid::Uuid::new_v4()));
