@@ -2708,10 +2708,11 @@ impl EbMcp {
         .await
     }
 
-    // The list behind Boekhouden > Importeren in e-Boekhouden's own app (`import/gridtable`). Only the read: the
-    // paths that process, book or delete these lines (`import/verwerk`, `import/bulk/wegboeken`) are never called.
+    // The list behind Boekhouden > Importeren in e-Boekhouden's own app (`import/gridtable`). Only the read here:
+    // processing these lines goes through mutatie_toevoegen and importregels_verwerken, a line's comment through
+    // bankregel_opmerking_wijzigen; writing lines off in bulk (`import/bulk/wegboeken`) is never called.
     #[tool(
-        description = "Geïmporteerde bankregels (afschriftregels) die nog niet verwerkt zijn tot een mutatie. Per regel: id, datum (van de import), rekening (IBAN van de eigen bankrekening), mutDatum (boekdatum), mutBedrag (negatief is af), mutOmschrijving (met naam en IBAN van de tegenpartij), mutFactuur, grootboekId, opmerking, hasFiles en verwerkFailureReason. Te filteren op boekdatum en omschrijving. Alleen lezen. Eén regel verwerken kan met mutatie_toevoegen (bankregel_id); alle regels opnieuw door de automatische importregels halen kan met importregels_verwerken.",
+        description = "Geïmporteerde bankregels (afschriftregels) die nog niet verwerkt zijn tot een mutatie. Per regel: id, datum (van de import), rekening (IBAN van de eigen bankrekening), mutDatum (boekdatum), mutBedrag (negatief is af), mutOmschrijving (met naam en IBAN van de tegenpartij), mutFactuur, grootboekId, opmerking, hasFiles en verwerkFailureReason. Te filteren op boekdatum en omschrijving. Alleen lezen. Eén regel verwerken kan met mutatie_toevoegen (bankregel_id); alle regels opnieuw door de automatische importregels halen kan met importregels_verwerken; een opmerking bij een regel zetten of wissen (bijvoorbeeld \"wacht op factuur\") kan met bankregel_opmerking_wijzigen.",
         annotations(title = "Bankregels", read_only_hint = true)
     )]
     async fn bankregels(
@@ -4952,6 +4953,7 @@ impl ServerHandler for EbMcp {
                  Klopt een voorstel dat nog wacht niet, of is het niet meer nodig, trek het dan zelf in met akkoord_intrekken (met een korte reden) in plaats van de gebruiker te vragen het te weigeren; na goedkeuring kan dat niet meer. \
                  Een geïmporteerde bankregel verwerken kan: bankregels geeft de onverwerkte regels met hun id, en mutatie_toevoegen met bankregel_id boekt de mutatie en verwerkt de regel in één keer, bij elke soort, ook een factuurbetaling. \
                  Boek geld van een bankregel nooit zonder bankregel_id: dan blijft de regel open staan en dreigt een dubbele boeking. \
+                 Kan een bankregel nog niet geboekt worden (bijvoorbeeld omdat de factuur nog ontbreekt), zet er dan een opmerking bij met bankregel_opmerking_wijzigen, zoals \"wacht op factuur\". \
                  Een btw-aangifte, ICP-opgave of suppletie versturen, indienen of betalen kan EB MCP niet: dat doet de gebruiker zelf. \
                  Wel kan btwaangifte_betaallink de iDEAL-link van een verstuurde aangifte opzoeken: toon die link aan de gebruiker om zelf te openen, open of volg hem nooit zelf. \
                  Zegt een tool dat de uitkomst onbekend is (een mail of bestand dat mogelijk al weg is), probeer het dan niet opnieuw maar laat de gebruiker eerst kijken. \
