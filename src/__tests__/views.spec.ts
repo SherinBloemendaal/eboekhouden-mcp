@@ -282,11 +282,12 @@ describe('instellingen', () => {
     wrapper.unmount()
   })
 
-  it('has Wacht op akkoord in de aanroep on, for at most five minutes', async () => {
+  it('has Wacht op akkoord in de aanroep off, with five minutes ready for when it is turned on', async () => {
     const wrapper = await mountAt('/instellingen')
-    expect(wrapper.find('[aria-label="Wacht op akkoord in de aanroep"]').attributes('aria-checked')).toBe('true')
+    expect(wrapper.find('[aria-label="Wacht op akkoord in de aanroep"]').attributes('aria-checked')).toBe('false')
     const wait = wrapper.find('select[aria-label="Hoogstens wachten"]')
-    expect(wait.attributes('disabled')).toBeUndefined()
+    expect(wait.attributes('disabled')).toBeDefined()
+    expect(wrapper.text()).toContain('Staat uit zolang Wacht op akkoord in de aanroep uit staat.')
     expect((wait.element as HTMLSelectElement).value).toBe('5')
     expect(wait.findAll('option').map((o) => o.text())).toEqual(['1 minuut', '2 minuten', '5 minuten', '10 minuten'])
     wrapper.unmount()

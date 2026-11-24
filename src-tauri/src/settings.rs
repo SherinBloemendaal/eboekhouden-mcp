@@ -36,7 +36,9 @@ pub struct Settings {
     pub show_in_dock: bool,
     /// Wacht op akkoord in de aanroep: a tool whose change needs approval keeps its MCP call open until the user
     /// answered (or `wait_minutes` passed) and answers with the outcome, so the AI client carries on by itself.
-    /// Off: the call answers at once with status wacht, as before. On by default (Dion, 2026-11-24).
+    /// Off: the call answers at once with status wacht and a voorstel_id. Off by default: a client that gives
+    /// up on a long call has no voorstel_id to ask after, and how long each client keeps a call open is not
+    /// measured yet.
     pub wait_for_approval: bool,
     /// How long a call waits at most before it answers with status wacht after all. One of `WAIT_CHOICES`.
     pub wait_minutes: u32,
@@ -49,7 +51,7 @@ impl Default for Settings {
             keep_signed_in: false,
             appearance: Appearance::System,
             show_in_dock: true,
-            wait_for_approval: true,
+            wait_for_approval: false,
             wait_minutes: 5,
         }
     }
@@ -117,11 +119,11 @@ mod tests {
                 keep_signed_in: true,
                 appearance: Appearance::Dark,
                 show_in_dock: true,
-                wait_for_approval: false,
+                wait_for_approval: true,
                 wait_minutes: 2,
             })
             .unwrap();
-        assert!(!SettingsStore::open(&dir).get().wait_for_approval);
+        assert!(SettingsStore::open(&dir).get().wait_for_approval);
         assert_eq!(SettingsStore::open(&dir).get().wait_minutes, 2);
         assert!(SettingsStore::open(&dir).get().keep_signed_in);
         assert_eq!(SettingsStore::open(&dir).get().idle_minutes, 60);
@@ -145,8 +147,8 @@ mod older_files {
                 keep_signed_in: false,
                 appearance: Appearance::System,
                 show_in_dock: true,
-                // Waiting for approval is new and on: a file from before it waits too.
-                wait_for_approval: true,
+                // Waiting for approval in the call is new and off: a file from before it answers at once, as it did.
+                wait_for_approval: false,
                 wait_minutes: 5,
             }
         );
@@ -159,7 +161,7 @@ mod older_files {
         let dir = std::env::temp_dir().join(format!("ebmcp-settings-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let store = SettingsStore::open(&dir);
-        assert!(store.get().wait_for_approval);
+        assert!(!store.get().wait_for_approval);
         assert_eq!(store.get().wait_minutes, 5);
         assert!(
             store
@@ -169,10 +171,10 @@ mod older_files {
                 })
                 .is_err()
         );
-        let off: Settings =
-            serde_json::from_str(r#"{"waitForApproval": false, "waitMinutes": 10}"#).unwrap();
-        assert!(!off.wait_for_approval);
-        assert_eq!(off.wait_minutes, 10);
+        let on: Settings =
+            serde_json::from_str(r#"{"waitForApproval": true, "waitMinutes": 10}"#).unwrap();
+        assert!(on.wait_for_approval);
+        assert_eq!(on.wait_minutes, 10);
     }
 
     #[test]

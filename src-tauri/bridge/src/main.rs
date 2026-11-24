@@ -85,8 +85,11 @@ async fn main() -> ExitCode {
             continue;
         }
         let message: Option<Value> = serde_json::from_str(&line).ok();
+        // The id of a request, which gets an answer. The client's own answer to a request of EB MCP carries an
+        // id too, but no method: nothing comes back for it, so it goes on as a notification does.
         let id = message
             .as_ref()
+            .filter(|m| m.get("method").is_some())
             .and_then(|m| m.get("id"))
             .filter(|id| !id.is_null())
             .cloned();
@@ -206,15 +209,19 @@ async fn forward(
         );
         return;
     }
-    let emit = |message: String| {
-        if shared.get().protocol.is_none()
-            && let Ok(value) = serde_json::from_str::<Value>(&message)
-            && let Some(v) = value
-                .pointer("/result/protocolVersion")
-                .and_then(Value::as_str)
-        {
-            let v = v.to_owned();
-            shared.update(|s| s.protocol = Some(v));
+    // Whether the client got the answer to this request: a message that carries its id and a result or an error.
+    let mut answered = false;
+    let mut emit = |message: String| {
+        if let Ok(value) = serde_json::from_str::<Value>(&message) {
+            answered |= answers(&value, id.as_ref());
+            if shared.get().protocol.is_none()
+                && let Some(v) = value
+                    .pointer("/result/protocolVersion")
+                    .and_then(Value::as_str)
+            {
+                let v = v.to_owned();
+                shared.update(|s| s.protocol = Some(v));
+            }
         }
         let _ = out.send(message);
     };
@@ -223,15 +230,31 @@ async fn forward(
         // call still waits.
         let mut stream = EventStream::default();
         while let Some(chunk) = answer.chunk().await {
-            stream.push(&chunk).into_iter().for_each(&emit);
+            stream.push(&chunk).into_iter().for_each(&mut emit);
         }
-        stream.finish().into_iter().for_each(&emit);
+        stream.finish().into_iter().for_each(&mut emit);
     } else {
         let body = answer.text().await;
         if !body.trim().is_empty() {
             emit(body.trim().to_owned());
         }
     }
+    // The body ended without the answer: EB MCP stopped or the connection broke while the call waited. The
+    // client hears so at once, and not only when its own time runs out; a change that waited for approval is
+    // not lost by it, so the client is told not to send it again.
+    if !answered {
+        send_all(&out, error_for(id, CUT_OFF));
+    }
+}
+
+/// The answer to a request whose connection to EB MCP ended before its answer came.
+const CUT_OFF: &str = "De verbinding met EB MCP viel weg voordat het antwoord er was. Doe een aanroep die iets wijzigt niet opnieuw: wachtte de wijziging op akkoord, dan wacht ze daar mogelijk nog. Kijk eerst met akkoord_status wat er van geworden is.";
+
+/// Whether `message` is the answer to the request with this id: its id, with a result or an error.
+fn answers(message: &Value, id: Option<&Value>) -> bool {
+    id.is_some()
+        && message.get("id") == id
+        && (message.get("result").is_some() || message.get("error").is_some())
 }
 
 /// Starts a new session unless another request did so already since `stale` was sent. The session to use.
@@ -505,6 +528,36 @@ mod tests {
             vec!["{\"a\":1}".to_owned()],
             "a last event without its blank line"
         );
+    }
+
+    #[test]
+    fn knows_the_answer_to_a_request_from_what_else_comes_by() {
+        let id = json!(7);
+        assert!(answers(
+            &json!({"jsonrpc": "2.0", "id": 7, "result": {}}),
+            Some(&id)
+        ));
+        assert!(answers(
+            &json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -1}}),
+            Some(&id)
+        ));
+        // Progress, a request from the server with the same number, and another request's answer are not it.
+        assert!(!answers(
+            &json!({"jsonrpc": "2.0", "method": "notifications/progress"}),
+            Some(&id)
+        ));
+        assert!(!answers(
+            &json!({"jsonrpc": "2.0", "id": 7, "method": "ping"}),
+            Some(&id)
+        ));
+        assert!(!answers(
+            &json!({"jsonrpc": "2.0", "id": 8, "result": {}}),
+            Some(&id)
+        ));
+        assert!(!answers(
+            &json!({"jsonrpc": "2.0", "id": 7, "result": {}}),
+            None
+        ));
     }
 
     #[test]

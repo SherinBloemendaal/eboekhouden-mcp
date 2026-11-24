@@ -1144,6 +1144,15 @@ mod tests {
         assert!(text.contains("binnen 1 seconde niet geantwoord"), "{text}");
         assert!(text.contains("niet opnieuw"), "{text}");
         assert_eq!(state.approvals.count(), 1, "the change still waits");
+        // A client that gave up on the call and sends it again gets no second proposal: it hears which one waits.
+        let (is_error, text) = answer_of(book(4).await.unwrap());
+        assert!(is_error, "{text}");
+        assert!(
+            text.contains(&format!("als voorstel {id}")) && text.contains("geen tweede voorstel"),
+            "{text}"
+        );
+        assert_eq!(state.approvals.count(), 1, "still one proposal");
+        assert_eq!(seen.lock().unwrap().len(), 1, "and nothing went out");
         assert!(state.approvals.decide(id, true, crate::state::now_ms()));
         let record = settled(&state, id).await;
         assert_eq!(record.status, crate::approvals::Status::Done);

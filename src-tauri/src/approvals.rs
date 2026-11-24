@@ -610,6 +610,25 @@ impl Approvals {
         self.changed();
     }
 
+    /// The waiting proposal that asks the very same as a new call would: the same tool with the same arguments
+    /// for the same account. A client that gave up on a call that waited in it (Wacht op akkoord in de aanroep)
+    /// has no voorstel_id and may send the call again; that would put the same change in the queue twice.
+    pub fn waiting_same(&self, account_id: Uuid, tool: &str, args: &Value) -> Option<u64> {
+        let args = kept(args);
+        let inner = self.lock();
+        inner
+            .records
+            .iter()
+            .find(|d| {
+                let proposal = &d.record.proposal;
+                inner.pending.contains_key(&proposal.id)
+                    && proposal.account_id == account_id
+                    && proposal.tool == tool
+                    && d.args == args
+            })
+            .map(|d| d.record.proposal.id)
+    }
+
     /// The waiting proposals, oldest first.
     pub fn list(&self) -> Vec<Proposal> {
         let inner = self.lock();

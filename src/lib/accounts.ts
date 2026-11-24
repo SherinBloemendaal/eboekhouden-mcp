@@ -289,7 +289,7 @@ export function traceText(trace: Trace): string {
 export const sendCode = (id: string, code: string) => invoke('signin_code', { id, code })
 export const signOut = (id: string) => invoke('sign_out', { id }).finally(refresh)
 export const signOutAll = () => invoke('sign_out_all').finally(refresh)
-export const getSettings = () => (inApp() ? invoke<Settings>('settings_get') : Promise.resolve<Settings>({ idleMinutes: 30, keepSignedIn: false, appearance: 'system', showInDock: true, waitForApproval: true, waitMinutes: 5 }))
+export const getSettings = () => (inApp() ? invoke<Settings>('settings_get') : Promise.resolve<Settings>({ idleMinutes: 30, keepSignedIn: false, appearance: 'system', showInDock: true, waitForApproval: false, waitMinutes: 5 }))
 export const saveSettings = (value: Settings) => invoke('settings_set', { value })
 
 /** Closes this window's view of a sign-in. Its newest step stays known, here and in other windows. */

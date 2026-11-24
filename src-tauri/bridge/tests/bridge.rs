@@ -448,6 +448,98 @@ async fn a_waiting_call_holds_up_nothing_and_its_progress_comes_through_at_once(
     );
 }
 
+/// EB MCP stops, or the connection breaks, while a call waits: the client gets an answer to its request at once,
+/// which says not to send a change again. The client's own answer to a request of EB MCP gets nothing back.
+#[tokio::test]
+async fn a_call_whose_stream_ends_without_its_answer_is_answered_by_the_bridge() {
+    use axum::body::Body;
+    let app = Router::new().route(
+        "/mcp",
+        post(move |body: String| async move {
+            let message: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let id = message["id"].clone();
+            let sse = |body: String| {
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .header("mcp-session-id", "s-1")
+                    .body(Body::from(body))
+                    .unwrap()
+            };
+            match message["method"].as_str() {
+                Some("initialize") => sse(format!(
+                    "data: {}\n\n",
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2025-06-18"}})
+                )),
+                // Progress, and then the stream ends: the answer never comes.
+                Some("tools/call") => sse(format!(
+                    "data: {}\n\n",
+                    serde_json::json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progressToken": "p", "progress": 15}})
+                )),
+                Some(_) => sse(format!(
+                    "data: {}\n\n",
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"tools": []}})
+                )),
+                // The client's answer to a request of EB MCP: accepted, with nothing in return.
+                None => axum::response::Response::builder()
+                    .status(202)
+                    .body(Body::empty())
+                    .unwrap(),
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let url = format!("http://127.0.0.1:{}/mcp", addr.port());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_eb-mcp-bridge"))
+        .args(["--url", &url])
+        .env("EB_MCP_TOKEN", "t0k3n")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap()).lines();
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+        .await
+        .unwrap();
+    assert!(out.next_line().await.unwrap().unwrap().contains("\"id\":1"));
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"mutatie_toevoegen\"}}\n")
+        .await
+        .unwrap();
+    let progress = out.next_line().await.unwrap().unwrap();
+    assert!(progress.contains("notifications/progress"), "{progress}");
+    let cut: serde_json::Value =
+        serde_json::from_str(&out.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(cut["id"], 2);
+    let message = cut["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("viel weg")
+            && message.contains("niet opnieuw")
+            && message.contains("akkoord_status"),
+        "{message}"
+    );
+    // The client answers a request of EB MCP (an id, no method), then asks something: only the last gets a line.
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"}\n")
+        .await
+        .unwrap();
+    let list = out.next_line().await.unwrap().unwrap();
+    assert!(
+        list.contains("\"id\":3") && list.contains("tools"),
+        "{list}"
+    );
+    drop(stdin);
+    child.wait().await.unwrap();
+    assert!(
+        out.next_line().await.unwrap().is_none(),
+        "nothing more was written"
+    );
+}
+
 /// The body of the waiting call: `first`, then `last` once `wait` is released.
 fn async_stream(
     first: String,
