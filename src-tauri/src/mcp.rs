@@ -1149,6 +1149,37 @@ mod tests {
         assert_eq!(record.status, crate::approvals::Status::Done);
         assert_eq!(seen.lock().unwrap().len(), 2, "booked after Goedkeuren");
 
+        // Through eb-mcp-bridge the call waits less than a minute whatever the setting (1 second in tests), so
+        // Claude Desktop hears that the change waits before it gives up on the call.
+        state.set_approval_wait(Some(std::time::Duration::from_secs(30)));
+        let started = std::time::Instant::now();
+        let call = http
+            .post(&url)
+            .bearer_auth(TOKEN)
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18")
+            .header("mcp-session-id", session.clone().unwrap())
+            .header(crate::tools::BRIDGE_HEADER, "1")
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {
+                "name": "mutatie_toevoegen",
+                "arguments": {
+                    "soort": "geld_uitgegeven", "datum": "2026-11-06", "rekening": "1010", "omschrijving": "Parkeergarage",
+                    "regels": [{"tegenrekening": "4550", "bedrag": 2}]
+                }
+            }}))
+            .send()
+            .await
+            .unwrap();
+        let (_, text) = answer_of(call.text().await.unwrap());
+        assert!(
+            text.contains("\"status\":\"wacht\"") && text.contains("binnen 1 seconde"),
+            "{text}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "capped, not 30 s"
+        );
+
         // Waiting off: the call answers at once, as before.
         state.set_approval_wait(None);
         let call = book(5);

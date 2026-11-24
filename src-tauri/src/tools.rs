@@ -1050,7 +1050,11 @@ const PROGRESS_EVERY: Duration = if cfg!(test) {
 };
 /// How long a call through eb-mcp-bridge waits for the user at most: Claude Desktop, the client that starts
 /// the bridge, gives up on a tool call after about a minute.
-const BRIDGE_WAIT: Duration = Duration::from_secs(50);
+const BRIDGE_WAIT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(50)
+};
 /// The header eb-mcp-bridge sends with each request (bridge/src/main.rs).
 pub const BRIDGE_HEADER: &str = "x-eb-mcp-bridge";
 
@@ -5073,12 +5077,9 @@ mod tests {
         let five = Some(Duration::from_secs(300));
         assert_eq!(capped(five, false), five);
         assert_eq!(capped(five, true), Some(BRIDGE_WAIT));
-        assert_eq!(
-            capped(Some(Duration::from_secs(20)), true),
-            Some(Duration::from_secs(20))
-        );
+        let short = Some(Duration::from_millis(500));
+        assert_eq!(capped(short, true), short);
         assert_eq!(capped(None, true), None);
-        assert!(BRIDGE_WAIT < Duration::from_secs(60));
         assert_eq!(minutes(Duration::from_secs(50)), "50 seconden");
         assert_eq!(minutes(Duration::from_secs(60)), "1 minuut");
         assert_eq!(minutes(Duration::from_secs(300)), "5 minuten");

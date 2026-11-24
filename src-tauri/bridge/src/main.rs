@@ -184,7 +184,9 @@ async fn forward(
         }
         Ok(answer) => answer,
     };
-    if let Some(s) = answer.session.clone() {
+    // The session comes from the answer to the initialize (and from `renew`): a late answer of a call that
+    // waited minutes must not put back a session that was replaced meanwhile.
+    if is_initialize && let Some(s) = answer.session.clone() {
         shared.update(|state| state.id = Some(s));
     }
     if answer.status == 401 {
