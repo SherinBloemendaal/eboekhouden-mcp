@@ -1733,7 +1733,9 @@ impl EbMcp {
                     .log
                     .finish_mcp(run.id, Outcome::Ok, Some(&value), None);
                 if let Some(id) = proposal {
-                    self.state.approvals.finish(id, Ok(&value), now);
+                    self.state
+                        .approvals
+                        .finish_noted(id, Ok(&value), missed(&value["data"]), now);
                 }
                 CallToolResult::success(vec![ContentBlock::text(value.to_string())])
             }
@@ -2221,6 +2223,22 @@ fn plain_text(html: &str) -> String {
         text.push('\n');
     }
     text.trim().to_owned()
+}
+
+/// What did not come of a change that is done, for the history (`Record::note`): a booking whose attachment
+/// did not get to the mutatie (`attach_to_mutatie`). The AI client reads the same in `bijlage.let_op`.
+fn missed(data: &Value) -> Option<String> {
+    let bijlage = data.get("bijlage")?;
+    let fout = bijlage.get("fout").and_then(Value::as_str)?;
+    Some(
+        if bijlage.get("bestand_id").is_some_and(|id| !id.is_null()) {
+            format!(
+                "De boeking staat in e-Boekhouden en het bestand in het archief, maar ze zijn niet aan elkaar gekoppeld: {fout}"
+            )
+        } else {
+            format!("De boeking staat in e-Boekhouden, maar de bijlage is niet toegevoegd: {fout}")
+        },
+    )
 }
 
 /// Saves `bytes` as `dir/name`, or `dir/name (2).pdf` and on while that name is taken. The file is created new:

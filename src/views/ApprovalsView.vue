@@ -13,7 +13,7 @@ import JsonView from '../components/JsonView.vue'
 import { store } from '../lib/accounts'
 import {
   ago, approvalDetail, approvalState, connectApprovals, decideAll, decideApproval, decisionLabel, exportApprovals, filterHistory,
-  followSelection, nameList, proposalKind, refreshApprovals, refreshHistory, splitTitle, stamp, STATUSES, statusOf, watchHistory,
+  followSelection, nameList, proposalKind, refreshApprovals, refreshHistory, splitTitle, stamp, recordStatus, STATUSES, watchHistory,
   type ApprovalDetail, type ApprovalRecord, type ApprovalStatus, type DecideAllResult, type Proposal,
 } from '../lib/approvals'
 import { useExport } from '../lib/exporting'
@@ -321,11 +321,12 @@ function showInQueue(id: number) {
 }
 
 /** The outcome in words, for the detail. */
-function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off'; text: string } {
+function outcome(record: ApprovalRecord): { tone: 'ok' | 'warn' | 'bad' | 'info' | 'off'; text: string } {
   switch (record.status) {
     case 'waiting': return { tone: 'info', text: 'Wacht op je akkoord.' }
     case 'running': return { tone: 'info', text: 'EB MCP voert deze wijziging nu uit in e-Boekhouden.' }
-    case 'done': return { tone: 'ok', text: 'Uitgevoerd in e-Boekhouden.' }
+    // A change that left a part undone (a booking without its attachment) says what, so it does not pass for whole.
+    case 'done': return record.note ? { tone: 'warn', text: record.note } : { tone: 'ok', text: 'Uitgevoerd in e-Boekhouden.' }
     case 'failed': return { tone: 'bad', text: `Mislukt: ${record.error ?? 'e-Boekhouden gaf geen reden.'}` }
     // The reason says whether anything went out: a change that was cut off while it ran may be half done.
     case 'refused': return { tone: 'off', text: record.error ?? 'Geweigerd. Er is niets gewijzigd in e-Boekhouden.' }
@@ -487,7 +488,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
                   </span>
                   <span class="r-status">
                     <span v-if="r.decision === 'auto'" class="chip auto">Zonder akkoord</span>
-                    <span class="chip status" :class="statusOf(r.status).tone">{{ statusOf(r.status).label }}</span>
+                    <span class="chip status" :class="recordStatus(r).tone">{{ recordStatus(r).label }}</span>
                   </span>
                 </button>
               </li>
@@ -501,7 +502,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
                     <button type="button" class="icon-btn" aria-label="Details sluiten" title="Sluiten" @click="closeDetail"><Icon name="x" :size="14" /></button>
                   </div>
                   <div class="facts">
-                    <span class="chip status" :class="statusOf(selected.status).tone">{{ statusOf(selected.status).label }}</span>
+                    <span class="chip status" :class="recordStatus(selected).tone">{{ recordStatus(selected).label }}</span>
                     <span v-if="selected.decision === 'auto'" class="chip auto">Zonder akkoord</span>
                     <span v-if="selected.danger" class="chip bad">Niet terug te draaien</span>
                   </div>
@@ -702,6 +703,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'bad' | 'info' | 'off';
 .chip { display: inline-flex; align-items: center; gap: 4px; height: 18px; padding: 0 7px; border-radius: 999px; background: var(--subtle); color: var(--label); font-size: 11px; font-weight: 500; white-space: nowrap; flex: none; }
 .chip.ok { background: var(--success-soft); color: var(--success); }
 .chip.bad { background: var(--danger-soft); color: var(--danger); }
+.chip.warn { background: var(--warn-soft); color: var(--warn); }
 .chip.run { background: var(--info-soft); color: var(--info); }
 .chip.off { background: var(--subtle); color: var(--muted); }
 .chip.auto { background: transparent; color: var(--muted); box-shadow: inset 0 0 0 0.5px var(--line); }

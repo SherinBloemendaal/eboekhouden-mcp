@@ -1220,6 +1220,7 @@ mod tests {
             );
         }
         let result = state.approvals.get(id).unwrap().result.unwrap();
+        assert_eq!(state.approvals.get(id).unwrap().record.note, None);
         assert_eq!(result["data"]["mutNr"], 3908);
         assert_eq!(
             result["data"]["bijlage"],
@@ -1261,6 +1262,14 @@ mod tests {
             let_op.contains("Mutatie 3908 is geboekt")
                 && let_op.contains("archief_uploaden en mutatie_nr 3908"),
             "{let_op}"
+        );
+        // The user hears it too: the record in the history is done, with what did not come of it.
+        let note = settled(&state, id).await.note.unwrap();
+        assert!(
+            note.starts_with(
+                "De boeking staat in e-Boekhouden, maar de bijlage is niet toegevoegd:"
+            ) && note.contains("niet toegestaan"),
+            "{note}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

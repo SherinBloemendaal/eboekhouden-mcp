@@ -191,6 +191,11 @@ pub struct Record {
     pub decision: Option<Decision>,
     pub status: Status,
     pub error: Option<String>,
+    /// What did not come of a change that is done: the main change stands, a part that goes with it does not
+    /// (a booking whose attachment failed). The app shows it with the outcome, so the user hears it too and
+    /// not only the AI client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     /// The app version that asked.
     pub version: String,
     /// The user answered it with Alles goedkeuren or Alles weigeren (`decide_all`), not on its own.
@@ -409,6 +414,7 @@ impl Approvals {
                     Status::Waiting
                 },
                 error: None,
+                note: None,
                 version: APP_VERSION.to_owned(),
                 bulk: false,
             },
@@ -587,6 +593,17 @@ impl Approvals {
     /// The outcome of a change that ran: done with the tool's answer, or failed with the error. Only a
     /// running record takes it; one that was refused or lapsed keeps saying so.
     pub fn finish(&self, id: u64, outcome: Result<&Value, String>, now: u64) {
+        self.finish_noted(id, outcome, None, now);
+    }
+
+    /// As `finish`, with what did not come of a change that is done (`Record::note`).
+    pub fn finish_noted(
+        &self,
+        id: u64,
+        outcome: Result<&Value, String>,
+        note: Option<String>,
+        now: u64,
+    ) {
         let mut inner = self.lock();
         let Some(detail) = inner.record_mut(id) else {
             return;
@@ -597,6 +614,7 @@ impl Approvals {
         match outcome {
             Ok(result) => {
                 detail.record.status = Status::Done;
+                detail.record.note = note;
                 detail.result = Some(kept(result));
             }
             Err(message) => {
@@ -996,6 +1014,7 @@ mod tests {
                 decision: Some(Decision::Approved),
                 status: Status::Done,
                 error: None,
+                note: None,
                 version: "0.4.0".into(),
                 bulk: true,
             },

@@ -4,7 +4,7 @@ import App from '../App.vue'
 import AccountForm from '../components/AccountForm.vue'
 import { rightsChip, rightsText, store, type AccountView } from '../lib/accounts'
 import {
-  ago, approvalState, decisionLabel, filterHistory, followSelection, nameList, proposalKind, quitWarning, refreshApprovals, splitTitle, statusOf, type ApprovalDetail, type ApprovalRecord, type DecideAllResult, type Proposal,
+  ago, approvalState, decisionLabel, filterHistory, followSelection, nameList, proposalKind, quitWarning, recordStatus, refreshApprovals, splitTitle, statusOf, type ApprovalDetail, type ApprovalRecord, type DecideAllResult, type Proposal,
 } from '../lib/approvals'
 import { statusLabel, type McpEntry } from '../lib/log'
 import { router } from '../router'
@@ -585,6 +585,26 @@ describe('the history', () => {
     // The list names it too, and it can be filtered on.
     expect(statusOf('withdrawn')).toMatchObject({ label: 'Ingetrokken', tone: 'off' })
     expect(decisionLabel('withdrawn')).toBe('Ingetrokken door de AI-client')
+  })
+
+  it('says it when a change is done but a part that goes with it is not', async () => {
+    const note = 'De boeking staat in e-Boekhouden, maar de bijlage is niet toegevoegd: dit bestandstype is niet toegestaan'
+    history = [
+      record({ id: 21, status: 'done', decision: 'approved', decidedAt: 2_000, note }),
+      record({ id: 20, status: 'done', decision: 'approved', decidedAt: 1_000 }),
+    ]
+    await openHistory()
+    const chips = [...document.querySelectorAll<HTMLElement>('.record .chip.status')]
+    expect(chips.map((c) => [c.textContent, c.classList.contains('warn')])).toEqual([['Deels uitgevoerd', true], ['Uitgevoerd', false]])
+    const outcomeOf = async (index: number) => {
+      document.querySelectorAll<HTMLButtonElement>('.record')[index]!.click()
+      await flushPromises()
+      const box = document.querySelector<HTMLElement>('aside.detail .outcome')!
+      return [box.classList.contains('warn'), box.textContent?.trim()]
+    }
+    expect(await outcomeOf(0)).toEqual([true, note])
+    expect(await outcomeOf(1)).toEqual([false, 'Uitgevoerd in e-Boekhouden.'])
+    expect(recordStatus({ status: 'failed', note })).toMatchObject({ label: 'Mislukt', tone: 'bad' })
   })
 
   it('names an answer given to all waiting changes at once', async () => {
