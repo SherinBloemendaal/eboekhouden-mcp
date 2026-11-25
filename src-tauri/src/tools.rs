@@ -8,13 +8,14 @@
 
 use std::future::Future;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, ContentBlock, Icon, Implementation, ResourceContents, ServerCapabilities,
-        ServerConfig,
+        CallToolResult, ContentBlock, Icon, Implementation, ProgressNotificationParam,
+        ResourceContents, ServerCapabilities, ServerConfig,
     },
     schemars::{self, JsonSchema},
     service::RequestContext,
@@ -860,6 +861,26 @@ pub struct ArchiefArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct MutatieBijlagenArgs {
+    /// Mutatienummer (het nummer uit mutaties en mutatie, niet het interne id).
+    pub nr: u64,
+    /// Aantal bestanden, 1 tot 200 (standaard 50).
+    pub limit: Option<u32>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BijlageDownloadenArgs {
+    /// Id van het bestand in het digitaal archief (uit mutatie_bijlagen of digitaal_archief).
+    pub id: u64,
+    /// Map op deze computer om het bestand in te zetten, als volledig pad naar een bestaande map (standaard Downloads/EB MCP/<administratie>, die EB MCP zo nodig aanmaakt). Een eigen map kan alleen voor een pdf, afbeelding, xml, txt, csv, xlsx of docx; elk ander soort bestand gaat alleen naar de standaardmap.
+    pub map: Option<String>,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GetArgs {
     /// Pad onder /v1/api/, bijvoorbeeld "relatie/gridtable". Alleen leesbare paden van de API-kaart.
     pub pad: String,
@@ -895,9 +916,18 @@ struct WriteRun {
     queued: Mutex<Option<oneshot::Sender<u64>>>,
     /// The change's record in the history (approvals.rs), once `approve` made one.
     proposal: Mutex<Option<u64>>,
+    /// The file the change sends along, set by the tool before `approve` (`Run::attach`), for the preview.
+    file: Mutex<Option<approvals::Attachment>>,
 }
 
 impl Run {
+    /// The file this change sends along, so its proposal can show it (Akkoord, preview).
+    fn attach(&self, file: approvals::Attachment) {
+        if let Some(write) = &self.write {
+            *write.file.lock().unwrap_or_else(|e| e.into_inner()) = Some(file);
+        }
+    }
+
     fn proposal(&self) -> Option<u64> {
         self.write
             .as_ref()
@@ -955,6 +985,16 @@ const ABANDONED: &str =
     "De AI-client heeft de aanroep afgebroken; er is niets gevraagd of gewijzigd.";
 /// The answer of a write tool whose task stopped halfway (a panic, or the app shutting down).
 const CUT_OFF: &str = "De aanroep is afgebroken voordat hij klaar was. Kijk in e-Boekhouden wat er al is doorgevoerd.";
+
+/// The answer to a call that asks the very same as proposal `id`, which still waits (`Approvals::waiting_same`).
+fn repeated(id: u64) -> String {
+    format!(
+        "Dezelfde wijziging wacht al op het akkoord van de gebruiker in EB MCP, als voorstel {id}. Er is geen \
+         tweede voorstel gemaakt en er is niets gewijzigd. Vraag de uitkomst op met akkoord_status (voorstel_id \
+         {id}). Is echt een tweede, gelijke wijziging bedoeld, doe de aanroep dan opnieuw nadat de gebruiker op \
+         voorstel {id} heeft geantwoord."
+    )
+}
 
 /// Stops a write tool's task when its MCP call ends before the task gave an answer, as long as the change
 /// was not committed (`Gate`). Disarmed once the call has its answer.
@@ -1039,6 +1079,47 @@ fn client_name(context: &RequestContext<RoleServer>) -> String {
 /// after which some AI clients give up on a tool call; a sign-in itself takes a few seconds, the rest is
 /// the user answering 1Password or Touch ID.
 const SIGN_IN_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// How often a tool call that waits for the user's approval tells a client that asked for progress that it
+/// still waits.
+const PROGRESS_EVERY: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(15)
+};
+/// How long a call through eb-mcp-bridge waits for the user at most: Claude Desktop, the client that starts
+/// the bridge, gives up on a tool call after about a minute.
+const BRIDGE_WAIT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(50)
+};
+/// The header eb-mcp-bridge sends with each request (bridge/src/main.rs).
+pub const BRIDGE_HEADER: &str = "x-eb-mcp-bridge";
+
+/// How long this call waits for the user's approval: the setting (`AppState::approval_wait`), and never
+/// longer than `BRIDGE_WAIT` through the bridge. `None`: it answers at once with status wacht.
+fn wait_limit(setting: Option<Duration>, context: &RequestContext<RoleServer>) -> Option<Duration> {
+    let bridged = context
+        .extensions
+        .get::<axum::http::request::Parts>()
+        .is_some_and(|parts| parts.headers.contains_key(BRIDGE_HEADER));
+    capped(setting, bridged)
+}
+
+fn capped(setting: Option<Duration>, bridged: bool) -> Option<Duration> {
+    setting.map(|wait| if bridged { wait.min(BRIDGE_WAIT) } else { wait })
+}
+
+/// "50 seconden", "1 minuut", "5 minuten".
+fn minutes(wait: Duration) -> String {
+    match wait.as_secs() {
+        1 => "1 seconde".to_owned(),
+        secs if secs < 60 => format!("{secs} seconden"),
+        60..=119 => "1 minuut".to_owned(),
+        secs => format!("{} minuten", secs / 60),
+    }
+}
 
 /// The account a tool call is about. There is no default account: with several accounts a call must name
 /// its own, so an AI client never answers from the wrong books. A single account needs no name.
@@ -1270,8 +1351,12 @@ fn rights_value(rights: Rights) -> Value {
     })
 }
 
-/// A file from this computer for the digitaal archief: its name and its bytes in base64, as `folder/upload` takes them.
-fn read_upload(path: &str, name: Option<&str>) -> Result<(String, String, u64), String> {
+/// A file from this computer for the digitaal archief: its name and its bytes in base64, as `folder/upload` takes them,
+/// and what the proposal shows of it.
+fn read_upload(
+    path: &str,
+    name: Option<&str>,
+) -> Result<(String, String, u64, approvals::Attachment), String> {
     use base64::Engine;
     /// The web app's own limit.
     const MAX: u64 = 5120 * 1024;
@@ -1302,10 +1387,12 @@ fn read_upload(path: &str, name: Option<&str>) -> Result<(String, String, u64), 
         return Err("De bestandsnaam is te lang of bevat een schuine streep".into());
     }
     let bytes = std::fs::read(path).map_err(|_| format!("{} is niet te lezen", path.display()))?;
+    let attachment = approvals::Attachment::new(path, &file_name, &bytes);
     Ok((
         file_name,
-        base64::engine::general_purpose::STANDARD.encode(bytes),
-        meta.len(),
+        base64::engine::general_purpose::STANDARD.encode(&bytes),
+        bytes.len() as u64,
+        attachment,
     ))
 }
 
@@ -1365,6 +1452,7 @@ impl EbMcp {
             gate: gate.clone(),
             queued: Mutex::new(Some(queued)),
             proposal: Mutex::new(None),
+            file: Mutex::new(None),
         });
         let run = Arc::new(run);
         let mut task = tokio::spawn({
@@ -1385,24 +1473,74 @@ impl EbMcp {
             task: task.abort_handle(),
             armed: true,
         };
-        let answer = tokio::select! {
+        let joined_answer = |joined: Result<CallToolResult, tokio::task::JoinError>| match joined {
+            Ok(answer) => answer,
+            Err(e) => {
+                log::error!("{tool}: the task of the change stopped: {e}");
+                CallToolResult::error(vec![ContentBlock::text(CUT_OFF.to_owned())])
+            }
+        };
+        let queued = tokio::select! {
             // A change that was answered and ran before this call looked gives its own outcome.
             biased;
-            joined = &mut task => match joined {
-                Ok(answer) => answer,
-                Err(e) => {
-                    log::error!("{tool}: the task of the change stopped: {e}");
-                    CallToolResult::error(vec![ContentBlock::text(CUT_OFF.to_owned())])
-                }
+            joined = &mut task => Err(joined_answer(joined)),
+            Ok(id) = &mut proposal => Ok(id),
+        };
+        let answer = match queued {
+            Err(answer) => answer,
+            Ok(id) => match wait_limit(self.state.approval_wait(), context) {
+                None => self.waiting_answer(&run, id, None),
+                // From here the change is committed (`Gate`): when the client stops waiting, the change still
+                // waits in the queue and runs after Goedkeuren, as if this call had answered at once.
+                Some(limit) => match self.await_answer(context, id, &mut task, limit).await {
+                    Some(joined) => joined_answer(joined),
+                    None => self.waiting_answer(&run, id, Some(limit)),
+                },
             },
-            Ok(id) = &mut proposal => self.waiting_answer(&run, id),
         };
         stop.armed = false;
         Ok(answer)
     }
 
+    /// Keeps the MCP call open while the change of proposal `id` waits for the user, at most `limit`: the
+    /// task's own answer once it ended (approved and ran, refused, withdrawn, lapsed), or `None` when the
+    /// limit passed first. A client that asked for progress hears every `PROGRESS_EVERY` that it still waits,
+    /// which also keeps its connection busy.
+    async fn await_answer(
+        &self,
+        context: &RequestContext<RoleServer>,
+        id: u64,
+        task: &mut tokio::task::JoinHandle<CallToolResult>,
+        limit: Duration,
+    ) -> Option<Result<CallToolResult, tokio::task::JoinError>> {
+        let token = context.meta.get_progress_token();
+        let deadline = tokio::time::Instant::now() + limit;
+        let mut ticks =
+            tokio::time::interval_at(tokio::time::Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY);
+        let mut waited = 0u64;
+        loop {
+            tokio::select! {
+                biased;
+                joined = &mut *task => return Some(joined),
+                _ = tokio::time::sleep_until(deadline) => return None,
+                _ = ticks.tick() => {
+                    waited += PROGRESS_EVERY.as_secs();
+                    if let Some(token) = token.clone() {
+                        let note = ProgressNotificationParam::new(token, waited as f64)
+                            .with_total(limit.as_secs() as f64)
+                            .with_message(format!(
+                                "Voorstel {id} wacht op het akkoord van de gebruiker in EB MCP"
+                            ));
+                        let _ = context.peer.notify_progress(note).await;
+                    }
+                }
+            }
+        }
+    }
+
     /// The answer of a tool whose change waits for the user: not an error, and it says how to follow up.
-    fn waiting_answer(&self, run: &Run, id: u64) -> CallToolResult {
+    /// `waited`: the call waited this long for the user before it answered.
+    fn waiting_answer(&self, run: &Run, id: u64, waited: Option<Duration>) -> CallToolResult {
         let title = self
             .state
             .approvals
@@ -1415,14 +1553,102 @@ impl EbMcp {
             "status": "wacht",
             "voorstel_id": id,
             "titel": title,
-            "let_op": format!(
-                "Deze wijziging wacht op het akkoord van de gebruiker in EB MCP; er is nog niets gewijzigd. \
-                 Je hoeft niet te wachten: ga gerust verder met ander werk. Zodra de gebruiker goedkeurt, voert EB MCP \
-                 de wijziging zelf uit. Vraag de uitkomst later op met akkoord_status (voorstel_id {id}), en vertel \
-                 de gebruiker dat er in EB MCP een wijziging op akkoord wacht."
-            ),
+            "let_op": match waited {
+                None => format!(
+                    "Deze wijziging wacht op het akkoord van de gebruiker in EB MCP; er is nog niets gewijzigd. \
+                     Je hoeft niet te wachten: ga gerust verder met ander werk. Zodra de gebruiker goedkeurt, voert EB MCP \
+                     de wijziging zelf uit. Vraag de uitkomst later op met akkoord_status (voorstel_id {id}), en vertel \
+                     de gebruiker dat er in EB MCP een wijziging op akkoord wacht."
+                ),
+                Some(waited) => format!(
+                    "De gebruiker heeft binnen {} niet geantwoord; de wijziging wacht nog op akkoord in EB MCP en er is \
+                     nog niets gewijzigd. Doe deze aanroep niet opnieuw: dan staat dezelfde wijziging er twee keer. Zodra \
+                     de gebruiker goedkeurt, voert EB MCP de wijziging zelf uit. Vraag de uitkomst later op met \
+                     akkoord_status (voorstel_id {id}), en vertel de gebruiker dat er in EB MCP een wijziging op akkoord wacht.",
+                    minutes(waited)
+                ),
+            },
         });
         CallToolResult::success(vec![ContentBlock::text(value.to_string())])
+    }
+
+    /// Puts a file in the digitaal archief (`folder/upload`) after the approval. Its id there.
+    async fn upload(
+        &self,
+        run: &Run,
+        name: &str,
+        data: String,
+        overwrite: bool,
+        folder: u64,
+    ) -> Result<u64, Halt> {
+        let body =
+            json!({"fileName": name, "data": data, "overwrite": overwrite, "folderId": folder});
+        let uploaded = self
+            .change(run, "POST", "folder/upload", Some(&body))
+            .await?;
+        if let Some(error) = uploaded
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .filter(|e| !e.is_empty())
+        {
+            return Err(Halt::Error(format!(
+                "e-Boekhouden weigert het bestand: {error}"
+            )));
+        }
+        uploaded
+            .get("folderId")
+            .and_then(Value::as_u64)
+            .filter(|_| uploaded.get("saved").and_then(Value::as_bool) != Some(false))
+            .ok_or_else(|| Halt::Error("e-Boekhouden heeft het bestand niet opgeslagen".into()))
+    }
+
+    /// Links a file in the archive to mutatie `nr`, after the approval.
+    async fn link_file(&self, run: &Run, id: u64, nr: u64) -> Result<Value, Halt> {
+        let link =
+            json!({"koppelId": nr, "folders": [{"id": id, "soort": "F"}], "koppelType": "MUT"});
+        self.change_done(run, "POST", "folderkoppel/koppel/item", Some(&link))
+            .await
+    }
+
+    /// The attachment of a new mutatie (`mutatie_toevoegen` with `bijlage`): uploaded to the Basismap and
+    /// linked to the mutatie that was just booked. Never an error of the call: the booking stands, so a failed
+    /// upload or link is told in the answer, with how to put only the file right.
+    async fn attach_to_mutatie(
+        &self,
+        run: &Run,
+        booked: &Value,
+        name: &str,
+        data: String,
+    ) -> Value {
+        let Some(nr) = booked.get("mutNr").and_then(Value::as_u64) else {
+            return json!({
+                "naam": name,
+                "gekoppeld_aan_mutatie": Value::Null,
+                "fout": "e-Boekhouden gaf geen mutatienummer terug, dus de bijlage is niet geüpload.",
+                "let_op": "De mutatie is wel geboekt: boek haar niet opnieuw. Zoek haar op met mutaties en zet de bijlage er met archief_uploaden en mutatie_nr bij.",
+            });
+        };
+        let id = match self.upload(run, name, data, false, 0).await {
+            Ok(id) => id,
+            Err(Halt::Error(message) | Halt::Refused(message)) => {
+                return json!({
+                    "naam": name,
+                    "gekoppeld_aan_mutatie": Value::Null,
+                    "fout": message,
+                    "let_op": format!("Mutatie {nr} is geboekt, de bijlage niet. Boek de mutatie niet opnieuw; zet alleen de bijlage erbij met archief_uploaden en mutatie_nr {nr}."),
+                });
+            }
+        };
+        match self.link_file(run, id, nr).await {
+            Ok(_) => json!({"bestand_id": id, "naam": name, "gekoppeld_aan_mutatie": nr}),
+            Err(Halt::Error(message) | Halt::Refused(message)) => json!({
+                "bestand_id": id,
+                "naam": name,
+                "gekoppeld_aan_mutatie": Value::Null,
+                "fout": message,
+                "let_op": format!("Mutatie {nr} is geboekt en de bijlage staat in het archief (id {id}), maar ze zijn niet gekoppeld. Koppel ze met archief_koppelen (bestand_id {id}, mutatie_nr {nr}); boek en upload niets opnieuw."),
+            }),
+        }
     }
 
     /// The rekeningschema and btw codes of the account's administration.
@@ -1512,6 +1738,7 @@ impl EbMcp {
             title: built.title.clone(),
             lines: built.lines.clone(),
             danger,
+            file: write.file.lock().unwrap_or_else(|e| e.into_inner()).take(),
         };
         let technical = Technical {
             args: write.args.clone(),
@@ -1525,6 +1752,16 @@ impl EbMcp {
             self.state.log.link_proposal(run.id, id);
             let _ = self.state.events.send(AppEvent::ApprovalsChanged);
             return Ok(());
+        }
+        // With waiting in the call on, a client that gave up on its call has no voorstel_id and may send the
+        // call again. The same call while its proposal still waits is that repeat: it gets no second proposal.
+        if self.state.approval_wait().is_some()
+            && let Some(id) =
+                self.state
+                    .approvals
+                    .waiting_same(run.account.id, tool, &technical.args)
+        {
+            return Err(Halt::Refused(repeated(id)));
         }
         let (proposal, answer) = self.state.approvals.ask(ask, technical, now);
         *write.proposal.lock().unwrap_or_else(|e| e.into_inner()) = Some(proposal.id);
@@ -1654,7 +1891,9 @@ impl EbMcp {
                     .log
                     .finish_mcp(run.id, Outcome::Ok, Some(&value), None);
                 if let Some(id) = proposal {
-                    self.state.approvals.finish(id, Ok(&value), now);
+                    self.state
+                        .approvals
+                        .finish_noted(id, Ok(&value), missed(&value["data"]), now);
                 }
                 CallToolResult::success(vec![ContentBlock::text(value.to_string())])
             }
@@ -1714,6 +1953,65 @@ impl EbMcp {
             saved,
             base64::engine::general_purpose::STANDARD.encode(&bytes),
         ))
+    }
+
+    /// Fetches one file of the digitaal archief and saves it on this computer, next to whatever is there already.
+    /// Only GETs go to e-Boekhouden; the file goes nowhere but the folder.
+    async fn save_bijlage(&self, run: &Run, id: u64, map: Option<&str>) -> Result<Value, String> {
+        let info = self.fetch(run, &format!("folder/{id}"), Vec::new()).await?;
+        let naam = info.get("naam").and_then(Value::as_str).map(str::to_owned);
+        if info.get("soort").and_then(Value::as_str) != Some("F") {
+            return Err(format!(
+                "{} is een map, geen bestand",
+                naam.as_deref().unwrap_or("Dit id")
+            ));
+        }
+        let named = map.map(str::trim).filter(|m| !m.is_empty());
+        let dir = match named {
+            Some(named) => download_dir(Some(named))?,
+            None => {
+                let dir = bijlagen_dir(
+                    &download_dir(None)?,
+                    run.account.administration.as_deref(),
+                    &run.account.label,
+                );
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| format!("De map {} is niet aan te maken: {e}", dir.display()))?;
+                dir
+            }
+        };
+        let path = format!("folder/{id}/download");
+        let (call, file) = self
+            .state
+            .api_download(run.account.id, &path, Some(run.id), &run.client)
+            .await;
+        let (bytes, header_name) = match file {
+            Some(file) if call.ok() => file,
+            _ => {
+                return Err(call
+                    .error
+                    .unwrap_or_else(|| format!("e-Boekhouden gaf {} op {path}", call.status)));
+            }
+        };
+        let content_type = sniff_type(&bytes, header_name.as_deref().or(naam.as_deref()));
+        let name = bijlage_name(header_name.as_deref(), naam.as_deref(), id, content_type);
+        // The archive decides the name and the bytes, and this tool asks no approval: in a folder the client
+        // picked, only a document may land, never something the system would run or load from there.
+        if named.is_some() && !is_document(&name) {
+            return Err(format!(
+                "{name} is geen pdf, afbeelding, xml, txt, csv, xlsx of docx: zo'n bestand zet EB MCP alleen in Downloads/EB MCP. Laat map weg."
+            ));
+        }
+        let target = write_new(&dir, &name, &bytes)
+            .map_err(|e| format!("Het bestand is niet op te slaan in {}: {e}", dir.display()))?;
+        Ok(json!({
+            "id": id,
+            "pad": target.to_string_lossy(),
+            "bestandsnaam": target.file_name().map(|n| n.to_string_lossy().into_owned()),
+            "naam_in_archief": naam,
+            "bytes": bytes.len(),
+            "content_type": content_type,
+        }))
     }
 
     /// The answer of a pdf tool: where the file was saved, and the pdf itself as an embedded resource, so an AI
@@ -2144,6 +2442,22 @@ fn plain_text(html: &str) -> String {
     text.trim().to_owned()
 }
 
+/// What did not come of a change that is done, for the history (`Record::note`): a booking whose attachment
+/// did not get to the mutatie (`attach_to_mutatie`). The AI client reads the same in `bijlage.let_op`.
+fn missed(data: &Value) -> Option<String> {
+    let bijlage = data.get("bijlage")?;
+    let fout = bijlage.get("fout").and_then(Value::as_str)?;
+    Some(
+        if bijlage.get("bestand_id").is_some_and(|id| !id.is_null()) {
+            format!(
+                "De boeking staat in e-Boekhouden en het bestand in het archief, maar ze zijn niet aan elkaar gekoppeld: {fout}"
+            )
+        } else {
+            format!("De boeking staat in e-Boekhouden, maar de bijlage is niet toegevoegd: {fout}")
+        },
+    )
+}
+
 /// Saves `bytes` as `dir/name`, or `dir/name (2).pdf` and on while that name is taken. The file is created new:
 /// an existing file is never overwritten and a symlink with that name is never followed.
 fn write_new(
@@ -2176,6 +2490,193 @@ fn write_new(
         }
     }
     Err(std::io::Error::other("te veel bestanden met deze naam"))
+}
+
+/// The query for `folder/gekoppeldgridtable`: the files linked to mutatie `nr` (its number, not its id), as
+/// e-Boekhouden's own archive grid asks for them (`sortDirection=0`, seen in the browser on 2026-11-24).
+fn bijlagen_query(nr: u64, limit: Option<u32>) -> Result<Vec<(String, String)>, String> {
+    let mut query = grid(limit, None)?;
+    for (key, value) in query.iter_mut() {
+        if key == "sortDirection" {
+            *value = "0".into();
+        }
+    }
+    query.push(("koppelId".into(), nr.to_string()));
+    query.push(("koppelSoort".into(), "MUT".into()));
+    Ok(query)
+}
+
+/// The linked files as `mutatie_bijlagen` gives them: per row id, naam, datum and grootte. The grid also has
+/// koppelId (the mutatienummer asked for), soort and guid, which say nothing new.
+fn bijlagen(grid: Value) -> Value {
+    let mut grid = named_rows(grid);
+    if let Some(rows) = grid.get_mut("data").and_then(Value::as_array_mut) {
+        for row in rows.iter_mut() {
+            if let Some(o) = row.as_object() {
+                *row = json!({
+                    "id": o.get("id"),
+                    "naam": o.get("naam"),
+                    "datum": o.get("datum"),
+                    "grootte": o.get("grootte"),
+                });
+            }
+        }
+    }
+    grid
+}
+
+/// A name that is safe as one file or folder name on macOS and Windows: no folder separators, no characters
+/// Windows refuses, no control characters, no leading or trailing dots or spaces, at most 150 characters.
+fn safe_name(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if cleaned.is_empty() {
+        return None;
+    }
+    // Windows keeps these names for devices, with any extension: "NUL.pdf" is the device, not a file.
+    let cleaned = if is_device_name(cleaned) {
+        format!("_{cleaned}")
+    } else {
+        cleaned.to_owned()
+    };
+    let cleaned = cleaned.as_str();
+    const MAX: usize = 150;
+    if cleaned.chars().count() <= MAX {
+        return Some(cleaned.to_owned());
+    }
+    // Too long: shorten the part before the extension, so the file still opens with the right app.
+    let (stem, ext) = match cleaned.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ext.chars().count() <= 10 => {
+            (stem, format!(".{ext}"))
+        }
+        _ => (cleaned, String::new()),
+    };
+    let keep = MAX - ext.chars().count();
+    Some(format!(
+        "{}{ext}",
+        stem.chars().take(keep).collect::<String>().trim_end()
+    ))
+}
+
+/// Whether Windows reads this name as a device (CON, PRN, AUX, NUL, COM1 to COM9, LPT1 to LPT9): the part
+/// before the first dot decides, whatever its case and whatever spaces follow it.
+fn is_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    let upper = stem.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    match upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+    {
+        Some(rest) => rest.len() == 1 && matches!(rest.as_bytes()[0], b'1'..=b'9'),
+        None => false,
+    }
+}
+
+/// Whether a file of this name is a plain document: the kinds a receipt or invoice comes in. Only these may be
+/// saved in a folder the AI client names; the last extension decides, as it does for the system.
+fn is_document(name: &str) -> bool {
+    const DOCUMENTS: [&str; 14] = [
+        "pdf", "jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "heic", "xml", "txt", "csv",
+        "xlsx", "docx",
+    ];
+    name.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty() && DOCUMENTS.contains(&ext.to_ascii_lowercase().as_str())
+    })
+}
+
+/// The default folder for archive files: Downloads/EB MCP/<administratie>, or the account's label when the
+/// administration has no usable name.
+fn bijlagen_dir(
+    downloads: &std::path::Path,
+    administration: Option<&str>,
+    label: &str,
+) -> std::path::PathBuf {
+    let folder = administration
+        .and_then(safe_name)
+        .or_else(|| safe_name(label))
+        .unwrap_or_else(|| "administratie".to_owned());
+    downloads.join("EB MCP").join(folder)
+}
+
+/// What kind of file the bytes are, by their first bytes, else by the extension of its name.
+fn sniff_type(bytes: &[u8], name: Option<&str>) -> &'static str {
+    if bytes.starts_with(b"%PDF") {
+        return "application/pdf";
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "image/jpeg";
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return "image/png";
+    }
+    if bytes.starts_with(b"GIF8") {
+        return "image/gif";
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return "image/webp";
+    }
+    if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        return "image/tiff";
+    }
+    let ext = name
+        .and_then(|n| n.rsplit_once('.'))
+        .map(|(_, ext)| ext.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("pdf") => "application/pdf",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("heic") => "image/heic",
+        Some("xml") => "application/xml",
+        Some("txt") => "text/plain",
+        Some("csv") => "text/csv",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        _ => "application/octet-stream",
+    }
+}
+
+/// The extensions that go with a content type the bytes gave away, the usual one first.
+fn extensions_of(content_type: &str) -> &'static [&'static str] {
+    match content_type {
+        "application/pdf" => &["pdf"],
+        "image/jpeg" => &["jpg", "jpeg"],
+        "image/png" => &["png"],
+        "image/gif" => &["gif"],
+        "image/webp" => &["webp"],
+        "image/tiff" => &["tif", "tiff"],
+        _ => &[],
+    }
+}
+
+/// The name an archive file is saved under: e-Boekhouden's download name, else its name in the archive, else
+/// bijlage-<id>; made safe, and ending in the extension of what the file is when that is known. A name like
+/// "Factuur 12.11.2026" has dots but no extension, so the end of the name is compared, not just looked for.
+fn bijlage_name(header: Option<&str>, naam: Option<&str>, id: u64, content_type: &str) -> String {
+    let name = header
+        .and_then(safe_name)
+        .or_else(|| naam.and_then(safe_name))
+        .unwrap_or_else(|| format!("bijlage-{id}"));
+    let extensions = extensions_of(content_type);
+    let lower = name.to_lowercase();
+    let fits = extensions.iter().any(|ext| {
+        lower
+            .strip_suffix(ext)
+            .is_some_and(|rest| rest.ends_with('.') && rest.len() > 1)
+    });
+    match extensions.first() {
+        Some(ext) if !fits => format!("{name}.{ext}"),
+        _ => name,
+    }
 }
 
 /// The folder a tool may save a download in: the one named (a full path to an existing folder) or Downloads.
@@ -2385,11 +2886,15 @@ impl EbMcp {
             "app": "EB MCP",
             "versie": env!("CARGO_PKG_VERSION"),
             "alleen_lezen": !can_write,
+            "wacht_op_akkoord": match self.state.approval_wait() {
+                Some(wait) => format!("ja, hooguit {}", minutes(wait)),
+                None => "nee, een wijziging met akkoord geeft meteen status wacht en een voorstel_id".to_owned(),
+            },
             "accounts": accounts,
             "let_op": if self.state.session_count() == 0 {
                 "Nog niemand ingelogd. Log een account in met de tool inloggen, of vraag de gebruiker in te loggen via EB MCP in de menubalk."
             } else if can_write {
-                "Per account staat bij rechten wat er mag, per soort wijziging: boeken_en_wijzigen (toevoegen en wijzigen), verwijderen, versturen (mail, Peppol, het incassobestand, een bericht of opdracht aan de accountant) en ingrijpend (crediteren, in bulk factureren of boeken, afboeken, de beginbalans, bedrijfsgegevens, een btw-aangifte verwerken). Elk staat op uit (de tool weigert), met akkoord (de gebruiker keurt elke wijziging goed in EB MCP) of zonder akkoord; versturen en ingrijpend gaan nooit zonder akkoord. Een wijziging die op akkoord wacht geeft meteen antwoord met een voorstel_id; akkoord_status geeft later de uitkomst."
+                "Per account staat bij rechten wat er mag, per soort wijziging: boeken_en_wijzigen (toevoegen en wijzigen), verwijderen, versturen (mail, Peppol, het incassobestand, een bericht of opdracht aan de accountant) en ingrijpend (crediteren, in bulk factureren of boeken, afboeken, de beginbalans, bedrijfsgegevens, een btw-aangifte verwerken). Elk staat op uit (de tool weigert), met akkoord (de gebruiker keurt elke wijziging goed in EB MCP) of zonder akkoord; versturen en ingrijpend gaan nooit zonder akkoord. Een wijziging die op akkoord wacht geeft status wacht en een voorstel_id terug, en akkoord_status geeft later de uitkomst; heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst open tot hij beslist (hooguit een paar minuten). wacht_op_akkoord zegt hoe het nu staat."
             } else {
                 "Alleen lezen: schrijven staat voor elk account uit. De gebruiker kan het per account aanzetten in EB MCP onder Accounts."
             },
@@ -2708,10 +3213,11 @@ impl EbMcp {
         .await
     }
 
-    // The list behind Boekhouden > Importeren in e-Boekhouden's own app (`import/gridtable`). Only the read: the
-    // paths that process, book or delete these lines (`import/verwerk`, `import/bulk/wegboeken`) are never called.
+    // The list behind Boekhouden > Importeren in e-Boekhouden's own app (`import/gridtable`). Only the read here:
+    // processing these lines goes through mutatie_toevoegen and importregels_verwerken, a line's comment through
+    // bankregel_opmerking_wijzigen; writing lines off in bulk (`import/bulk/wegboeken`) is never called.
     #[tool(
-        description = "Geïmporteerde bankregels (afschriftregels) die nog niet verwerkt zijn tot een mutatie. Per regel: id, datum (van de import), rekening (IBAN van de eigen bankrekening), mutDatum (boekdatum), mutBedrag (negatief is af), mutOmschrijving (met naam en IBAN van de tegenpartij), mutFactuur, grootboekId, opmerking, hasFiles en verwerkFailureReason. Te filteren op boekdatum en omschrijving. Alleen lezen. Eén regel verwerken kan met mutatie_toevoegen (bankregel_id); alle regels opnieuw door de automatische importregels halen kan met importregels_verwerken.",
+        description = "Geïmporteerde bankregels (afschriftregels) die nog niet verwerkt zijn tot een mutatie. Per regel: id, datum (van de import), rekening (IBAN van de eigen bankrekening), mutDatum (boekdatum), mutBedrag (negatief is af), mutOmschrijving (met naam en IBAN van de tegenpartij), mutFactuur, grootboekId, opmerking, hasFiles en verwerkFailureReason. Te filteren op boekdatum en omschrijving. Alleen lezen. Eén regel verwerken kan met mutatie_toevoegen (bankregel_id); alle regels opnieuw door de automatische importregels halen kan met importregels_verwerken; een opmerking bij een regel zetten of wissen (bijvoorbeeld \"wacht op factuur\") kan met bankregel_opmerking_wijzigen.",
         annotations(title = "Bankregels", read_only_hint = true)
     )]
     async fn bankregels(
@@ -2964,6 +3470,62 @@ impl EbMcp {
     }
 
     #[tool(
+        description = "De bestanden uit het digitaal archief die aan een mutatie gekoppeld zijn (bonnen, facturen), op mutatienummer: id, naam, datum en grootte. Haal een bestand op met bijlage_downloaden.",
+        annotations(title = "Bijlagen van een mutatie", read_only_hint = true)
+    )]
+    async fn mutatie_bijlagen(
+        &self,
+        Parameters(args): Parameters<MutatieBijlagenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const PATH: &str = "folder/gekoppeldgridtable";
+        let run = match self.begin(&context, "mutatie_bijlagen", &args, args.account.as_deref()) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let query = match bijlagen_query(args.nr, args.limit) {
+            Ok(query) => query,
+            Err(message) => return Ok(self.refuse(run, message)),
+        };
+        let call = self
+            .state
+            .api_get(run.account.id, PATH, &query, Some(run.id), &run.client)
+            .await;
+        let result = match (call.ok(), call.json) {
+            (true, Some(json)) => Ok(bijlagen(json)),
+            // An empty answer is read as a mutatie without files, not as an unknown id.
+            (true, None) => Ok(json!({ "data": [] })),
+            _ => Err(call
+                .error
+                .unwrap_or_else(|| format!("e-Boekhouden gaf {} op {PATH}", call.status))),
+        };
+        Ok(self.end(run, PATH, result))
+    }
+
+    #[tool(
+        description = "Een bestand uit het digitaal archief (een bon of factuur, meestal pdf of jpg) op deze computer opslaan, op id (uit mutatie_bijlagen of digitaal_archief). Standaard in de map Downloads/EB MCP/<administratie>; een eigen map kan alleen voor een pdf, afbeelding, xml, txt, csv, xlsx of docx. Het antwoord geeft het volledige pad, de bestandsnaam, de grootte en het soort bestand; het bestand zelf gaat nergens anders heen. Verandert niets in e-Boekhouden. Bestaande bestanden worden niet overschreven.",
+        annotations(title = "Bijlage downloaden", read_only_hint = true)
+    )]
+    async fn bijlage_downloaden(
+        &self,
+        Parameters(args): Parameters<BijlageDownloadenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let run = match self.begin(
+            &context,
+            "bijlage_downloaden",
+            &args,
+            args.account.as_deref(),
+        ) {
+            Ok(run) => run,
+            Err(answer) => return Ok(answer),
+        };
+        let path = format!("folder/{}/download", args.id);
+        let result = self.save_bijlage(&run, args.id, args.map.as_deref()).await;
+        Ok(self.end(run, &path, result))
+    }
+
+    #[tool(
         description = "Een leesbaar pad van de interne API van e-Boekhouden opvragen (GET onder /v1/api/). Alleen paden van de API-kaart die niets veranderen; al het andere wordt geweigerd zonder dat er iets naar e-Boekhouden gaat.",
         annotations(title = "GET", read_only_hint = true)
     )]
@@ -3017,7 +3579,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een mutatie boeken, zoals op de schermen Invoeren > Facturen, Afschrift/bonnetjes en Memoriaal: factuur ontvangen of verstuurd, factuurbetaling ontvangen of verstuurd, geld ontvangen of uitgegeven, of memoriaal. Met bankregel_id wordt een onverwerkte bankregel daarmee verwerkt, bij elke soort, ook een factuurbetaling: geef de bankrekening, de datum en het bedrag van de regel, zodat hij niet nog eens geboekt hoeft te worden. Het voorstel toont de bankregel en zegt het als rekening, richting of totaal ervan afwijken. Zonder bankregel_id blijft de bankregel open staan. Rekeningen gaan op code (zie grootboek), btw op code (GEEN, HOOG_VERK_21, HOOG_INK_21, LAAG_VERK_9, ...); e-Boekhouden rekent de btw zelf uit. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de boeking eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een mutatie boeken, zoals op de schermen Invoeren > Facturen, Afschrift/bonnetjes en Memoriaal: factuur ontvangen of verstuurd, factuurbetaling ontvangen of verstuurd, geld ontvangen of uitgegeven, of memoriaal. Met bankregel_id wordt een onverwerkte bankregel daarmee verwerkt, bij elke soort, ook een factuurbetaling: geef de bankrekening, de datum en het bedrag van de regel, zodat hij niet nog eens geboekt hoeft te worden. Het voorstel toont de bankregel en zegt het als rekening, richting of totaal ervan afwijken. Zonder bankregel_id blijft de bankregel open staan. Met bijlage (het volledige pad van de factuur of bon op deze computer, hoogstens 5 MB) zet EB MCP het bestand na de boeking in het digitaal archief en koppelt het aan de nieuwe mutatie, met hetzelfde akkoord: één aanroep in plaats van mutatie_toevoegen plus archief_uploaden. Mislukt de boeking, dan wordt er niets geüpload; mislukt alleen de bijlage, dan staat de boeking en zegt bijlage.let_op hoe je alleen het bestand alsnog toevoegt. Rekeningen gaan op code (zie grootboek), btw op code (GEEN, HOOG_VERK_21, HOOG_INK_21, LAAG_VERK_9, ...); e-Boekhouden rekent de btw zelf uit. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de boeking eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Mutatie toevoegen",
             read_only_hint = false,
@@ -3051,17 +3613,48 @@ impl EbMcp {
                     Some(id) => Some(this.bankregel(&run, id).await?),
                     None => None,
                 };
-                let built = write::mutatie_nieuw(&args, &books, bankregel.as_ref())?;
+                // The attachment is read before the user is asked anything: a wrong path or a file that is too
+                // big is refused now, not after the booking.
+                let bijlage = match args.bijlage.as_deref() {
+                    Some(pad) => {
+                        let (name, data, size, file) =
+                            read_upload(pad, args.bijlage_naam.as_deref())?;
+                        // Akkoord shows the file that goes along, as it does for an upload.
+                        run.attach(file);
+                        Some((name, data, size))
+                    }
+                    None => None,
+                };
+                let mut built = write::mutatie_nieuw(&args, &books, bankregel.as_ref())?;
+                if let Some((name, _, size)) = &bijlage {
+                    built.lines.push(line(
+                        "Bijlage",
+                        format!(
+                            "{name} ({} kB), komt na de boeking in het digitaal archief en wordt aan de mutatie gekoppeld",
+                            size.div_ceil(1024)
+                        ),
+                    ));
+                }
                 this.approve(&run, TOOL, &built, false).await?;
-                this.change(&run, "POST", "mutatie", Some(&built.body))
-                    .await
+                let mut booked = this
+                    .change(&run, "POST", "mutatie", Some(&built.body))
+                    .await?;
+                if let Some((name, data, _)) = bijlage {
+                    let attached = this.attach_to_mutatie(&run, &booked, &name, data).await;
+                    if let Value::Object(map) = &mut booked {
+                        map.insert("bijlage".into(), attached);
+                    } else {
+                        booked = json!({"mutatie": booked, "bijlage": attached});
+                    }
+                }
+                Ok(booked)
             },
         )
         .await
     }
 
     #[tool(
-        description = "Een bestaande mutatie wijzigen, op mutatienummer. Wat je niet noemt blijft zoals het is; regels of betalingen die je meegeeft vervangen alle bestaande. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een bestaande mutatie wijzigen, op mutatienummer. Wat je niet noemt blijft zoals het is; regels of betalingen die je meegeeft vervangen alle bestaande. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Mutatie wijzigen",
             read_only_hint = false,
@@ -3103,7 +3696,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een bestand van deze computer in het digitaal archief zetten, en het naar wens meteen aan een mutatie koppelen (mutatie_nr). Geef het volledige pad; hoogstens 5 MB. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een bestand van deze computer in het digitaal archief zetten, en het naar wens meteen aan een mutatie koppelen (mutatie_nr). Geef het volledige pad; hoogstens 5 MB. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Bestand uploaden",
             read_only_hint = false,
@@ -3119,7 +3712,8 @@ impl EbMcp {
         const TOOL: &str = "archief_uploaden";
         let account = args.account.clone();
         self.write_tool(&context, TOOL, account.as_deref(), args, "Bestand geüpload", move |this, run, args| async move {
-            let (name, data, size) = read_upload(&args.pad, args.naam.as_deref())?;
+            let (name, data, size, file) = read_upload(&args.pad, args.naam.as_deref())?;
+            run.attach(file);
             let mut lines = vec![
                 line("Bestand", args.pad.trim()),
                 line("Naam in het archief", &name),
@@ -3136,20 +3730,10 @@ impl EbMcp {
             }
             let built = Built { body: Value::Null, title: format!("Bestand uploaden: {name}"), lines };
             this.approve(&run, TOOL, &built, false).await?;
-            let body = json!({"fileName": name, "data": data, "overwrite": args.overschrijven.unwrap_or(false), "folderId": args.map_id.unwrap_or(0)});
-            let uploaded = this.change(&run, "POST", "folder/upload", Some(&body)).await?;
-            if let Some(error) = uploaded.get("errorMessage").and_then(Value::as_str).filter(|e| !e.is_empty()) {
-                return Err(Halt::Error(format!("e-Boekhouden weigert het bestand: {error}")));
-            }
-            let id = uploaded
-                .get("folderId")
-                .and_then(Value::as_u64)
-                .filter(|_| uploaded.get("saved").and_then(Value::as_bool) != Some(false))
-                .ok_or_else(|| Halt::Error("e-Boekhouden heeft het bestand niet opgeslagen".into()))?;
+            let id = this.upload(&run, &name, data, args.overschrijven.unwrap_or(false), args.map_id.unwrap_or(0)).await?;
             let mut done = json!({"bestand_id": id, "naam": name, "gekoppeld_aan_mutatie": Value::Null});
             if let Some(nr) = args.mutatie_nr {
-                let link = json!({"koppelId": nr, "folders": [{"id": id, "soort": "F"}], "koppelType": "MUT"});
-                match this.change_done(&run, "POST", "folderkoppel/koppel/item", Some(&link)).await {
+                match this.link_file(&run, id, nr).await {
                     Ok(_) => done["gekoppeld_aan_mutatie"] = json!(nr),
                     Err(Halt::Error(message) | Halt::Refused(message)) => {
                         return Err(Halt::Error(format!(
@@ -3164,7 +3748,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een bestand dat al in het digitaal archief staat aan een mutatie koppelen. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een bestand dat al in het digitaal archief staat aan een mutatie koppelen. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Bestand koppelen",
             read_only_hint = false,
@@ -3240,7 +3824,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een verkoopfactuur maken. Prijzen per stuk, incl of excl btw; btw op code (HOOG_VERK_21, LAAG_VERK_9, GEEN, ...), de omzetrekening op code. Zonder nummer krijgt de factuur het volgende nummer van e-Boekhouden. De factuur wordt niet verstuurd. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de factuur eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een verkoopfactuur maken. Prijzen per stuk, incl of excl btw; btw op code (HOOG_VERK_21, LAAG_VERK_9, GEEN, ...), de omzetrekening op code. Zonder nummer krijgt de factuur het volgende nummer van e-Boekhouden. De factuur wordt niet verstuurd. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de factuur eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Factuur toevoegen",
             read_only_hint = false,
@@ -3276,7 +3860,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een verkoopfactuur wijzigen, op id. Wat je niet noemt blijft zoals het is. Eén of enkele regels: regels_toevoegen (komt achteraan), regels_wijzigen (op het id van de regel uit factuur) en regels_verwijderen; de andere regels worden dan niet aangeraakt en houden hun artikel, eenheid en volgorde. Met regels vervang je alle regels in één keer: gebruik dat alleen als alles opnieuw moet. De mutatie van een verwerkte factuur volgt vanzelf. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een verkoopfactuur wijzigen, op id. Wat je niet noemt blijft zoals het is. Eén of enkele regels: regels_toevoegen (komt achteraan), regels_wijzigen (op het id van de regel uit factuur) en regels_verwijderen; de andere regels worden dan niet aangeraakt en houden hun artikel, eenheid en volgorde. Met regels vervang je alle regels in één keer: gebruik dat alleen als alles opnieuw moet. De mutatie van een verwerkte factuur volgt vanzelf. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Factuur wijzigen",
             read_only_hint = false,
@@ -3312,7 +3896,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een verkoopfactuur verwijderen, op id. De mutatie van een verwerkte factuur verdwijnt mee. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een verkoopfactuur verwijderen, op id. De mutatie van een verwerkte factuur verdwijnt mee. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Factuur verwijderen",
             read_only_hint = false,
@@ -3378,7 +3962,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een verkoopfactuur crediteren, op id: er komt een nieuwe factuur met dezelfde regels in negatieve aantallen, zoals Factuur crediteren in e-Boekhouden doet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een verkoopfactuur crediteren, op id: er komt een nieuwe factuur met dezelfde regels in negatieve aantallen, zoals Factuur crediteren in e-Boekhouden doet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Factuur crediteren",
             read_only_hint = false,
@@ -3459,7 +4043,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een abonnement maken: een terugkerende factuur voor een relatie. Prijzen per stuk, incl of excl btw; btw en omzetrekening op code. Er wordt nog geen factuur gemaakt; dat doet abonnementen_factureren. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een abonnement maken: een terugkerende factuur voor een relatie. Prijzen per stuk, incl of excl btw; btw en omzetrekening op code. Er wordt nog geen factuur gemaakt; dat doet abonnementen_factureren. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Abonnement toevoegen",
             read_only_hint = false,
@@ -3494,7 +4078,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een abonnement wijzigen, op id. Wat je niet noemt blijft zoals het is. Eén of enkele regels: regels_toevoegen (komt achteraan), regels_wijzigen (op het id van de regel uit abonnement) en regels_verwijderen; de andere regels worden dan niet aangeraakt en houden hun artikel, eenheid en volgorde. Met regels vervang je alle regels in één keer, wat de koppeling met artikel en eenheid van de oude regels weghaalt: gebruik dat alleen als alles opnieuw moet. Een regel mag aantal 0 hebben. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een abonnement wijzigen, op id. Wat je niet noemt blijft zoals het is. Eén of enkele regels: regels_toevoegen (komt achteraan), regels_wijzigen (op het id van de regel uit abonnement) en regels_verwijderen; de andere regels worden dan niet aangeraakt en houden hun artikel, eenheid en volgorde. Met regels vervang je alle regels in één keer, wat de koppeling met artikel en eenheid van de oude regels weghaalt: gebruik dat alleen als alles opnieuw moet. Een regel mag aantal 0 hebben. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Abonnement wijzigen",
             read_only_hint = false,
@@ -3531,7 +4115,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een abonnement verwijderen, op id. Facturen die er al van gemaakt zijn blijven staan. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een abonnement verwijderen, op id. Facturen die er al van gemaakt zijn blijven staan. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Abonnement verwijderen",
             read_only_hint = false,
@@ -3592,7 +4176,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Facturen maken voor abonnementen, zoals Facturen maken in e-Boekhouden: voor ALLE abonnementen waarvan de prolongatiedatum in het gekozen venster valt (standaard: al verlopen) komt er een factuur, en hun prolongatiedatum schuift een periode op. Eén abonnement kiezen kan niet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Facturen maken voor abonnementen, zoals Facturen maken in e-Boekhouden: voor ALLE abonnementen waarvan de prolongatiedatum in het gekozen venster valt (standaard: al verlopen) komt er een factuur, en hun prolongatiedatum schuift een periode op. Eén abonnement kiezen kan niet. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Abonnementen factureren",
             read_only_hint = false,
@@ -3642,7 +4226,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een mutatie verwijderen, op mutatienummer. Boekhoudkundig wordt dit afgeraden: corrigeer liever met een tegenboeking of wijzig de mutatie, zodat zichtbaar blijft wat er is gebeurd. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een mutatie verwijderen, op mutatienummer. Boekhoudkundig wordt dit afgeraden: corrigeer liever met een tegenboeking of wijzig de mutatie, zodat zichtbaar blijft wat er is gebeurd. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Mutatie verwijderen",
             read_only_hint = false,
@@ -3721,7 +4305,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een bestand uit het digitaal archief verwijderen; het gaat naar de prullenbak van het archief. Is het bestand nog aan een mutatie of iets anders gekoppeld, dan staat er een waarschuwing bij. Of de gebruiker het eerst goedkeurt, volgt uit wat het account voor verwijderen toestaat. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een bestand uit het digitaal archief verwijderen; het gaat naar de prullenbak van het archief. Is het bestand nog aan een mutatie of iets anders gekoppeld, dan staat er een waarschuwing bij. Of de gebruiker het eerst goedkeurt, volgt uit wat het account voor verwijderen toestaat. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Bestand verwijderen",
             read_only_hint = false,
@@ -3840,7 +4424,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een verkoopfactuur per e-mail versturen vanuit e-Boekhouden, met de factuur als pdf in de bijlage. Onderwerp en bericht komen uit een e-mailsjabloon voor facturen (sjabloon_id), zoals e-Boekhouden het voor deze factuur invult, of geef je zelf mee; eigen tekst gaat zoals hij is, dus zonder codes zoals [FACTNUMMER]. Zonder ontvanger gaat de mail naar het factuur- of e-mailadres van de relatie. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de ontvanger, het onderwerp en het bericht. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een verkoopfactuur per e-mail versturen vanuit e-Boekhouden, met de factuur als pdf in de bijlage. Onderwerp en bericht komen uit een e-mailsjabloon voor facturen (sjabloon_id), zoals e-Boekhouden het voor deze factuur invult, of geef je zelf mee; eigen tekst gaat zoals hij is, dus zonder codes zoals [FACTNUMMER]. Zonder ontvanger gaat de mail naar het factuur- of e-mailadres van de relatie. Dit verstuurt echte e-mail en is niet terug te draaien. De gebruiker moet dit altijd goedkeuren in EB MCP en ziet daar de ontvanger, het onderwerp en het bericht. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Factuur mailen",
             read_only_hint = false,
@@ -3936,7 +4520,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een e-mailsjabloon maken voor het mailen van facturen of offertes. Gebruik in onderwerp en bericht de codes van e-Boekhouden, zoals [FACTNUMMER], [RELBEDRIJF] en [ABBEDRIJF] (zie emailsjablonen voor voorbeelden). Het bericht is HTML. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een e-mailsjabloon maken voor het mailen van facturen of offertes. Gebruik in onderwerp en bericht de codes van e-Boekhouden, zoals [FACTNUMMER], [RELBEDRIJF] en [ABBEDRIJF] (zie emailsjablonen voor voorbeelden). Het bericht is HTML. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "E-mailsjabloon toevoegen",
             read_only_hint = false,
@@ -3988,7 +4572,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een e-mailsjabloon wijzigen, op id (uit emailsjablonen). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een e-mailsjabloon wijzigen, op id (uit emailsjablonen). Wat je niet noemt blijft zoals het is. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "E-mailsjabloon wijzigen",
             read_only_hint = false,
@@ -4083,7 +4667,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een e-mailsjabloon verwijderen, op id. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een e-mailsjabloon verwijderen, op id. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "E-mailsjabloon verwijderen",
             read_only_hint = false,
@@ -4187,7 +4771,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een offerte maken voor een relatie. Prijzen per stuk, incl of excl btw; btw op code (HOOG_VERK_21, LAAG_VERK_9, GEEN, ...), de omzetrekening op code. Zonder nummer krijgt de offerte het volgende nummer van e-Boekhouden. De offerte wordt niet verstuurd. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de offerte eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een offerte maken voor een relatie. Prijzen per stuk, incl of excl btw; btw op code (HOOG_VERK_21, LAAG_VERK_9, GEEN, ...), de omzetrekening op code. Zonder nummer krijgt de offerte het volgende nummer van e-Boekhouden. De offerte wordt niet verstuurd. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de offerte eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Offerte toevoegen",
             read_only_hint = false,
@@ -4256,7 +4840,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een offerte wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. De statussen staan bij de tool offerte. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een offerte wijzigen, op id. Wat je niet noemt blijft zoals het is; regels die je meegeeft vervangen alle bestaande. De statussen staan bij de tool offerte. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Offerte wijzigen",
             read_only_hint = false,
@@ -4309,7 +4893,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een offerte verwijderen, op id. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een offerte verwijderen, op id. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Offerte verwijderen",
             read_only_hint = false,
@@ -4430,7 +5014,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een sjabloon maken. Factuur en offerte: een kopie van een bestaand sjabloon (kopie_van, standaard het eerste actieve); pas de opmaak daarna aan met sjabloon_wijzigen. Aanmaan: een e-mailtekst met onderwerp en bericht. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een sjabloon maken. Factuur en offerte: een kopie van een bestaand sjabloon (kopie_van, standaard het eerste actieve); pas de opmaak daarna aan met sjabloon_wijzigen. Aanmaan: een e-mailtekst met onderwerp en bericht. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Sjabloon toevoegen",
             read_only_hint = false,
@@ -4493,7 +5077,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een sjabloon wijzigen, op soort en id. Aanmaan: naam, onderwerp of bericht. Factuur en offerte: naam, actief of inactief, en de opmaak: geef dan het hele document `opmaak` uit de tool sjabloon terug met je wijzigingen (tekst in content, plaats in x en y, grootte in width en height; nieuwe elementen krijgen een nieuw id). De gebruiker ziet per element wat er verandert. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een sjabloon wijzigen, op soort en id. Aanmaan: naam, onderwerp of bericht. Factuur en offerte: naam, actief of inactief, en de opmaak: geef dan het hele document `opmaak` uit de tool sjabloon terug met je wijzigingen (tekst in content, plaats in x en y, grootte in width en height; nieuwe elementen krijgen een nieuw id). De gebruiker ziet per element wat er verandert. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Sjabloon wijzigen",
             read_only_hint = false,
@@ -4599,7 +5183,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een sjabloon verwijderen, op soort en id. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een sjabloon verwijderen, op soort en id. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Sjabloon verwijderen",
             read_only_hint = false,
@@ -4696,7 +5280,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een relatie (klant of leverancier) aanmaken. Naam en code zijn nodig; de code is uniek binnen de administratie. Zoek de gegevens van een bedrijf eerst op met kvk_zoeken en kvk_adres. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de relatie eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een relatie (klant of leverancier) aanmaken. Naam en code zijn nodig; de code is uniek binnen de administratie. Zoek de gegevens van een bedrijf eerst op met kvk_zoeken en kvk_adres. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de relatie eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Relatie toevoegen",
             read_only_hint = false,
@@ -4773,7 +5357,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een relatie wijzigen, op id. Wat je niet noemt blijft zoals het is; een leeg veld maakt het leeg. Een wijziging van het IBAN, de BIC of een e-mailadres bepaalt waar geld en facturen heen gaan en vraagt daarom altijd het akkoord van de gebruiker. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een relatie wijzigen, op id. Wat je niet noemt blijft zoals het is; een leeg veld maakt het leeg. Een wijziging van het IBAN, de BIC of een e-mailadres bepaalt waar geld en facturen heen gaan en vraagt daarom altijd het akkoord van de gebruiker. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Relatie wijzigen",
             read_only_hint = false,
@@ -4862,7 +5446,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een relatie verwijderen, op id. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een relatie verwijderen, op id. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Relatie verwijderen",
             read_only_hint = false,
@@ -4945,13 +5529,17 @@ impl ServerHandler for EbMcp {
                 "Leest de boekhouding in e-Boekhouden van de accounts die in EB MCP zijn ingelogd. \
                  Wijzigen (relaties, mutaties, bestanden, facturen, offertes, abonnementen, sjablonen, uren en projecten, producten, grootboekrekeningen en kostenplaatsen, importregels, vaste activa, de beginbalans, bedrijfsgegevens) en alles wat e-Boekhouden verlaat (facturen, offertes en aanmaningen mailen, Peppol, het incassobestand) kan alleen voor accounts waar de gebruiker dat heeft aangezet, per soort wijziging: boeken en wijzigen, verwijderen, versturen en ingrijpend; \
                  status zegt per account en per soort of die uit staat, met akkoord of zonder akkoord. Staat een soort uit, dan weigert de tool en zegt hij welke. Met akkoord toont EB MCP elke wijziging eerst aan de gebruiker; \
-                 alles wat mail of een bestand de deur uit doet, crediteren, in bulk factureren of boeken, afboeken, bedrijfsgegevens en het verwerken van een btw-aangifte vragen altijd akkoord, en verwijderen ook tenzij de gebruiker dat anders heeft gezet. Zo'n tool wacht niet op de gebruiker: \
-                 hij antwoordt meteen met status wacht en een voorstel_id, en voert de wijziging zelf uit zodra de gebruiker goedkeurt. \
+                 alles wat mail of een bestand de deur uit doet, crediteren, in bulk factureren of boeken, afboeken, bedrijfsgegevens en het verwerken van een btw-aangifte vragen altijd akkoord, en verwijderen ook tenzij de gebruiker dat anders heeft gezet. Zo'n tool antwoordt \
+                 met status wacht en een voorstel_id, en EB MCP voert de wijziging zelf uit zodra de gebruiker goedkeurt. \
+                 Heeft de gebruiker wachten in de aanroep aangezet (status zegt het bij wacht_op_akkoord), dan blijft de aanroep eerst open tot de gebruiker in EB MCP beslist (hooguit een paar minuten) en geeft hij dan de uitkomst zelf: uitgevoerd met het resultaat, of geweigerd; pas als de gebruiker in die tijd niet beslist, komt status wacht. \
+                 Doe de aanroep dan niet opnieuw, en ook niet als je client hem afbrak: de wijziging wacht al. \
                  Vertel de gebruiker dat er in EB MCP een wijziging op akkoord wacht, ga gerust verder met ander werk, \
                  en vraag de uitkomst later op met akkoord_status (met voorstel_id voor één voorstel en zijn resultaat; zonder voor alles van de laatste 24 uur). \
                  Klopt een voorstel dat nog wacht niet, of is het niet meer nodig, trek het dan zelf in met akkoord_intrekken (met een korte reden) in plaats van de gebruiker te vragen het te weigeren; na goedkeuring kan dat niet meer. \
                  Een geïmporteerde bankregel verwerken kan: bankregels geeft de onverwerkte regels met hun id, en mutatie_toevoegen met bankregel_id boekt de mutatie en verwerkt de regel in één keer, bij elke soort, ook een factuurbetaling. \
                  Boek geld van een bankregel nooit zonder bankregel_id: dan blijft de regel open staan en dreigt een dubbele boeking. \
+                 Kan een bankregel nog niet geboekt worden (bijvoorbeeld omdat de factuur nog ontbreekt), zet er dan een opmerking bij met bankregel_opmerking_wijzigen, zoals \"wacht op factuur\". \
+                 Hoort er een factuur of bon bij die op deze computer staat, geef die dan mee als bijlage van mutatie_toevoegen: dan staat hij na hetzelfde akkoord in het archief en gekoppeld aan de mutatie. \
                  Een btw-aangifte, ICP-opgave of suppletie versturen, indienen of betalen kan EB MCP niet: dat doet de gebruiker zelf. \
                  Wel kan btwaangifte_betaallink de iDEAL-link van een verstuurde aangifte opzoeken: toon die link aan de gebruiker om zelf te openen, open of volg hem nooit zelf. \
                  Zegt een tool dat de uitkomst onbekend is (een mail of bestand dat mogelijk al weg is), probeer het dan niet opnieuw maar laat de gebruiker eerst kijken. \
@@ -4964,6 +5552,19 @@ impl ServerHandler for EbMcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_through_the_bridge_waits_less_than_a_minute() {
+        let five = Some(Duration::from_secs(300));
+        assert_eq!(capped(five, false), five);
+        assert_eq!(capped(five, true), Some(BRIDGE_WAIT));
+        let short = Some(Duration::from_millis(500));
+        assert_eq!(capped(short, true), short);
+        assert_eq!(capped(None, true), None);
+        assert_eq!(minutes(Duration::from_secs(50)), "50 seconden");
+        assert_eq!(minutes(Duration::from_secs(60)), "1 minuut");
+        assert_eq!(minutes(Duration::from_secs(300)), "5 minuten");
+    }
 
     #[test]
     fn every_tool_names_one_plain_type_for_a_field_that_may_be_left_out() {
@@ -5190,7 +5791,7 @@ mod tests {
     fn counts_its_tools_on_the_router() {
         // The tools of this file, plus what each part names in its own module.
         let [reads, writes, _] = part_tools();
-        assert_eq!(tool_count(), 57 + reads.len() + writes.len());
+        assert_eq!(tool_count(), 59 + reads.len() + writes.len());
     }
 
     #[test]
@@ -5303,8 +5904,10 @@ mod tests {
         let file = dir.join("bon.pdf");
         std::fs::write(&file, b"%PDF-1.4 proef").unwrap();
         let path = file.to_str().unwrap();
-        let (name, data, size) = read_upload(path, None).unwrap();
+        let (name, data, size, attachment) = read_upload(path, None).unwrap();
         assert_eq!((name.as_str(), size), ("bon.pdf", 14));
+        assert_eq!(attachment.path, path);
+        assert_eq!(attachment.kind.as_deref(), Some("application/pdf"));
         // base64 of the bytes, without a data: prefix: what folder/upload takes.
         assert_eq!(data, "JVBERi0xLjQgcHJvZWY=");
         assert_eq!(
@@ -5446,6 +6049,129 @@ mod tests {
         );
         assert!(download_dir(Some(dir.join("weg").to_str().unwrap())).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn asks_for_the_files_of_a_mutatie_by_its_number() {
+        let query = bijlagen_query(2894, None).unwrap();
+        for want in [
+            ("offset", "0"),
+            ("limit", "50"),
+            ("orderBy", ""),
+            ("sortDirection", "0"),
+            ("koppelId", "2894"),
+            ("koppelSoort", "MUT"),
+        ] {
+            assert!(
+                query.contains(&(want.0.into(), want.1.into())),
+                "{want:?} in {query:?}"
+            );
+        }
+        assert!(bijlagen_query(1, Some(0)).is_err());
+        let rows = bijlagen(json!({
+            "colMetadata": [{"name": "id"}, {"name": "koppelId"}, {"name": "naam"}, {"name": "soort"}, {"name": "datum"}, {"name": "grootte"}, {"name": "guid"}],
+            "data": [[51, 2894, "bon.jpg", "F", "2026-11-03T10:00:00", 48213, "abc"]],
+            "rowCount": 1
+        }));
+        assert_eq!(
+            rows["data"],
+            json!([{"id": 51, "naam": "bon.jpg", "datum": "2026-11-03T10:00:00", "grootte": 48213}])
+        );
+        assert_eq!(rows["rowCount"], 1);
+    }
+
+    #[test]
+    fn names_a_saved_archive_file_safely() {
+        assert_eq!(safe_name("../../etc/passwd"), Some("_.._etc_passwd".into()));
+        assert_eq!(safe_name("  .verborgen. "), Some("verborgen".into()));
+        assert_eq!(safe_name("a:b*c?.pdf"), Some("a_b_c_.pdf".into()));
+        assert_eq!(safe_name(".."), None);
+        assert_eq!(safe_name(""), None);
+        // Windows device names get a prefix, with or without an extension and in any case.
+        assert_eq!(safe_name("NUL"), Some("_NUL".into()));
+        assert_eq!(safe_name("con.pdf"), Some("_con.pdf".into()));
+        assert_eq!(safe_name("Com1 .txt"), Some("_Com1 .txt".into()));
+        assert_eq!(safe_name("LPT9.tar.gz"), Some("_LPT9.tar.gz".into()));
+        assert_eq!(safe_name("COM0.pdf"), Some("COM0.pdf".into()));
+        assert_eq!(safe_name("COM10.pdf"), Some("COM10.pdf".into()));
+        assert_eq!(safe_name("Consult.pdf"), Some("Consult.pdf".into()));
+        assert_eq!(safe_name("nul bon.pdf"), Some("nul bon.pdf".into()));
+        // Only plain documents may go to a folder the client named; the last extension decides.
+        for name in [
+            "bon.pdf",
+            "Bon.JPEG",
+            "scan.heic",
+            "ubl.xml",
+            "a.b.csv",
+            "start.command.pdf",
+        ] {
+            assert!(is_document(name), "{name}");
+        }
+        for name in [
+            "start.command",
+            "bon.pdf.app",
+            "x.plist",
+            "setup.exe",
+            "bijlage-5",
+            ".pdf",
+            "a.sh",
+        ] {
+            assert!(!is_document(name), "{name}");
+        }
+        let long = format!("{}.pdf", "x".repeat(300));
+        let short = safe_name(&long).unwrap();
+        assert_eq!(short.chars().count(), 150);
+        assert!(short.ends_with(".pdf"));
+
+        assert_eq!(
+            bijlage_name(Some("bon 1.jpg"), Some("anders.pdf"), 5, "image/jpeg"),
+            "bon 1.jpg"
+        );
+        assert_eq!(
+            bijlage_name(None, Some("Factuur KPN"), 5, "application/pdf"),
+            "Factuur KPN.pdf"
+        );
+        assert_eq!(bijlage_name(None, None, 5, "image/png"), "bijlage-5.png");
+        assert_eq!(
+            bijlage_name(None, Some("Factuur 12.11.2026"), 5, "application/pdf"),
+            "Factuur 12.11.2026.pdf"
+        );
+        assert_eq!(
+            bijlage_name(None, Some("Bon.JPEG"), 5, "image/jpeg"),
+            "Bon.JPEG"
+        );
+        assert_eq!(
+            bijlage_name(None, Some("scan.heic"), 5, "image/heic"),
+            "scan.heic"
+        );
+        assert_eq!(
+            bijlage_name(Some(".."), None, 7, "application/octet-stream"),
+            "bijlage-7"
+        );
+
+        assert_eq!(sniff_type(b"%PDF-1.7", Some("x.jpg")), "application/pdf");
+        assert_eq!(sniff_type(&[0xFF, 0xD8, 0xFF, 0xE0], None), "image/jpeg");
+        assert_eq!(sniff_type(b"\x89PNG\r\n\x1a\nrest", None), "image/png");
+        assert_eq!(sniff_type(b"onbekend", Some("Bon.JPEG")), "image/jpeg");
+        assert_eq!(sniff_type(b"onbekend", None), "application/octet-stream");
+
+        let downloads = std::path::Path::new("/Users/lisa/Downloads");
+        assert_eq!(
+            bijlagen_dir(downloads, Some("Studio Noord B.V."), "Studio"),
+            downloads.join("EB MCP").join("Studio Noord B.V")
+        );
+        assert_eq!(
+            bijlagen_dir(downloads, Some("A/B"), "Studio"),
+            downloads.join("EB MCP").join("A_B")
+        );
+        assert_eq!(
+            bijlagen_dir(downloads, None, "Studio"),
+            downloads.join("EB MCP").join("Studio")
+        );
+        assert_eq!(
+            bijlagen_dir(downloads, Some(" "), ".."),
+            downloads.join("EB MCP").join("administratie")
+        );
     }
 
     #[test]

@@ -1,10 +1,11 @@
 import { flushPromises, mount } from '@vue/test-utils'
+import { nextTick } from 'vue'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from '../App.vue'
 import AccountForm from '../components/AccountForm.vue'
 import { rightsChip, rightsText, store, type AccountView } from '../lib/accounts'
 import {
-  ago, approvalState, decisionLabel, filterHistory, followSelection, nameList, proposalKind, quitWarning, refreshApprovals, splitTitle, statusOf, type ApprovalDetail, type ApprovalRecord, type DecideAllResult, type Proposal,
+  ago, approvalState, decisionLabel, filterHistory, followSelection, nameList, proposalKind, quitWarning, recordStatus, refreshApprovals, splitTitle, statusOf, type ApprovalDetail, type ApprovalRecord, type DecideAllResult, type Proposal,
 } from '../lib/approvals'
 import { statusLabel, type McpEntry } from '../lib/log'
 import { router } from '../router'
@@ -59,6 +60,7 @@ let onGet: (id: number) => Promise<ApprovalDetail> = async (id) => ({
 })
 let onExport: () => Promise<string> = async () => '/Users/jan/Downloads/eb-mcp-akkoord.jsonl.gz'
 let onReveal: (path: string) => Promise<void> = async () => {}
+let onFile: (id: number) => Promise<unknown> = async () => ({ name: 'bon.png', kind: 'image/png', size: 8, changed: false, data: 'iVBORw==' })
 
 const mounted: { unmount(): void }[] = []
 beforeEach(() => {
@@ -72,8 +74,9 @@ beforeEach(() => {
       case 'approval_get': return onGet(args!.id as number)
       case 'approvals_export': return onExport()
       case 'log_export_reveal': return onReveal(args!.path as string)
+      case 'approval_file': return onFile(args!.id as number)
       case 'accounts_list': return []
-      case 'settings_get': return { idleMinutes: 30, appearance: 'system', showInDock: true }
+      case 'settings_get': return { idleMinutes: 30, appearance: 'system', showInDock: true, notifyApprovals: true, waitForApproval: true, waitMinutes: 5 }
       case 'log_list': return []
       default: return undefined
     }
@@ -96,6 +99,7 @@ afterEach(() => {
   onGet = async (id) => ({ ...history.find((r) => r.id === id)!, args: { omschrijving: 'Bankkosten' }, body: { Rekening: '1010' }, result: { MutatieNr: 812 } })
   onExport = async () => '/Users/jan/Downloads/eb-mcp-akkoord.jsonl.gz'
   onReveal = async () => {}
+  onFile = async () => ({ name: 'bon.png', kind: 'image/png', size: 8, changed: false, data: 'iVBORw==' })
 })
 
 // The whole window, as in the app: the toolbar's Teleport target, the sidebar and the banner live in the shell.
@@ -164,6 +168,69 @@ describe('the queue', () => {
     expect(buttons(detail(), 'Goedkeuren')).toHaveLength(1)
     expect(buttons(detail(), 'Weigeren')).toHaveLength(1)
     expect(buttons(document.querySelector('.q-list')!, 'Goedkeuren')).toHaveLength(0)
+  })
+
+  it('shows the file of an upload before Goedkeuren, and opens only the file of that proposal', async () => {
+    const file = { path: '/Users/jan/Downloads/bon.png', name: 'bon.png', size: 8, kind: 'image/png', openable: true }
+    waiting = [proposal({ tool: 'archief_uploaden', title: 'Bestand uploaden: bon.png', file }), proposal({ id: 8 })]
+    await mountAt('/akkoord')
+    expect(detail().textContent).toContain('Bestand')
+    expect(detail().querySelector('.file-name')?.textContent).toBe('bon.png')
+    expect(detail().querySelector('.file-size')?.textContent).toBe('8 B')
+    const image = detail().querySelector<HTMLImageElement>('img.file-view')!
+    expect(image.getAttribute('src')).toBe('data:image/png;base64,iVBORw==')
+    expect(image.alt).toBe('Voorbeeld van bon.png')
+    expect(detail().textContent).not.toContain('sinds het voorstel')
+    // A button shows that it waits for the system, and the other one waits with it.
+    const [openen, toon] = [buttons(detail(), 'Openen')[0]!, buttons(detail(), 'Toon in Finder')[0]!]
+    openen.click()
+    await nextTick()
+    expect([openen.getAttribute('aria-busy'), openen.disabled, toon.disabled]).toEqual(['true', true, true])
+    await flushPromises()
+    expect([openen.getAttribute('aria-busy'), openen.disabled, toon.disabled]).toEqual(['false', false, false])
+    toon.click()
+    await flushPromises()
+    // An image the webview cannot draw (HEIC on Windows) gives way to a sentence, in the same place.
+    image.dispatchEvent(new Event('error'))
+    await flushPromises()
+    expect(detail().querySelector('img.file-view')).toBeNull()
+    expect(detail().querySelector('.file-stage')?.textContent).toBe('Dit voorbeeld kan hier niet worden getoond; open het bestand om het te bekijken.')
+    expect(invoke.mock.calls.filter((c) => c[0] === 'approval_file_open').map((c) => c[1])).toEqual([{ id: 7, reveal: false }, { id: 7, reveal: true }])
+    // A proposal without a file has no preview, and nothing is read for it.
+    await choose(8)
+    expect(detail().querySelector('.file-preview')).toBeNull()
+    expect(invoke.mock.calls.filter((c) => c[0] === 'approval_file').map((c) => c[1])).toEqual([{ id: 7 }])
+  })
+
+  it('says when the file changed since the proposal, shows a PDF in a frame and other files by name', async () => {
+    const created: Blob[] = []
+    const createObjectURL = vi.fn((blob: Blob) => (created.push(blob), 'blob:voorbeeld'))
+    Object.defineProperty(URL, 'createObjectURL', { value: createObjectURL, configurable: true })
+    Object.defineProperty(URL, 'revokeObjectURL', { value: vi.fn(), configurable: true })
+    onFile = async () => ({ name: 'factuur.pdf', kind: 'application/pdf', size: 16, changed: true, data: 'JVBERi0xLjQgZmFjdHV1cg==' })
+    waiting = [
+      proposal({ tool: 'archief_uploaden', title: 'Bestand uploaden: factuur.pdf', file: { path: '/Users/jan/factuur.pdf', name: 'factuur.pdf', size: 16, kind: 'application/pdf', openable: true } }),
+      proposal({ id: 8, tool: 'archief_uploaden', title: 'Bestand uploaden: export.csv', file: { path: '/Users/jan/export.csv', name: 'export.csv', size: 2048, kind: null, openable: false } }),
+    ]
+    await mountAt('/akkoord')
+    const frame = detail().querySelector<HTMLIFrameElement>('iframe.file-view')!
+    expect(frame.getAttribute('src')).toBe('blob:voorbeeld')
+    expect(created[0]!.type).toBe('application/pdf')
+    expect(created[0]!.size).toBe(16)
+    expect(detail().textContent).toContain('Het bestand op deze computer is gewijzigd of weg sinds het voorstel. Je ziet hier de versie van toen: die gaat na Goedkeuren naar e-Boekhouden.')
+    await choose(8)
+    expect(detail().querySelector('.file-view')).toBeNull()
+    expect(detail().textContent).toContain('Van dit soort bestand is geen voorbeeld; bekijk het in zijn map.')
+    // No PDF and no image: it is never handed to its own app, only shown in its folder.
+    expect(buttons(detail(), 'Openen')).toHaveLength(0)
+    expect(buttons(detail(), 'Toon in Finder')).toHaveLength(1)
+    expect(detail().querySelector('.file-size')?.textContent).toBe('2,0 kB')
+    // A file that cannot be read says why, in the app's own words.
+    onFile = async () => { throw 'bon.png is niet meer te lezen' }
+    waiting = [proposal({ id: 9, tool: 'archief_uploaden', title: 'Bestand uploaden: bon.png', file: { path: '/Users/jan/bon.png', name: 'bon.png', size: 8, kind: 'image/png', openable: true } })]
+    await refreshApprovals()
+    await flushPromises()
+    expect(detail().querySelector('[role="alert"]')?.textContent).toBe('bon.png is niet meer te lezen')
   })
 
   it('shows the proposal whose row is clicked', async () => {
@@ -342,6 +409,7 @@ describe('the queue', () => {
     expect(kind('archief_uploaden')).toEqual({ icon: 'plus', tone: 'accent' })
     expect(kind('relatie_wijzigen')).toEqual({ icon: 'pencil', tone: 'neutral' })
     expect(kind('archief_koppelen')).toEqual({ icon: 'pencil', tone: 'neutral' })
+    expect(kind('bankregel_opmerking_wijzigen')).toEqual({ icon: 'pencil', tone: 'neutral' })
     expect(kind('relatie_verwijderen')).toEqual({ icon: 'trash', tone: 'neutral' })
     expect(kind('factuur_mailen')).toEqual({ icon: 'mail', tone: 'neutral' })
     expect(kind('factuur_crediteren')).toEqual({ icon: 'file-text', tone: 'neutral' })
@@ -585,6 +653,26 @@ describe('the history', () => {
     // The list names it too, and it can be filtered on.
     expect(statusOf('withdrawn')).toMatchObject({ label: 'Ingetrokken', tone: 'off' })
     expect(decisionLabel('withdrawn')).toBe('Ingetrokken door de AI-client')
+  })
+
+  it('says it when a change is done but a part that goes with it is not', async () => {
+    const note = 'De boeking staat in e-Boekhouden, maar de bijlage is niet toegevoegd: dit bestandstype is niet toegestaan'
+    history = [
+      record({ id: 21, status: 'done', decision: 'approved', decidedAt: 2_000, note }),
+      record({ id: 20, status: 'done', decision: 'approved', decidedAt: 1_000 }),
+    ]
+    await openHistory()
+    const chips = [...document.querySelectorAll<HTMLElement>('.record .chip.status')]
+    expect(chips.map((c) => [c.textContent, c.classList.contains('warn')])).toEqual([['Deels uitgevoerd', true], ['Uitgevoerd', false]])
+    const outcomeOf = async (index: number) => {
+      document.querySelectorAll<HTMLButtonElement>('.record')[index]!.click()
+      await flushPromises()
+      const box = document.querySelector<HTMLElement>('aside.detail .outcome')!
+      return [box.classList.contains('warn'), box.textContent?.trim()]
+    }
+    expect(await outcomeOf(0)).toEqual([true, note])
+    expect(await outcomeOf(1)).toEqual([false, 'Uitgevoerd in e-Boekhouden.'])
+    expect(recordStatus({ status: 'failed', note })).toMatchObject({ label: 'Mislukt', tone: 'bad' })
   })
 
   it('names an answer given to all waiting changes at once', async () => {

@@ -19,6 +19,29 @@ export interface Proposal {
   /** Cannot be undone: asked even for an account that needs no approval otherwise. */
   danger: boolean
   askedAt: number
+  /** The file the change sends along (an upload to the digitaal archief), shown before Goedkeuren. */
+  file?: Attachment
+}
+
+/** A file from this computer that a change sends to e-Boekhouden (approvals.rs, `Attachment`). */
+export interface Attachment {
+  path: string
+  name: string
+  size: number
+  /** 'application/pdf' or an image type when the preview can show it, told from the file's bytes; null: no preview. */
+  kind: string | null
+  /** Openen may hand the file to its own app: only a PDF or an image. Anything else is only shown in its folder. */
+  openable: boolean
+}
+
+/** The file as the proposal read it (`approval_file`), which is what goes out; `changed`: the file on disk is no longer that, or is gone. */
+export interface FilePreview {
+  name: string
+  kind: string | null
+  size: number
+  changed: boolean
+  /** Base64. */
+  data: string
 }
 
 export type ApprovalStatus = 'waiting' | 'running' | 'done' | 'failed' | 'refused' | 'lapsed' | 'withdrawn'
@@ -31,6 +54,8 @@ export interface ApprovalRecord extends Proposal {
   decision: ApprovalDecision | null
   status: ApprovalStatus
   error: string | null
+  /** What did not come of a change that is done: the change stands, a part that goes with it (an attachment) does not. */
+  note?: string | null
   /** The EB MCP version that took the proposal in. */
   version: string
   /** Answered with Alles goedkeuren or Alles weigeren rather than on its own. */
@@ -141,7 +166,7 @@ export const approvalDetail = (id: number): Promise<ApprovalDetail> => invoke<Ap
 /** Writes the history to a .jsonl.gz file and gives its absolute path. */
 export const exportApprovals = (): Promise<string> => invoke<string>('approvals_export')
 
-export type StatusTone = 'ok' | 'bad' | 'run' | 'off'
+export type StatusTone = 'ok' | 'bad' | 'warn' | 'run' | 'off'
 
 export const STATUSES: { value: ApprovalStatus; label: string; tone: StatusTone }[] = [
   { value: 'waiting', label: 'Wacht', tone: 'run' },
@@ -156,6 +181,11 @@ export const STATUSES: { value: ApprovalStatus; label: string; tone: StatusTone 
 
 export function statusOf(status: ApprovalStatus): { label: string; tone: StatusTone } {
   return STATUSES.find((s) => s.value === status) ?? { label: status, tone: 'off' }
+}
+
+/** The status of a record as its chip shows it: a change that is done but left a part undone says so. */
+export function recordStatus(record: Pick<ApprovalRecord, 'status' | 'note'>): { label: string; tone: StatusTone } {
+  return record.status === 'done' && record.note ? { label: 'Deels uitgevoerd', tone: 'warn' } : statusOf(record.status)
 }
 
 /** How the detail names the answer, and whether it was given to all waiting changes at once. */
@@ -269,4 +299,15 @@ export function stamp(ms: number, full = false): string {
   return full
     ? new Date(ms).toLocaleString('nl-NL', { dateStyle: 'long', timeStyle: 'medium' })
     : new Date(ms).toLocaleString('nl-NL', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+}
+
+/** The file of a proposal that still waits, for its preview. Rejects with a Dutch sentence. */
+export const approvalFile = (id: number): Promise<FilePreview> => invoke<FilePreview>('approval_file', { id })
+/** Opens the file of a waiting proposal in its own app, or shows it in Finder or Explorer with `reveal`. */
+export const openApprovalFile = (id: number, reveal = false): Promise<void> => invoke<void>('approval_file_open', { id, reveal })
+
+/** What the preview can show of a file: an image, a PDF, or nothing. */
+export function previewKind(kind: string | null | undefined): 'image' | 'pdf' | null {
+  if (kind === 'application/pdf') return 'pdf'
+  return kind?.startsWith('image/') ? 'image' : null
 }

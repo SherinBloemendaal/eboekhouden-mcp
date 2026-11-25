@@ -1176,6 +1176,7 @@ name = "eb-mcp-bridge"
 version = "0.6.6"
 dependencies = [
  "axum",
+ "futures-util",
  "reqwest",
  "serde_json",
  "tokio",

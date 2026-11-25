@@ -270,6 +270,8 @@ mod tests {
             "btw",
             "uren",
             "digitaal_archief",
+            "mutatie_bijlagen",
+            "bijlage_downloaden",
             "get",
             "mutatie",
             "facturen",
@@ -363,7 +365,7 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            28 + writes.len() + part_reads.len() + part_writes.len()
+            30 + writes.len() + part_reads.len() + part_writes.len()
         );
         assert_eq!(crate::tools::tool_count(), names.len());
 
@@ -1011,6 +1013,284 @@ mod tests {
         answer_of(body)
     }
 
+    /// An upload to the digitaal archief puts its file on the proposal, so Akkoord can show it before Goedkeuren.
+    #[tokio::test]
+    async fn an_upload_shows_its_file_on_the_proposal() {
+        use crate::accounts::{AccountInput, Rights, Store};
+        let jar = Arc::new(crate::state::testing::FakeJar::default());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = Arc::new(crate::state::testing::state_with(
+            jar.clone(),
+            &eboekhouden(seen.clone()).await,
+        ));
+        let account = state
+            .accounts
+            .add(AccountInput {
+                label: "Studio Noord".into(),
+                username: "lisa@studionoord.example".into(),
+                store: Store::System,
+                op_ref: None,
+                op_title: None,
+                op_vault: None,
+                rights: Rights::ASK,
+            })
+            .unwrap();
+        state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
+        state.add_session(account.id, &account.label, "sessie");
+        let dir = std::env::temp_dir().join(format!("ebmcp-upload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bon = dir.join("bon.png");
+        std::fs::write(&bon, b"\x89PNG bon").unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mcp = router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
+        tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{PATH}");
+        let post = |body: serde_json::Value, session: Option<String>| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&body);
+            if let Some(s) = session {
+                request = request.header("mcp-session-id", s);
+            }
+            request.send()
+        };
+        let init = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "title": "Claude", "version": "1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        let call = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "archief_uploaden", "arguments": {"pad": bon.to_string_lossy()}}}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        let (_, text) = answer_of(call.text().await.unwrap());
+        let id = waiting_id(&text);
+        let file = state.approvals.list()[0]
+            .file
+            .clone()
+            .expect("the proposal has its file");
+        assert_eq!((file.name.as_str(), file.size), ("bon.png", 8));
+        assert_eq!(file.kind.as_deref(), Some("image/png"));
+        assert!(file.openable);
+        assert_eq!(
+            file.sent, None,
+            "the bytes are not sent along with the proposal"
+        );
+        let (waiting, sent) = state.approvals.waiting_file(id).unwrap();
+        let preview = waiting.preview(&sent);
+        assert!(!preview.changed);
+        assert_eq!(&sent[..], b"\x89PNG bon", "the preview is what goes out");
+        assert!(seen.lock().unwrap().is_empty(), "nothing went out");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With "Wacht op akkoord in de aanroep" on, the call stays open until the user answered and then gives the
+    /// outcome itself; a client that asked for progress hears meanwhile that it waits. When the user takes longer
+    /// than the setting allows, the call answers that the change waits, and the change still runs after Goedkeuren.
+    #[tokio::test]
+    async fn a_change_can_wait_in_the_call_for_the_users_answer() {
+        use crate::accounts::{AccountInput, Rights, Store};
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jar = Arc::new(crate::state::testing::FakeJar::default());
+        let state = Arc::new(crate::state::testing::state_with(
+            jar.clone(),
+            &eboekhouden(seen.clone()).await,
+        ));
+        let account = state
+            .accounts
+            .add(AccountInput {
+                label: "Studio Noord".into(),
+                username: "lisa@studionoord.example".into(),
+                store: Store::System,
+                op_ref: None,
+                op_title: None,
+                op_vault: None,
+                rights: Rights::ASK,
+            })
+            .unwrap();
+        state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
+        state.add_session(account.id, &account.label, "sessie");
+        state.set_approval_wait(Some(std::time::Duration::from_secs(30)));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mcp = router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
+        tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{PATH}");
+        let post = |body: serde_json::Value, session: Option<String>| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&body);
+            if let Some(s) = session {
+                request = request.header("mcp-session-id", s);
+            }
+            request.send()
+        };
+        let init = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "title": "Claude", "version": "1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        // A booking as its own task, so the test can answer for the user while the call waits.
+        let book = |id: u32| {
+            let call = post(
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+                    "name": "mutatie_toevoegen",
+                    "arguments": {
+                        "soort": "geld_uitgegeven", "datum": "2026-11-06", "rekening": "1010", "omschrijving": "Parkeergarage",
+                        "regels": [{"tegenrekening": "4550", "bedrag": 2}]
+                    },
+                    "_meta": {"progressToken": format!("boeking-{id}")}
+                }}),
+                session.clone(),
+            );
+            tokio::spawn(async move { call.await.unwrap().text().await.unwrap() })
+        };
+        let up = |known: usize| {
+            let state = state.clone();
+            async move {
+                for _ in 0..200 {
+                    if state.approvals.history(None).len() > known
+                        && let Some(p) = state.approvals.list().first()
+                    {
+                        return p.id;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("no proposal came up");
+            }
+        };
+
+        // Approved after a while: the call answers with the outcome, as a change without approval would.
+        let call = book(2);
+        let id = up(0).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(!call.is_finished(), "the call waits for the user");
+        assert!(state.approvals.decide(id, true, crate::state::now_ms()));
+        let body = call.await.unwrap();
+        assert!(
+            body.contains("notifications/progress")
+                && body.contains(&format!("Voorstel {id} wacht")),
+            "the client heard that the call waits: {body}"
+        );
+        let (is_error, text) = answer_of(body);
+        assert!(!is_error, "{text}");
+        assert!(
+            text.contains("3908") && text.contains("Mutatie toegevoegd"),
+            "{text}"
+        );
+        assert!(!text.contains("\"status\":\"wacht\""), "{text}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "booked once");
+
+        // Refused: the call says so, and nothing goes out.
+        let call = book(3);
+        let id = up(1).await;
+        assert!(state.approvals.decide(id, false, crate::state::now_ms()));
+        let (is_error, text) = answer_of(call.await.unwrap());
+        assert!(is_error && text.contains("geweigerd"), "{text}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "nothing more was sent");
+
+        // The user takes longer than the setting allows: the call answers that the change waits and asks not to
+        // call again; the change still runs after Goedkeuren.
+        state.set_approval_wait(Some(std::time::Duration::from_secs(1)));
+        let call = book(4);
+        let id = up(2).await;
+        let (is_error, text) = answer_of(call.await.unwrap());
+        assert!(!is_error, "{text}");
+        assert!(text.contains("\"status\":\"wacht\""), "{text}");
+        assert!(text.contains(&format!("\"voorstel_id\":{id}")), "{text}");
+        assert!(text.contains("binnen 1 seconde niet geantwoord"), "{text}");
+        assert!(text.contains("niet opnieuw"), "{text}");
+        assert_eq!(state.approvals.count(), 1, "the change still waits");
+        // A client that gave up on the call and sends it again gets no second proposal: it hears which one waits.
+        let (is_error, text) = answer_of(book(4).await.unwrap());
+        assert!(is_error, "{text}");
+        assert!(
+            text.contains(&format!("als voorstel {id}")) && text.contains("geen tweede voorstel"),
+            "{text}"
+        );
+        assert_eq!(state.approvals.count(), 1, "still one proposal");
+        assert_eq!(seen.lock().unwrap().len(), 1, "and nothing went out");
+        assert!(state.approvals.decide(id, true, crate::state::now_ms()));
+        let record = settled(&state, id).await;
+        assert_eq!(record.status, crate::approvals::Status::Done);
+        assert_eq!(seen.lock().unwrap().len(), 2, "booked after Goedkeuren");
+
+        // Through eb-mcp-bridge the call waits less than a minute whatever the setting (1 second in tests), so
+        // Claude Desktop hears that the change waits before it gives up on the call.
+        state.set_approval_wait(Some(std::time::Duration::from_secs(30)));
+        let started = std::time::Instant::now();
+        let call = http
+            .post(&url)
+            .bearer_auth(TOKEN)
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18")
+            .header("mcp-session-id", session.clone().unwrap())
+            .header(crate::tools::BRIDGE_HEADER, "1")
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {
+                "name": "mutatie_toevoegen",
+                "arguments": {
+                    "soort": "geld_uitgegeven", "datum": "2026-11-06", "rekening": "1010", "omschrijving": "Parkeergarage",
+                    "regels": [{"tegenrekening": "4550", "bedrag": 2}]
+                }
+            }}))
+            .send()
+            .await
+            .unwrap();
+        let (_, text) = answer_of(call.text().await.unwrap());
+        assert!(
+            text.contains("\"status\":\"wacht\"") && text.contains("binnen 1 seconde"),
+            "{text}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "capped, not 30 s"
+        );
+
+        // Waiting off: the call answers at once, as before.
+        state.set_approval_wait(None);
+        let call = book(5);
+        let (_, text) = answer_of(call.await.unwrap());
+        assert!(
+            text.contains("\"status\":\"wacht\"") && text.contains("Je hoeft niet te wachten"),
+            "{text}"
+        );
+    }
+
     fn answer_of(body: String) -> (bool, String) {
         let answer = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
@@ -1028,6 +1308,262 @@ mod tests {
                 .unwrap_or_default()
                 .to_owned(),
         )
+    }
+
+    /// A stand-in for e-Boekhouden with the calls a booking with an attachment needs: a mutatie with the
+    /// description "Fout" fails, a file whose name begins with "weigeren" is refused by the archive. Every call
+    /// that changes something is kept as (path, body).
+    async fn eboekhouden_with_archive(
+        seen: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    ) -> String {
+        use axum::routing::{get, post};
+        let (mutaties, uploads, links) = (seen.clone(), seen.clone(), seen);
+        let app = axum::Router::new()
+            .route(
+                "/v1/api/grootboekrekening/gridtable",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "colMetadata": [{"name": "id"}, {"name": "code"}, {"name": "omschrijving"}, {"name": "categorie"}, {"name": "inactief"}],
+                        "data": [[11, "1010", "Bank", "Betalingsmiddelen", false], [45, "4550", "Bankkosten", "Winst en Verlies", false]]
+                    }))
+                }),
+            )
+            .route(
+                "/v1/api/btwinfo/all",
+                get(|| async { axum::Json(serde_json::json!([{"code": "GEEN", "omschrijving": "Geen btw", "percentage": 0, "soort": ""}])) }),
+            )
+            .route(
+                "/v1/api/mutatie",
+                post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let seen = mutaties.clone();
+                    async move {
+                        let fails = body["mutatie"]["omschrijving"] == "Fout";
+                        seen.lock().unwrap().push(("mutatie".into(), body));
+                        if fails {
+                            (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"message": "Rekening ontbreekt"})))
+                        } else {
+                            (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"mutNr": 3908, "mutId": 4770877556u64})))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/api/folder/upload",
+                post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let seen = uploads.clone();
+                    async move {
+                        let refused = body["fileName"].as_str().unwrap_or_default().starts_with("weigeren");
+                        seen.lock().unwrap().push(("folder/upload".into(), body));
+                        axum::Json(if refused {
+                            serde_json::json!({"errorMessage": "Dit bestandstype is niet toegestaan"})
+                        } else {
+                            serde_json::json!({"folderId": 77, "saved": true})
+                        })
+                    }
+                }),
+            )
+            .route(
+                "/v1/api/folderkoppel/koppel/item",
+                post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let seen = links.clone();
+                    async move {
+                        seen.lock().unwrap().push(("folderkoppel/koppel/item".into(), body));
+                        axum::Json(serde_json::json!(true))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://127.0.0.1:{port}/v1/api/")
+    }
+
+    /// mutatie_toevoegen with a bijlage: one proposal that names the file, and after Goedkeuren the booking,
+    /// the upload and the link in that order. A failed booking uploads nothing; a refused upload leaves the
+    /// booking standing and says how to add only the file.
+    #[tokio::test]
+    async fn a_booking_can_bring_its_invoice_along() {
+        use crate::accounts::{AccountInput, Rights, Store};
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jar = Arc::new(crate::state::testing::FakeJar::default());
+        let state = Arc::new(crate::state::testing::state_with(
+            jar.clone(),
+            &eboekhouden_with_archive(seen.clone()).await,
+        ));
+        let account = state
+            .accounts
+            .add(AccountInput {
+                label: "Studio Noord".into(),
+                username: "lisa@studionoord.example".into(),
+                store: Store::System,
+                op_ref: None,
+                op_title: None,
+                op_vault: None,
+                rights: Rights::ASK,
+            })
+            .unwrap();
+        state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
+        state.add_session(account.id, &account.label, "sessie");
+        let dir = std::env::temp_dir().join(format!("ebmcp-bijlage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let factuur = dir.join("factuur-2026-0042.pdf");
+        std::fs::write(&factuur, b"%PDF-1.4 factuur").unwrap();
+        let geweigerd = dir.join("weigeren.exe");
+        std::fs::write(&geweigerd, b"MZ").unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mcp = router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
+        tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{PATH}");
+        let post = |body: serde_json::Value, session: Option<String>| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&body);
+            if let Some(s) = session {
+                request = request.header("mcp-session-id", s);
+            }
+            request.send()
+        };
+        let init = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "title": "Claude", "version": "1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        let book = |id: u32, omschrijving: &str, bijlage: &std::path::Path| {
+            let call = post(
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "mutatie_toevoegen", "arguments": {
+                    "soort": "geld_uitgegeven", "datum": "2026-11-06", "rekening": "1010", "omschrijving": omschrijving,
+                    "regels": [{"tegenrekening": "4550", "bedrag": 2}], "bijlage": bijlage.to_string_lossy()
+                }}}),
+                session.clone(),
+            );
+            async move { answer_of(call.await.unwrap().text().await.unwrap()) }
+        };
+        let paths = || {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // A path that is not there is refused before the user is asked anything.
+        let (is_error, text) = book(2, "Parkeergarage", &dir.join("weg.pdf")).await;
+        assert!(is_error && text.contains("Geen bestand gevonden"), "{text}");
+        assert!(
+            state.approvals.history(None).is_empty(),
+            "nothing was asked"
+        );
+
+        // One proposal that names the file; after Goedkeuren the booking, the upload and the link.
+        let (_, text) = book(3, "Parkeergarage", &factuur).await;
+        let id = waiting_id(&text);
+        let proposal = state.approvals.list().into_iter().next().unwrap();
+        assert!(
+            proposal.lines.iter().any(
+                |l| l.label == "Bijlage" && l.value.starts_with("factuur-2026-0042.pdf (1 kB)")
+            ),
+            "{:?}",
+            proposal.lines
+        );
+        // Akkoord shows the file that goes along, as it does for an upload.
+        let file = proposal.file.clone().expect("the proposal has its file");
+        assert_eq!(
+            (file.name.as_str(), file.kind.as_deref()),
+            ("factuur-2026-0042.pdf", Some("application/pdf"))
+        );
+        let (_, sent) = state.approvals.waiting_file(id).unwrap();
+        assert_eq!(
+            &sent[..],
+            b"%PDF-1.4 factuur",
+            "the preview is what goes out"
+        );
+        assert!(paths().is_empty(), "nothing goes out before Goedkeuren");
+        assert!(state.approvals.decide(id, true, crate::state::now_ms()));
+        let record = settled(&state, id).await;
+        assert_eq!(record.status, crate::approvals::Status::Done);
+        assert_eq!(
+            paths(),
+            vec!["mutatie", "folder/upload", "folderkoppel/koppel/item"]
+        );
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[1].1["fileName"], "factuur-2026-0042.pdf");
+            assert_eq!(seen[1].1["folderId"], 0, "the Basismap");
+            assert_eq!(
+                seen[2].1,
+                serde_json::json!({"koppelId": 3908, "folders": [{"id": 77, "soort": "F"}], "koppelType": "MUT"})
+            );
+        }
+        let result = state.approvals.get(id).unwrap().result.unwrap();
+        assert_eq!(state.approvals.get(id).unwrap().record.note, None);
+        assert_eq!(result["data"]["mutNr"], 3908);
+        assert_eq!(
+            result["data"]["bijlage"],
+            serde_json::json!({"bestand_id": 77, "naam": "factuur-2026-0042.pdf", "gekoppeld_aan_mutatie": 3908})
+        );
+
+        // The booking fails: nothing is uploaded.
+        seen.lock().unwrap().clear();
+        let (_, text) = book(4, "Fout", &factuur).await;
+        let id = waiting_id(&text);
+        assert!(state.approvals.decide(id, true, crate::state::now_ms()));
+        assert_eq!(
+            settled(&state, id).await.status,
+            crate::approvals::Status::Failed
+        );
+        assert_eq!(paths(), vec!["mutatie"], "no upload after a failed booking");
+
+        // The archive refuses the file: the booking stands, and the answer says how to add only the file.
+        seen.lock().unwrap().clear();
+        let (_, text) = book(5, "Parkeergarage", &geweigerd).await;
+        let id = waiting_id(&text);
+        assert!(state.approvals.decide(id, true, crate::state::now_ms()));
+        assert_eq!(
+            settled(&state, id).await.status,
+            crate::approvals::Status::Done
+        );
+        assert_eq!(paths(), vec!["mutatie", "folder/upload"]);
+        let bijlage = state.approvals.get(id).unwrap().result.unwrap()["data"]["bijlage"].clone();
+        assert_eq!(bijlage["gekoppeld_aan_mutatie"], serde_json::Value::Null);
+        assert!(
+            bijlage["fout"]
+                .as_str()
+                .unwrap()
+                .contains("niet toegestaan"),
+            "{bijlage}"
+        );
+        let let_op = bijlage["let_op"].as_str().unwrap();
+        assert!(
+            let_op.contains("Mutatie 3908 is geboekt")
+                && let_op.contains("archief_uploaden en mutatie_nr 3908"),
+            "{let_op}"
+        );
+        // The user hears it too: the record in the history is done, with what did not come of it.
+        let note = settled(&state, id).await.note.unwrap();
+        assert!(
+            note.starts_with(
+                "De boeking staat in e-Boekhouden, maar de bijlage is niet toegevoegd:"
+            ) && note.contains("niet toegestaan"),
+            "{note}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The proposal id of a "waiting" answer.
@@ -1099,6 +1635,45 @@ mod tests {
                 }),
             )
             .route(
+                // The files linked to mutatie 16; mutaties 17 and 18 have none. Any other
+                // query is an error, so the tool must ask exactly as e-Boekhouden's archive grid does.
+                "/v1/api/folder/gekoppeldgridtable",
+                get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                    let asked = |key: &str| q.get(key).map(String::as_str);
+                    if asked("koppelSoort") != Some("MUT") || asked("sortDirection") != Some("0") {
+                        return axum::http::StatusCode::BAD_REQUEST.into_response();
+                    }
+                    match asked("koppelId") {
+                        Some("16") => axum::Json(json!({
+                            "colMetadata": [{"name": "id"}, {"name": "koppelId"}, {"name": "naam"}, {"name": "soort"}, {"name": "datum"}, {"name": "grootte"}, {"name": "guid"}],
+                            "data": [[5, 16, "bon-5.jpg", "F", "2026-11-03T10:00:00", 4, "0f3c"]],
+                            "rowCount": 1
+                        }))
+                        .into_response(),
+                        // As the real API answers for a mutatie without files (seen 2026-11-24).
+                        Some("17") => axum::Json(json!({"colMetadata": [{"name": "id"}, {"name": "koppelId"}, {"name": "naam"}, {"name": "soort"}, {"name": "datum"}, {"name": "grootte"}, {"name": "guid"}], "data": [], "rowCount": 0})).into_response(),
+                        Some("18") => axum::http::StatusCode::NO_CONTENT.into_response(),
+                        _ => axum::http::StatusCode::BAD_REQUEST.into_response(),
+                    }
+                }),
+            )
+            .route(
+                "/v1/api/folder/{id}/download",
+                get(|Path(id): Path<u64>| async move {
+                    // File 66 is a script someone put in the archive; every other file is a photo of a receipt.
+                    if id == 66 {
+                        return (
+                            [(axum::http::header::CONTENT_DISPOSITION, "attachment; filename=start.command".to_owned())],
+                            b"#!/bin/sh\n".to_vec(),
+                        );
+                    }
+                    (
+                        [(axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=bon-{id}.jpg; filename*=UTF-8''bon-{id}.jpg"))],
+                        vec![0xFFu8, 0xD8, 0xFF, 0xE0],
+                    )
+                }),
+            )
+            .route(
                 "/v1/api/folder/{id}",
                 get(|Path(id): Path<u64>| async move { axum::Json(json!({"id": id, "naam": format!("bon-{id}.pdf"), "soort": "F", "isDeleted": id == 3, "koppelCount": 0})) }).delete(
                     move |Path(id): Path<u64>| {
@@ -1148,6 +1723,155 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://127.0.0.1:{port}/v1/api/")
+    }
+
+    #[tokio::test]
+    async fn the_files_of_a_mutatie_are_listed_and_saved_on_a_read_only_account() {
+        use crate::accounts::{AccountInput, Rights, Store};
+        let changes: Changes = Arc::default();
+        let jar = Arc::new(crate::state::testing::FakeJar::default());
+        let state = Arc::new(crate::state::testing::state_with(
+            jar,
+            &books_mock(changes.clone()).await,
+        ));
+        let account = state
+            .accounts
+            .add(AccountInput {
+                label: "Studio Noord".into(),
+                username: "lisa@studionoord.example".into(),
+                store: Store::System,
+                op_ref: None,
+                op_title: None,
+                op_vault: None,
+                rights: Rights::OFF,
+            })
+            .unwrap();
+        state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
+        state.add_session(account.id, &account.label, "sessie");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mcp = router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
+        tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{PATH}");
+        let post = |body: serde_json::Value, session: Option<String>| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&body);
+            if let Some(s) = session {
+                request = request.header("mcp-session-id", s);
+            }
+            request.send()
+        };
+        let init = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        let call = |tool: &'static str, arguments: serde_json::Value| {
+            let request = post(
+                serde_json::json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}),
+                session.clone(),
+            );
+            async move {
+                let body = request.await.unwrap().text().await.unwrap();
+                let answer = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .unwrap_or_else(|| {
+                        body.lines()
+                            .filter_map(|l| l.strip_prefix("data:"))
+                            .filter_map(|d| {
+                                serde_json::from_str::<serde_json::Value>(d.trim()).ok()
+                            })
+                            .find(|v| v.get("id").is_some())
+                            .unwrap_or_else(|| panic!("no JSON-RPC answer in {body}"))
+                    });
+                (
+                    answer["result"]["isError"] == true,
+                    answer["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            }
+        };
+
+        // Listing asks by mutatienummer with koppelSoort MUT (the mock refuses anything else).
+        let (is_error, text) = call("mutatie_bijlagen", serde_json::json!({"nr": 16})).await;
+        assert!(!is_error, "{text}");
+        let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            answer["data"]["data"],
+            serde_json::json!([{"id": 5, "naam": "bon-5.jpg", "datum": "2026-11-03T10:00:00", "grootte": 4}])
+        );
+        assert_eq!(answer["bron"], "folder/gekoppeldgridtable");
+        // A mutatie without files: an empty list, not an error. Also when the answer has no body at all.
+        for nr in [17, 18] {
+            let (is_error, text) = call("mutatie_bijlagen", serde_json::json!({"nr": nr})).await;
+            assert!(!is_error, "{text}");
+            let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(answer["data"]["data"], serde_json::json!([]), "{nr}");
+            assert_eq!(answer["rijen"], 0, "{nr}");
+        }
+
+        // Downloading saves the file in the folder given, never over another one, and answers where it is.
+        let dir = std::env::temp_dir().join(format!("ebmcp-bijlage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for want in ["bon-5.jpg", "bon-5 (2).jpg"] {
+            let (is_error, text) = call(
+                "bijlage_downloaden",
+                serde_json::json!({"id": 5, "map": dir.to_str().unwrap()}),
+            )
+            .await;
+            assert!(!is_error, "{text}");
+            let saved = &serde_json::from_str::<serde_json::Value>(&text).unwrap()["data"];
+            assert_eq!(saved["bestandsnaam"], want);
+            assert_eq!(saved["content_type"], "image/jpeg");
+            assert_eq!(saved["bytes"], 4);
+            assert_eq!(saved["pad"], dir.join(want).to_str().unwrap());
+            assert_eq!(
+                std::fs::read(dir.join(want)).unwrap(),
+                [0xFF, 0xD8, 0xFF, 0xE0]
+            );
+        }
+        let (is_error, text) = call(
+            "bijlage_downloaden",
+            serde_json::json!({"id": 5, "map": "Downloads"}),
+        )
+        .await;
+        assert!(is_error && text.contains("volledig pad"), "{text}");
+        // A file that is no document is refused in a folder the client named, and nothing is written there.
+        let before = std::fs::read_dir(&dir).unwrap().count();
+        let (is_error, text) = call(
+            "bijlage_downloaden",
+            serde_json::json!({"id": 66, "map": dir.to_str().unwrap()}),
+        )
+        .await;
+        assert!(
+            is_error && text.contains("start.command") && text.contains("Laat map weg"),
+            "{text}"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Both are reads: no approval, and nothing changed at e-Boekhouden.
+        assert_eq!(state.approvals.count(), 0);
+        assert!(changes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

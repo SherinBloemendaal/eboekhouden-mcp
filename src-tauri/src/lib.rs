@@ -378,6 +378,52 @@ fn approvals_history(
 }
 
 /// One proposal with its technical data: the tool's arguments, the request body and the result.
+/// Akkoord: the file a waiting proposal sends along, for its preview: the bytes the tool read, which are what
+/// goes out after Goedkeuren. Only the file of a proposal that still waits; any other id is refused.
+#[tauri::command]
+fn approval_file(
+    app_state: Shared<'_, AppState>,
+    id: u64,
+) -> Result<approvals::FilePreview, String> {
+    let (file, sent) = app_state
+        .approvals
+        .waiting_file(id)
+        .ok_or_else(|| "Dit voorstel wacht niet meer of heeft geen bestand.".to_owned())?;
+    Ok(file.preview(&sent))
+}
+
+/// Akkoord: opens the file of a waiting proposal in its own app (Voorvertoning, the PDF reader), or shows it in
+/// Finder or Explorer with `reveal`. Only the file of a proposal that still waits, and opening only a PDF or
+/// an image: the AI client named the file, and opening anything else could run it.
+#[tauri::command]
+fn approval_file_open(
+    app: AppHandle,
+    app_state: Shared<'_, AppState>,
+    id: u64,
+    reveal: bool,
+) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let (file, _) = app_state
+        .approvals
+        .waiting_file(id)
+        .ok_or_else(|| "Dit voorstel wacht niet meer of heeft geen bestand.".to_owned())?;
+    if !std::path::Path::new(&file.path).is_file() {
+        return Err(format!("{} staat niet meer op {}.", file.name, file.path));
+    }
+    if !reveal && !file.openable {
+        return Err(format!(
+            "{} is geen pdf of afbeelding: zo'n bestand opent EB MCP niet zelf. Bekijk het in zijn map.",
+            file.name
+        ));
+    }
+    if reveal {
+        app.opener().reveal_item_in_dir(&file.path)
+    } else {
+        app.opener().open_path(&file.path, None::<&str>)
+    }
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn approval_get(app_state: Shared<'_, AppState>, id: u64) -> Result<approvals::Detail, String> {
     app_state
@@ -605,18 +651,61 @@ impl Arrivals {
     }
 }
 
-/// The notification for proposals that came up together: its title and its text.
+/// The notification for proposals that came up together: its title and its text, each change with its
+/// account.
 fn notification_text(fresh: &[approvals::Proposal]) -> (String, String) {
     const SHOWN: usize = 3;
     let title = match fresh.len() {
         1 => "EB MCP: 1 wijziging wacht op je akkoord".to_owned(),
         n => format!("EB MCP: {n} wijzigingen wachten op je akkoord"),
     };
-    let mut lines: Vec<String> = fresh.iter().take(SHOWN).map(|p| p.title.clone()).collect();
+    let mut lines: Vec<String> = fresh
+        .iter()
+        .take(SHOWN)
+        .map(|p| format!("{} ({})", p.title, p.account))
+        .collect();
     if fresh.len() > SHOWN {
         lines.push(format!("en nog {}", fresh.len() - SHOWN));
     }
     (title, lines.join("\n"))
+}
+
+/// Where each notification of this run leads, by the id it was shown with, so a click on an older one opens
+/// its own proposal and not that of the newest. Only the last few are kept; a click the system reports
+/// without its notification, or on one that is no longer kept, leads to the Akkoord page with all that wait.
+#[derive(Default)]
+struct NotificationRoutes {
+    next: i32,
+    routes: std::collections::VecDeque<(i32, String)>,
+}
+
+impl NotificationRoutes {
+    const KEPT: usize = 32;
+
+    /// Keeps the route of a notification that is about to show and gives the id to show it with.
+    fn add(&mut self, route: String) -> i32 {
+        self.next = self.next.checked_add(1).unwrap_or(1);
+        if self.routes.len() == Self::KEPT {
+            self.routes.pop_front();
+        }
+        self.routes.push_back((self.next, route));
+        self.next
+    }
+
+    /// The route of the notification with this id.
+    fn route(&self, id: Option<i32>) -> String {
+        id.and_then(|id| self.routes.iter().find(|(kept, _)| *kept == id))
+            .map_or_else(|| APPROVALS_ROUTE.to_owned(), |(_, route)| route.clone())
+    }
+}
+
+/// Where a click on the notification for `fresh` leads: the proposal itself when there is one, else the
+/// Akkoord page with all that wait.
+fn notification_route(fresh: &[approvals::Proposal]) -> String {
+    match fresh {
+        [one] => format!("{APPROVALS_ROUTE}?open={}", one.id),
+        _ => APPROVALS_ROUTE.to_owned(),
+    }
 }
 
 /// Whether one of EB MCP's windows has the focus: then the user sees the proposal in the app already.
@@ -629,7 +718,7 @@ fn any_window_focused(app: &AppHandle) -> bool {
 
 /// A system notification for proposals that came up. When notifications are not allowed or not available,
 /// nothing happens: the count in the menu bar and the app itself show what waits.
-fn notify_waiting(app: &AppHandle, fresh: &[approvals::Proposal]) {
+fn notify_waiting(app: &AppHandle, fresh: &[approvals::Proposal], id: i32) {
     use tauri::plugin::PermissionState;
     use tauri_plugin_notification::NotificationExt;
     let notification = app.notification();
@@ -646,7 +735,7 @@ fn notify_waiting(app: &AppHandle, fresh: &[approvals::Proposal]) {
         return;
     }
     let (title, body) = notification_text(fresh);
-    if let Err(e) = notification.builder().title(title).body(body).show() {
+    if let Err(e) = notification.builder().id(id).title(title).body(body).show() {
         log::info!("no notification for a waiting change: {e}");
     }
 }
@@ -868,11 +957,15 @@ fn settings_get(settings: Shared<'_, SettingsStore>) -> Settings {
 fn settings_set(
     app: AppHandle,
     settings: Shared<'_, SettingsStore>,
+    app_state: Shared<'_, AppState>,
     value: Settings,
 ) -> Result<(), String> {
     let before = settings.get();
     let (appearance, dock) = (value.appearance, value.show_in_dock);
+    let wait = approval_wait(&value);
     settings.set(value)?;
+    // Tool calls that start from now on wait this long; a call that waits already keeps its own limit.
+    app_state.set_approval_wait(wait);
     // Only what changed: setting the Dock policy deactivates the app and brings the window back
     // (apply_dock), which should not happen when only the idle time changed.
     if appearance != before.appearance {
@@ -882,6 +975,13 @@ fn settings_set(
         apply_dock(&app, dock);
     }
     Ok(())
+}
+
+/// How long a tool call waits for the user's approval under these settings (state.rs, tools.rs).
+fn approval_wait(settings: &Settings) -> Option<Duration> {
+    settings
+        .wait_for_approval
+        .then(|| Duration::from_secs(u64::from(settings.wait_minutes) * 60))
 }
 
 /// macOS: with the Dock icon EB MCP is a regular app (Dock, Cmd+Tab); without it only the menu-bar
@@ -1454,6 +1554,8 @@ pub fn run() {
             approvals_decide_all,
             approvals_history,
             approval_get,
+            approval_file,
+            approval_file_open,
             approvals_export,
             open_log_dir,
             open_op_install,
@@ -1520,6 +1622,7 @@ pub fn run() {
             // server takes its first call. What still waited for an answer when EB MCP stopped lapses.
             app_state.log.open(logstore::log_file(&dir));
             app_state.approvals.open(approvals::history_file(&dir));
+            app_state.set_approval_wait(approval_wait(&settings.get()));
             // Calls logged by 0.4.0 carry no wait yet: their proposals' records know when it began and ended.
             for detail in app_state.approvals.since(0) {
                 let record = &detail.record;
@@ -1548,19 +1651,26 @@ pub fn run() {
                 }
             });
 
-            // A click on a notification of a waiting change opens the main window at Akkoord.
+            // A click on a notification of a waiting change opens the main window at Akkoord, on the proposal
+            // when that notification was about one. An older notification still leads to its own proposal.
+            let clicked = Arc::new(std::sync::Mutex::new(NotificationRoutes::default()));
             {
                 use tauri_plugin_notification::NotificationExt;
-                let handle = app.handle().clone();
-                let _ = app
-                    .notification()
-                    .on_action(move |_| open_main(handle.clone(), Some(APPROVALS_ROUTE.into())));
+                let (handle, clicked) = (app.handle().clone(), clicked.clone());
+                let _ = app.notification().on_action(move |performed| {
+                    let route = clicked
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .route(performed.notification().map(|n| n.id()));
+                    open_main(handle.clone(), Some(route));
+                });
             }
 
             // Proposals that came up while no EB MCP window had the focus get a notification; those close
             // together share one.
             let (arrived, mut arrivals) = tokio::sync::mpsc::unbounded_channel::<()>();
-            let (handle, notifying) = (app.handle().clone(), app_state.clone());
+            let (handle, notifying, choices) =
+                (app.handle().clone(), app_state.clone(), settings.clone());
             tauri::async_runtime::spawn(async move {
                 let mut seen = Arrivals {
                     seen: notifying.approvals.last_id(),
@@ -1570,15 +1680,24 @@ pub fn run() {
                     while arrivals.try_recv().is_ok() {}
                     let fresh =
                         seen.fresh(&notifying.approvals.list(), notifying.approvals.last_id());
-                    if !fresh.is_empty() && !any_window_focused(&handle) {
-                        notify_waiting(&handle, &fresh);
+                    // Off in Instellingen: what came up is still marked as seen, so turning it on again
+                    // does not announce old proposals.
+                    if !fresh.is_empty()
+                        && choices.get().notify_approvals
+                        && !any_window_focused(&handle)
+                    {
+                        let id = clicked
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .add(notification_route(&fresh));
+                        notify_waiting(&handle, &fresh, id);
                     }
                 }
             });
 
             // Forward state changes to every window. A change of the queue or the history also updates the
             // count in the menu bar, may lead to a notification and is saved. The app never takes the focus
-            // for it: the AI client does not wait for the answer.
+            // for it: the user answers when it suits them, also when an AI client waits in its call.
             let mut events = app_state.events.subscribe();
             let handle = app.handle().clone();
             let watching = app_state.clone();
@@ -1763,6 +1882,7 @@ mod tests {
             lines: Vec::new(),
             danger: false,
             asked_at: 1,
+            file: None,
         }
     }
 
@@ -1891,7 +2011,7 @@ mod tests {
             notification_text(&fresh),
             (
                 "EB MCP: 2 wijzigingen wachten op je akkoord".to_owned(),
-                "Eerste\nTweede".to_owned()
+                "Eerste (Studio Noord)\nTweede (Studio Noord)".to_owned()
             )
         );
         assert!(seen.fresh(&waiting, 7).is_empty(), "announced once");
@@ -1900,11 +2020,32 @@ mod tests {
             notification_text(&one),
             (
                 "EB MCP: 1 wijziging wacht op je akkoord".to_owned(),
-                "Derde".to_owned()
+                "Derde (Studio Noord)".to_owned()
             )
         );
         let many: Vec<_> = (10..15).map(|n| proposal(n, &format!("Nr {n}"))).collect();
-        assert_eq!(notification_text(&many).1, "Nr 10\nNr 11\nNr 12\nen nog 2");
+        assert_eq!(
+            notification_text(&many).1,
+            "Nr 10 (Studio Noord)\nNr 11 (Studio Noord)\nNr 12 (Studio Noord)\nen nog 2"
+        );
+        // A click opens the one proposal, or the page with all of them.
+        assert_eq!(notification_route(&one), "/akkoord?open=8");
+        assert_eq!(notification_route(&many), "/akkoord");
+        // Each notification keeps its own route: a click on an older one opens its own proposal.
+        let mut routes = NotificationRoutes::default();
+        let first = routes.add("/akkoord?open=8".into());
+        let second = routes.add("/akkoord?open=9".into());
+        assert_ne!(first, second);
+        assert_eq!(routes.route(Some(first)), "/akkoord?open=8");
+        assert_eq!(routes.route(Some(second)), "/akkoord?open=9");
+        // A click without its notification, or on one long gone, opens the page with all that wait.
+        assert_eq!(routes.route(None), "/akkoord");
+        assert_eq!(routes.route(Some(999)), "/akkoord");
+        for n in 0..NotificationRoutes::KEPT {
+            routes.add(format!("/akkoord?open={}", 100 + n));
+        }
+        assert_eq!(routes.route(Some(first)), "/akkoord");
+        assert_eq!(routes.routes.len(), NotificationRoutes::KEPT);
     }
 
     #[test]
