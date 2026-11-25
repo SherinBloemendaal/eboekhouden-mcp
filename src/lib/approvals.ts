@@ -31,6 +31,8 @@ export interface ApprovalRecord extends Proposal {
   decision: ApprovalDecision | null
   status: ApprovalStatus
   error: string | null
+  /** What did not come of a change that is done: the change stands, a part that goes with it (an attachment) does not. */
+  note?: string | null
   /** The EB MCP version that took the proposal in. */
   version: string
   /** Answered with Alles goedkeuren or Alles weigeren rather than on its own. */
@@ -141,7 +143,7 @@ export const approvalDetail = (id: number): Promise<ApprovalDetail> => invoke<Ap
 /** Writes the history to a .jsonl.gz file and gives its absolute path. */
 export const exportApprovals = (): Promise<string> => invoke<string>('approvals_export')
 
-export type StatusTone = 'ok' | 'bad' | 'run' | 'off'
+export type StatusTone = 'ok' | 'bad' | 'warn' | 'run' | 'off'
 
 export const STATUSES: { value: ApprovalStatus; label: string; tone: StatusTone }[] = [
   { value: 'waiting', label: 'Wacht', tone: 'run' },
@@ -156,6 +158,11 @@ export const STATUSES: { value: ApprovalStatus; label: string; tone: StatusTone 
 
 export function statusOf(status: ApprovalStatus): { label: string; tone: StatusTone } {
   return STATUSES.find((s) => s.value === status) ?? { label: status, tone: 'off' }
+}
+
+/** The status of a record as its chip shows it: a change that is done but left a part undone says so. */
+export function recordStatus(record: Pick<ApprovalRecord, 'status' | 'note'>): { label: string; tone: StatusTone } {
+  return record.status === 'done' && record.note ? { label: 'Deels uitgevoerd', tone: 'warn' } : statusOf(record.status)
 }
 
 /** How the detail names the answer, and whether it was given to all waiting changes at once. */
