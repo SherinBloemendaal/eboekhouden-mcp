@@ -86,6 +86,23 @@ async fn eboekhouden(seen: Seen) -> String {
         .route("/v1/api/vasteactivamutatie/boekingencount", get(|| async { axum::Json(json!(1)) }))
         .route("/v1/api/import/countImport", get(|| async { axum::Json(json!(13)) }))
         .route(
+            // The unprocessed bank lines: one, in the shape the real grid has.
+            "/v1/api/import/gridtable",
+            get(|| async {
+                axum::Json(json!({
+                    "colMetadata": [{"name": "id"}, {"name": "datum"}, {"name": "rekening"}, {"name": "mutDatum"}, {"name": "mutBedrag"}, {"name": "mutOmschrijving"}, {"name": "mutFactuur"}, {"name": "grootboekId"}, {"name": "opmerking"}, {"name": "hasFiles"}, {"name": "verwerkFailureReason"}],
+                    "data": [[465233844u64, "2026-11-10T08:00:00", "NL00BANK0123456789", "2026-11-06T00:00:00", -2.0, "BCK*Parkeergarage Dams Groningen", "", 11, null, null, null]],
+                    "rowCount": 1, "offset": 0, "limit": 2000
+                }))
+            }),
+        )
+        .route(
+            "/v1/api/import/opmerking/465233844",
+            get(|| async {
+                axum::Json(json!({"id": 465233844u64, "administratieId": 9001, "mutOmschrijving": "BCK*Parkeergarage Dams Groningen", "opmerking": null}))
+            }),
+        )
+        .route(
             "/v1/api/importregel/gridtable",
             get(|| async { axum::Json(json!({"colMetadata": [{"name": "id"}], "data": [[1]], "rowCount": 4})) }),
         )
@@ -658,4 +675,85 @@ async fn the_beginbalans_changes_only_in_balance_and_always_asks() {
         sent[0]["body"]["datum"],
         json!({"day": 1, "month": 1, "year": 2026})
     );
+}
+
+#[tokio::test]
+async fn a_bankregel_opmerking_goes_out_only_when_approved() {
+    let h = Harness::new().await;
+    let opmerking = json!({"bankregel_id": 465233844u64, "opmerking": "wacht op factuur"});
+
+    // Writing is off: refused, nothing asked.
+    let (is_error, text) = h
+        .call("bankregel_opmerking_wijzigen", opmerking.clone())
+        .await;
+    assert!(is_error && text.contains("alleen-lezen"), "{text}");
+    assert_eq!(h.state.approvals.count(), 0);
+
+    // A line that is not among the unprocessed ones is refused before anything is asked.
+    h.set_write(Rights::ASK);
+    let (is_error, text) = h
+        .call(
+            "bankregel_opmerking_wijzigen",
+            json!({"bankregel_id": 1, "opmerking": "x"}),
+        )
+        .await;
+    assert!(
+        is_error && text.contains("Bankregel 1 staat niet bij de onverwerkte bankregels"),
+        "{text}"
+    );
+    assert_eq!(h.state.approvals.count(), 0);
+
+    // It waits and shows the line with the old and the new comment; refused, nothing goes out.
+    let (is_error, text) = h
+        .call("bankregel_opmerking_wijzigen", opmerking.clone())
+        .await;
+    assert!(!is_error, "{text}");
+    let id = waiting_id(&text);
+    let proposal = h.proposal_up();
+    assert_eq!(proposal.title, "Opmerking bij bankregel: -2,00");
+    assert!(!proposal.danger);
+    let lines: Vec<(&str, &str)> = proposal
+        .lines
+        .iter()
+        .map(|l| (l.label.as_str(), l.value.as_str()))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (
+                "Bankregel",
+                "06-11-2026, -2,00: BCK*Parkeergarage Dams Groningen (id 465233844)"
+            ),
+            ("Opmerking nu", "(geen)"),
+            ("Nieuwe opmerking", "wacht op factuur"),
+        ]
+    );
+    assert!(h.state.approvals.decide(id, false, 1));
+    assert_eq!(h.settled(id).await.status, Status::Refused);
+    assert!(h.seen().is_empty(), "a refused change sends nothing");
+
+    // Approved: the model e-Boekhouden gave goes back whole, with only the comment changed.
+    let (_, text) = h
+        .call("bankregel_opmerking_wijzigen", opmerking.clone())
+        .await;
+    let id = waiting_id(&text);
+    assert!(h.state.approvals.decide(id, true, 2));
+    {
+        let r = h.settled(id).await;
+        assert_eq!(r.status, Status::Done, "{r:?}");
+    }
+    let sent = json!({"method": "PUT", "path": "import/opmerking", "query": null, "body": {
+        "id": 465233844u64, "administratieId": 9001, "mutOmschrijving": "BCK*Parkeergarage Dams Groningen",
+        "opmerking": "wacht op factuur"}});
+    assert_eq!(h.seen(), vec![sent.clone()]);
+
+    // Adding and changing without approval: it goes straight through.
+    h.set_write(Rights::AUTO);
+    let (is_error, text) = h.call("bankregel_opmerking_wijzigen", opmerking).await;
+    assert!(!is_error, "{text}");
+    assert!(
+        text.contains("Opmerking bij de bankregel opgeslagen"),
+        "{text}"
+    );
+    assert_eq!(h.seen(), vec![sent.clone(), sent]);
 }

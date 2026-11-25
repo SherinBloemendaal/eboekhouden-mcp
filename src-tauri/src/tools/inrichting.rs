@@ -5,7 +5,8 @@
 //!
 //! Every request shape comes from e-Boekhouden's own web app (the public Angular bundle, 2026-11-12):
 //! - `importregels.rs`: the screens Boekhouden > Importeren > Automatische importregels (`app-importregels-list`,
-//!   `app-importregels-form`) and the link "Alle regels opnieuw automatisch verwerken" (`app-import-list`).
+//!   `app-importregels-form`), the link "Alle regels opnieuw automatisch verwerken" and the opmerking of one bank
+//!   line (`app-import-list`).
 //! - `vaste_activa.rs`: Beheer > Vaste activa (`app-vaste-activa-form`, the list with "Afschrijvingen boeken" and
 //!   the Afschrijfschema of one asset, `app-vaste-activa-mutatie-list`).
 //! - `beginbalans.rs`: Beheer > Beginbalans (`app-beginbalans-form`).
@@ -40,6 +41,7 @@ pub(super) const WRITES: &[&str] = &[
     "importregel_wijzigen",
     "importregel_verwijderen",
     "importregels_verwerken",
+    "bankregel_opmerking_wijzigen",
     "vastactief_toevoegen",
     "vastactief_wijzigen",
     "vastactief_verwijderen",

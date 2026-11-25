@@ -342,6 +342,7 @@ describe('the queue', () => {
     expect(kind('archief_uploaden')).toEqual({ icon: 'plus', tone: 'accent' })
     expect(kind('relatie_wijzigen')).toEqual({ icon: 'pencil', tone: 'neutral' })
     expect(kind('archief_koppelen')).toEqual({ icon: 'pencil', tone: 'neutral' })
+    expect(kind('bankregel_opmerking_wijzigen')).toEqual({ icon: 'pencil', tone: 'neutral' })
     expect(kind('relatie_verwijderen')).toEqual({ icon: 'trash', tone: 'neutral' })
     expect(kind('factuur_mailen')).toEqual({ icon: 'mail', tone: 'neutral' })
     expect(kind('factuur_crediteren')).toEqual({ icon: 'file-text', tone: 'neutral' })

@@ -590,8 +590,13 @@ impl Bankregel {
         })
     }
 
-    /// The line as the proposal shows it: enough to know it from the statement.
+    /// The line as the proposal of a booking shows it: enough to know it from the statement.
     fn shown(&self) -> String {
+        format!("{}; deze boeking verwerkt hem", self.label())
+    }
+
+    /// Date, amount, description and id: enough to know the line from the statement.
+    pub fn label(&self) -> String {
         const MAX: usize = 120;
         let datum = self
             .datum
@@ -601,11 +606,7 @@ impl Bankregel {
         if self.omschrijving.chars().count() > MAX {
             text.push('…');
         }
-        format!(
-            "{datum}, {}: {text} (id {}); deze boeking verwerkt hem",
-            euro(self.bedrag),
-            self.id
-        )
+        format!("{datum}, {}: {text} (id {})", euro(self.bedrag), self.id)
     }
 }
 

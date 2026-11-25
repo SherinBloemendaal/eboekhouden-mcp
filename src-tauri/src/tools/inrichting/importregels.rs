@@ -15,6 +15,10 @@
 //! - Btw codes: the form takes `btwinfo/info`, keeps the codes valid today (`filterInfo(info, {date: today})`) and
 //!   only those with `simpleExtended == 'S'` unless `setting/administratie.use-extended-btwcodes` is true or the user
 //!   is an accountant (which EB MCP cannot see; it keeps to the setting).
+//! - The comment on one unprocessed bank line (the speech bubble in the list of Boekhouden > Importeren): `GET
+//!   import/opmerking/{id}` -> `{id, administratieId, mutOmschrijving, opmerking}`, and `PUT import/opmerking` with
+//!   that same object, `opmerking` changed (`updateOpmerking` in the import service). Both checked against a real
+//!   administration on 2026-11-24; `bankregels` shows the new text in its `opmerking` column right after.
 
 use super::*;
 
@@ -89,6 +93,16 @@ impl RegelSoort {
             BijAf::Afschrijving => Self::GeldUitgegeven,
         }
     }
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BankregelOpmerkingWijzigenArgs {
+    /// Id van een onverwerkte bankregel (uit bankregels).
+    pub bankregel_id: u64,
+    /// De nieuwe opmerking, bijvoorbeeld "wacht op factuur". Vervangt de opmerking die er staat; een lege tekst wist hem.
+    pub opmerking: String,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -557,6 +571,61 @@ fn importregels_verwerken_built(niet_verwerkt: u64, regels: Option<u64>) -> Resu
     })
 }
 
+/// The comment of `bankregel` set to `opmerking`: the opmerking model as e-Boekhouden gave it (`GET
+/// import/opmerking/{id}`), with only `opmerking` changed, is what goes back. An empty text clears it.
+fn bankregel_opmerking_built(
+    bankregel: &write::Bankregel,
+    model: &Value,
+    opmerking: &str,
+) -> Result<Built, String> {
+    let unknown = || {
+        format!(
+            "e-Boekhouden gaf de opmerking van bankregel {} in een onbekende vorm terug; er is niets gewijzigd",
+            bankregel.id
+        )
+    };
+    let mut body = model.as_object().cloned().ok_or_else(unknown)?;
+    if body.get("id").and_then(Value::as_u64) != Some(bankregel.id) {
+        return Err(unknown());
+    }
+    let nu = body
+        .get("opmerking")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let nieuw = opmerking.trim();
+    if nu == nieuw {
+        return Err(if nieuw.is_empty() {
+            "Deze bankregel heeft geen opmerking: er valt niets te wissen".into()
+        } else {
+            "Deze bankregel heeft deze opmerking al: er valt niets te wijzigen".into()
+        });
+    }
+    body.insert("opmerking".into(), json!(nieuw));
+    let shown = |text: &str| {
+        if text.is_empty() {
+            "(geen)".to_owned()
+        } else {
+            text.to_owned()
+        }
+    };
+    let what = if nieuw.is_empty() {
+        "Opmerking bij bankregel wissen"
+    } else {
+        "Opmerking bij bankregel"
+    };
+    Ok(Built {
+        body: Value::Object(body),
+        title: format!("{what}: {}", write::euro(bankregel.bedrag)),
+        lines: vec![
+            line("Bankregel", bankregel.label()),
+            line("Opmerking nu", shown(&nu)),
+            line("Nieuwe opmerking", shown(nieuw)),
+        ],
+    })
+}
+
 /// The setting e-Boekhouden's importregel form reads to offer the extended btw codes.
 const UITGEBREIDE_BTW: &str = "setting/administratie.use-extended-btwcodes";
 
@@ -803,6 +872,47 @@ impl EbMcp {
                 let built = importregels_verwerken_built(niet_verwerkt, aantal)?;
                 this.approve(&run, TOOL, &built, true).await?;
                 this.change(&run, "POST", "import/verwerk", None).await
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "De opmerking bij één onverwerkte bankregel zetten, wijzigen of wissen, zoals het opmerkingicoon in de lijst van Boekhouden > Importeren in e-Boekhouden, bijvoorbeeld \"wacht op factuur\". De bankregel zelf blijft onverwerkt staan; bankregels toont de opmerking daarna in het veld opmerking. Een lege opmerking wist hem. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        annotations(
+            title = "Opmerking bij bankregel",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn bankregel_opmerking_wijzigen(
+        &self,
+        Parameters(args): Parameters<BankregelOpmerkingWijzigenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "bankregel_opmerking_wijzigen";
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
+            "Opmerking bij de bankregel opgeslagen; bankregels toont hem in het veld opmerking",
+            move |this, run, args| async move {
+                // Only an unprocessed line: the same lookup as mutatie_toevoegen with bankregel_id.
+                let bankregel = this.bankregel(&run, args.bankregel_id).await?;
+                let model = this
+                    .fetch(
+                        &run,
+                        &format!("import/opmerking/{}", args.bankregel_id),
+                        Vec::new(),
+                    )
+                    .await?;
+                let built = bankregel_opmerking_built(&bankregel, &model, &args.opmerking)?;
+                this.approve(&run, TOOL, &built, false).await?;
+                this.change_done(&run, "PUT", "import/opmerking", Some(&built.body))
+                    .await
             },
         )
         .await
@@ -1175,5 +1285,59 @@ mod tests {
                 .unwrap_err()
                 .contains("geen niet verwerkte")
         );
+    }
+
+    #[test]
+    fn a_bankregel_opmerking_changes_only_the_opmerking_of_the_model() {
+        let bankregel = write::Bankregel {
+            id: 465233844,
+            datum: Some((2026, 11, 6)),
+            bedrag: -2.0,
+            omschrijving: "BCK*Parkeergarage Dams Groningen".into(),
+            grootboek_id: Some(11),
+        };
+        let model = json!({"id": 465233844u64, "administratieId": 9001, "mutOmschrijving": "BCK*Parkeergarage Dams Groningen", "opmerking": null});
+
+        let built = bankregel_opmerking_built(&bankregel, &model, "  wacht op factuur ").unwrap();
+        assert_eq!(
+            built.body,
+            json!({"id": 465233844u64, "administratieId": 9001, "mutOmschrijving": "BCK*Parkeergarage Dams Groningen", "opmerking": "wacht op factuur"})
+        );
+        assert_eq!(built.title, "Opmerking bij bankregel: -2,00");
+        assert_eq!(
+            label_values(&built),
+            vec![
+                (
+                    "Bankregel".into(),
+                    "06-11-2026, -2,00: BCK*Parkeergarage Dams Groningen (id 465233844)".into()
+                ),
+                ("Opmerking nu".into(), "(geen)".into()),
+                ("Nieuwe opmerking".into(), "wacht op factuur".into()),
+            ]
+        );
+
+        // An empty text clears it.
+        let mut with = model.clone();
+        with["opmerking"] = json!("wacht op factuur");
+        let built = bankregel_opmerking_built(&bankregel, &with, "").unwrap();
+        assert_eq!(built.body["opmerking"], "");
+        assert_eq!(built.title, "Opmerking bij bankregel wissen: -2,00");
+        assert!(label_values(&built).contains(&("Nieuwe opmerking".into(), "(geen)".into())));
+
+        // Nothing to change, or a model of another line or in another shape: refused.
+        assert!(
+            bankregel_opmerking_built(&bankregel, &with, "wacht op factuur")
+                .unwrap_err()
+                .contains("al")
+        );
+        assert!(
+            bankregel_opmerking_built(&bankregel, &model, " ")
+                .unwrap_err()
+                .contains("niets te wissen")
+        );
+        let mut other = model.clone();
+        other["id"] = json!(1);
+        assert!(bankregel_opmerking_built(&bankregel, &other, "x").is_err());
+        assert!(bankregel_opmerking_built(&bankregel, &json!(true), "x").is_err());
     }
 }
