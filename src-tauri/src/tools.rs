@@ -2188,6 +2188,37 @@ impl EbMcp {
     }
 
     /// An invoice or subscription with its lines, as the tools that read or change one need it.
+    /// The row of one invoice in `factuur/normaal/gridtable`, which is where e-Boekhouden says whether it is
+    /// processed (`factuur/{id}` does not). The grid takes no filter on id, so the pages are walked, at the size
+    /// e-Boekhouden's own page asks for.
+    async fn factuur_row(&self, run: &Run, id: u64) -> Result<Value, String> {
+        const PAGE: u64 = 2000;
+        let mut offset = 0;
+        loop {
+            let query = vec![
+                ("offset".to_owned(), offset.to_string()),
+                ("limit".to_owned(), PAGE.to_string()),
+                ("orderBy".to_owned(), String::new()),
+                ("sortDirection".to_owned(), String::new()),
+            ];
+            let page = named_rows(self.fetch(run, "factuur/normaal/gridtable", query).await?);
+            if let Some(found) = write::factuur_row(&page, id) {
+                return Ok(found.clone());
+            }
+            let rows = page
+                .get("data")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len) as u64;
+            let total = page.get("rowCount").and_then(Value::as_u64).unwrap_or(0);
+            offset += rows;
+            if rows == 0 || offset >= total {
+                return Err(format!(
+                    "Factuur {id} staat niet bij de verkoopfacturen van deze administratie: neem het id uit facturen. Er is niets geboekt."
+                ));
+            }
+        }
+    }
+
     async fn with_items(&self, run: &Run, path: &str, id: u64) -> Result<(Value, Value), String> {
         let now = self.fetch(run, &format!("{path}/{id}"), Vec::new()).await?;
         let items = self
@@ -2199,6 +2230,11 @@ impl EbMcp {
             .await?;
         Ok((now, items))
     }
+}
+
+/// The mutatienummer of an invoice in an answer of `mutatie/gridtable`, when that answer came and has it.
+fn factuur_mutatie(page: Result<Value, String>, id: u64) -> Option<u64> {
+    write::factuur_mutatie_nr(&named_rows(page.ok()?), id)
 }
 
 /// A plausible e-mail address: enough to stop a slip before it reaches e-Boekhouden, which does the real check.
@@ -3997,6 +4033,60 @@ impl EbMcp {
     }
 
     #[tool(
+        description = "Een bestaande verkoopfactuur die nog niet verwerkt is alsnog verwerken in de boekhouding, op id (uit facturen, waar verwerkt dan leeg is), zoals Verwerken in de factuurlijst van e-Boekhouden doet: er komt een mutatie Factuur verstuurd met de omzet en btw van de factuurregels op de debiteurenrekening, en de factuur krijgt zijn verwerkdatum. Daarna kan een betaling aan de factuur gekoppeld worden. data.mutNr is het mutatienummer. Een factuur die al verwerkt is wordt geweigerd; factuur_wijzigen verwerkt een factuur niet. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
+        annotations(
+            title = "Factuur verwerken",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn factuur_verwerken(
+        &self,
+        Parameters(args): Parameters<write::FactuurVerwerkenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        const TOOL: &str = "factuur_verwerken";
+        let account = args.account.clone();
+        self.write_tool(
+            &context,
+            TOOL,
+            account.as_deref(),
+            args,
+            "Factuur verwerkt; data.mutNr is het mutatienummer",
+            move |this, run, args| async move {
+                let row = this.factuur_row(&run, args.id).await?;
+                let books = this.books(&run).await?;
+                let built = write::factuur_verwerk(args.id, &row, &books)?;
+                this.approve(&run, TOOL, &built, false).await?;
+                // The invoice may have been processed while the proposal waited: look again before it goes out.
+                let nummer = write::factuur_onverwerkt(&this.factuur_row(&run, args.id).await?)?;
+                let answer = this
+                    .change(&run, "POST", "factuur/bulkverwerk", Some(&built.body))
+                    .await?;
+                write::factuur_verwerkt(&answer, &nummer)?;
+                // The booking stands by now: a number that cannot be read is no reason to call it failed.
+                let query = grid(Some(50), None).map(|mut q| {
+                    q.push(("factuur".to_owned(), nummer.clone()));
+                    q
+                })?;
+                let mut done = json!({"id": args.id, "nummer": nummer, "verwerkt": true});
+                match factuur_mutatie(this.fetch(&run, "mutatie/gridtable", query).await, args.id) {
+                    Some(nr) => done["mutNr"] = json!(nr),
+                    None => {
+                        done["mutNr"] = Value::Null;
+                        done["let_op"] = json!(format!(
+                            "De factuur is verwerkt, maar EB MCP kon het mutatienummer niet opzoeken: zoek het op met mutaties en factuur {nummer}."
+                        ));
+                    }
+                }
+                Ok(done)
+            },
+        )
+        .await
+    }
+
+    #[tool(
         description = "De abonnementen: id, naam, relatie, frequentie, startdatum, prolongatiedatum en bedrag.",
         annotations(title = "Abonnementen", read_only_hint = true)
     )]
@@ -5538,6 +5628,7 @@ impl ServerHandler for EbMcp {
                  Klopt een voorstel dat nog wacht niet, of is het niet meer nodig, trek het dan zelf in met akkoord_intrekken (met een korte reden) in plaats van de gebruiker te vragen het te weigeren; na goedkeuring kan dat niet meer. \
                  Een geïmporteerde bankregel verwerken kan: bankregels geeft de onverwerkte regels met hun id, en mutatie_toevoegen met bankregel_id boekt de mutatie en verwerkt de regel in één keer, bij elke soort, ook een factuurbetaling. \
                  Boek geld van een bankregel nooit zonder bankregel_id: dan blijft de regel open staan en dreigt een dubbele boeking. \
+                 Een verkoopfactuur die gemaakt is maar nog niet verwerkt (verwerkt leeg bij facturen) heeft nog geen mutatie, dus een betaling kan er niet aan gekoppeld worden: verwerk hem eerst met factuur_verwerken. \
                  Kan een bankregel nog niet geboekt worden (bijvoorbeeld omdat de factuur nog ontbreekt), zet er dan een opmerking bij met bankregel_opmerking_wijzigen, zoals \"wacht op factuur\". \
                  Hoort er een factuur of bon bij die op deze computer staat, geef die dan mee als bijlage van mutatie_toevoegen: dan staat hij na hetzelfde akkoord in het archief en gekoppeld aan de mutatie. \
                  Een btw-aangifte, ICP-opgave of suppletie versturen, indienen of betalen kan EB MCP niet: dat doet de gebruiker zelf. \
@@ -5791,7 +5882,7 @@ mod tests {
     fn counts_its_tools_on_the_router() {
         // The tools of this file, plus what each part names in its own module.
         let [reads, writes, _] = part_tools();
-        assert_eq!(tool_count(), 59 + reads.len() + writes.len());
+        assert_eq!(tool_count(), 60 + reads.len() + writes.len());
     }
 
     #[test]

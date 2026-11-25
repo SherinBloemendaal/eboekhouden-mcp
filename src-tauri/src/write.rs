@@ -2053,6 +2053,145 @@ pub fn factuur_credit(
     })
 }
 
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct FactuurVerwerkenArgs {
+    /// Id van de factuur die verwerkt wordt (uit facturen). De factuur mag nog niet verwerkt zijn.
+    pub id: u64,
+    /// Naam van het account in EB MCP, zoals status hem noemt. Verplicht zodra er meer dan één account in EB MCP staat.
+    pub account: Option<String>,
+}
+
+/// The invoice with this id in a page of `factuur/normaal/gridtable` whose rows carry their column names.
+pub fn factuur_row(page: &Value, id: u64) -> Option<&Value> {
+    page.get("data")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|row| row.get("id").and_then(Value::as_u64) == Some(id))
+}
+
+/// The number of an invoice row, and an error when the row says it is processed already (`verwerkt` holds the
+/// moment) or does not say either way.
+pub fn factuur_onverwerkt(row: &Value) -> Result<String, String> {
+    let bad = || {
+        "e-Boekhouden gaf de factuur in een onbekende vorm terug. Er is niets geboekt.".to_owned()
+    };
+    let nummer = row
+        .get("nummer")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(bad)?;
+    match row.get("verwerkt").ok_or_else(bad)? {
+        Value::Null => Ok(nummer.to_owned()),
+        moment => {
+            let op = moment
+                .as_str()
+                .and_then(|m| m.get(..10))
+                .and_then(|d| parse_date(d).ok())
+                .map(|d| format!(" op {}", dutch(d)))
+                .unwrap_or_default();
+            Err(format!(
+                "Factuur {nummer} is al verwerkt{op}: de mutatie staat bij mutaties met factuur {nummer}. Er is niets geboekt."
+            ))
+        }
+    }
+}
+
+/// Processing an invoice that exists already, as "Verwerken" in e-Boekhouden's list of invoices does for the
+/// invoices that are ticked: `factuur/bulkverwerk` with this one id. `row` is the invoice's row in
+/// `factuur/normaal/gridtable`. `confirmedAction` stays false: with true e-Boekhouden also changes a mutatie
+/// that exists already for the invoice, which is not what was shown to the user.
+pub fn factuur_verwerk(id: u64, row: &Value, books: &Books) -> Result<Built, String> {
+    let nummer = factuur_onverwerkt(row)?;
+    let debiteuren = books.debiteuren()?;
+    let mut lines = vec![line("Factuur", &nummer)];
+    if let Some(relatie) = row
+        .get("relatie")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        lines.push(line("Relatie", relatie));
+    }
+    if let Some(datum) = row
+        .get("datum")
+        .and_then(Value::as_str)
+        .and_then(|d| d.get(..10))
+        .and_then(|d| parse_date(d).ok())
+    {
+        lines.push(line("Factuurdatum", dutch(datum)));
+    }
+    if let Some(excl) = row.get("bedragExcl").and_then(Value::as_f64) {
+        lines.push(line("Totaal excl. btw", euro(excl)));
+    }
+    if let Some(incl) = row.get("bedragIncl").and_then(Value::as_f64) {
+        lines.push(line("Totaal incl. btw", euro(incl)));
+    }
+    lines.push(line(
+        "Debiteurenrekening",
+        format!("{} {}", debiteuren.code, debiteuren.naam),
+    ));
+    lines.push(line(
+        "Boeken",
+        "als mutatie Factuur verstuurd, met de omzet en btw van de factuurregels",
+    ));
+    Ok(Built {
+        body: json!({"factuurIds": [id], "gbId": debiteuren.id, "confirmedAction": false}),
+        title: format!("Factuur {nummer} verwerken"),
+        lines,
+    })
+}
+
+/// What `factuur/bulkverwerk` answered for one invoice: `{verwerkt, errors, invoicesWithDivergentGbid}`. An error
+/// unless exactly this invoice was processed.
+pub fn factuur_verwerkt(answer: &Value, nummer: &str) -> Result<(), String> {
+    if answer
+        .get("invoicesWithDivergentGbid")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0
+    {
+        return Err(format!(
+            "e-Boekhouden meldt dat er voor factuur {nummer} al een mutatie bestaat die door het verwerken zou wijzigen. EB MCP heeft dat niet bevestigd, dus er is niets verwerkt. Bekijk die mutatie eerst (mutaties met factuur {nummer}); verwerken kan dan in e-Boekhouden zelf, bij Facturen."
+        ));
+    }
+    let errors: Vec<String> = answer
+        .get("errors")
+        .and_then(Value::as_array)
+        .map(|errors| {
+            errors
+                .iter()
+                .map(|e| e.as_str().map_or_else(|| e.to_string(), str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !errors.is_empty() {
+        return Err(format!(
+            "e-Boekhouden heeft factuur {nummer} niet verwerkt: {}",
+            errors.join("; ")
+        ));
+    }
+    match answer.get("verwerkt").and_then(Value::as_u64) {
+        Some(1) => Ok(()),
+        _ => Err(format!(
+            "e-Boekhouden gaf geen duidelijk antwoord op het verwerken van factuur {nummer}: onbekend of hij verwerkt is. Probeer het niet opnieuw, maar kijk eerst bij facturen of verwerkt gevuld is."
+        )),
+    }
+}
+
+/// The number of the mutatie Factuur verstuurd (soort 2) of this invoice in a page of `mutatie/gridtable`.
+pub fn factuur_mutatie_nr(page: &Value, id: u64) -> Option<u64> {
+    page.get("data")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|row| {
+            row.get("factId").and_then(Value::as_u64) == Some(id)
+                && row.get("soortValue").and_then(Value::as_u64) == Some(2)
+        })?
+        .get("mutatieNr")
+        .and_then(Value::as_u64)
+}
+
 // ---------------------------------------------------------------- offertes
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -2937,6 +3076,107 @@ mod tests {
     }
 
     /// The rekeningschema and btw codes of the test administration, in the API's own shapes.
+    fn factuur_rij(verwerkt: Value) -> Value {
+        json!({"id": 73766304u64, "verwerkt": verwerkt, "relatieId": 49986265, "datum": "2026-11-24T00:00:00",
+               "nummer": "F01237", "relatie": "Studio Noord B.V.", "bedragExcl": 6762.0, "bedragIncl": 8182.02})
+    }
+
+    #[test]
+    fn processing_an_invoice_sends_its_id_and_the_debiteuren_account_unconfirmed() {
+        let page = json!({"data": [factuur_rij(Value::Null), {"id": 5, "nummer": "F00001", "verwerkt": null}]});
+        let row = factuur_row(&page, 73766304).unwrap();
+        assert!(factuur_row(&page, 6).is_none());
+        let built = factuur_verwerk(73766304, row, &books()).unwrap();
+        assert_eq!(
+            built.body,
+            json!({"factuurIds": [73766304u64], "gbId": 26852134, "confirmedAction": false})
+        );
+        assert_eq!(built.title, "Factuur F01237 verwerken");
+        let shown: Vec<(&str, &str)> = built
+            .lines
+            .iter()
+            .map(|l| (l.label.as_str(), l.value.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("Factuur", "F01237"),
+                ("Relatie", "Studio Noord B.V."),
+                ("Factuurdatum", "24-11-2026"),
+                ("Totaal excl. btw", "6762,00"),
+                ("Totaal incl. btw", "8182,02"),
+                ("Debiteurenrekening", "1300 Debiteuren"),
+                (
+                    "Boeken",
+                    "als mutatie Factuur verstuurd, met de omzet en btw van de factuurregels"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_invoice_that_is_processed_already_or_unreadable_is_refused() {
+        let done = factuur_verwerk(
+            73766304,
+            &factuur_rij(json!("2026-11-24T15:02:48.563")),
+            &books(),
+        )
+        .unwrap_err();
+        assert!(
+            done.starts_with("Factuur F01237 is al verwerkt op 24-11-2026")
+                && done.ends_with("Er is niets geboekt."),
+            "{done}"
+        );
+        // A row that does not say whether it is processed is not taken for unprocessed.
+        let unknown = factuur_verwerk(1, &json!({"id": 1, "nummer": "F1"}), &books()).unwrap_err();
+        assert!(unknown.contains("onbekende vorm"), "{unknown}");
+        let nameless =
+            factuur_verwerk(1, &json!({"id": 1, "verwerkt": null}), &books()).unwrap_err();
+        assert!(nameless.contains("onbekende vorm"), "{nameless}");
+    }
+
+    #[test]
+    fn the_answer_to_processing_counts_only_when_this_invoice_was_processed() {
+        assert_eq!(
+            factuur_verwerkt(
+                &json!({"verwerkt": 1, "errors": [], "invoicesWithDivergentGbid": 0}),
+                "F01237"
+            ),
+            Ok(())
+        );
+        assert_eq!(factuur_verwerkt(&json!({"verwerkt": 1}), "F01237"), Ok(()));
+        let divergent = factuur_verwerkt(
+            &json!({"verwerkt": 0, "invoicesWithDivergentGbid": 1}),
+            "F01237",
+        )
+        .unwrap_err();
+        assert!(divergent.contains("er is niets verwerkt"), "{divergent}");
+        let refused = factuur_verwerkt(
+            &json!({"verwerkt": 0, "errors": ["Factuur F01237: de periode is afgesloten"]}),
+            "F01237",
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused,
+            "e-Boekhouden heeft factuur F01237 niet verwerkt: Factuur F01237: de periode is afgesloten"
+        );
+        for vague in [json!({"verwerkt": 0}), json!(null), json!({"verwerkt": 2})] {
+            let unknown = factuur_verwerkt(&vague, "F01237").unwrap_err();
+            assert!(unknown.contains("onbekend of hij verwerkt is"), "{unknown}");
+        }
+    }
+
+    #[test]
+    fn the_mutatie_of_an_invoice_is_the_factuur_verstuurd_with_its_id() {
+        let page = json!({"data": [
+            {"mutatieNr": 10300, "soortValue": 4, "factId": 73766304u64},
+            {"mutatieNr": 10343, "soortValue": 2, "factId": 5},
+            {"mutatieNr": 10344, "soortValue": 2, "factId": 73766304u64}
+        ]});
+        assert_eq!(factuur_mutatie_nr(&page, 73766304), Some(10344));
+        assert_eq!(factuur_mutatie_nr(&page, 7), None);
+    }
+
     fn books() -> Books {
         let grootboek = json!({
             "colMetadata": [{"name": "id"}, {"name": "code"}, {"name": "omschrijving"}, {"name": "categorie"}, {"name": "rekeningGroep"}, {"name": "inactief"}],

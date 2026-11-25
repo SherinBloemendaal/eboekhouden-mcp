@@ -318,6 +318,7 @@ mod tests {
             "factuur_wijzigen",
             "factuur_verwijderen",
             "factuur_crediteren",
+            "factuur_verwerken",
             "abonnement_toevoegen",
             "abonnement_wijzigen",
             "abonnement_verwijderen",
@@ -1567,6 +1568,230 @@ mod tests {
     }
 
     /// The proposal id of a "waiting" answer.
+    /// factuur_verwerken: an invoice that is processed already, or not there, is refused before the user is
+    /// asked. An unprocessed one gets one proposal; after Goedkeuren the one call that e-Boekhouden's own
+    /// Verwerken makes goes out, never confirming a change to a mutatie that exists, and the answer has the
+    /// mutatienummer. An invoice that was processed elsewhere while the proposal waited is not sent again.
+    #[tokio::test]
+    async fn an_unprocessed_invoice_can_be_processed() {
+        use crate::accounts::{AccountInput, Rights, Store};
+        use axum::routing::{get, post as on_post};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let (done, elsewhere) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (posted, sets_done, reads_done, reads_elsewhere) =
+            (seen.clone(), done.clone(), done.clone(), elsewhere.clone());
+        let app = axum::Router::new()
+            .route(
+                "/v1/api/grootboekrekening/gridtable",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "colMetadata": [{"name": "id"}, {"name": "code"}, {"name": "omschrijving"}, {"name": "categorie"}, {"name": "inactief"}],
+                        "data": [[11, "1010", "Bank", "Betalingsmiddelen", false], [13, "1300", "Debiteuren", "Debiteuren", false]]
+                    }))
+                }),
+            )
+            .route(
+                "/v1/api/btwinfo/all",
+                get(|| async { axum::Json(serde_json::json!([{"code": "GEEN", "omschrijving": "Geen btw", "percentage": 0, "soort": ""}])) }),
+            )
+            .route(
+                "/v1/api/factuur/normaal/gridtable",
+                get(move || {
+                    let moment = |is: bool| if is { serde_json::json!("2026-11-25T10:00:00.5") } else { serde_json::Value::Null };
+                    let (first, fourth) = (
+                        moment(reads_done.load(Ordering::SeqCst)),
+                        moment(reads_elsewhere.load(Ordering::SeqCst)),
+                    );
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "colMetadata": [{"name": "id"}, {"name": "verwerkt"}, {"name": "datum"}, {"name": "nummer"}, {"name": "relatie"}, {"name": "bedragExcl"}, {"name": "bedragIncl"}],
+                            "data": [
+                                [73, first, "2026-11-24T00:00:00", "F00073", "Studio Noord B.V.", 100.0, 121.0],
+                                [74, "2026-11-20T09:00:00", "2026-11-20T00:00:00", "F00074", "Studio Noord B.V.", 10.0, 12.1],
+                                [75, null, "2026-11-21T00:00:00", "F00075", "Studio Noord B.V.", 20.0, 24.2],
+                                [76, fourth, "2026-11-22T00:00:00", "F00076", "Studio Noord B.V.", 30.0, 36.3]
+                            ],
+                            "rowCount": 4, "offset": 0, "limit": 2000
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/api/factuur/bulkverwerk",
+                on_post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let (posted, sets_done) = (posted.clone(), sets_done.clone());
+                    async move {
+                        let divergent = body["factuurIds"] == serde_json::json!([75]);
+                        posted.lock().unwrap().push(body);
+                        if divergent {
+                            axum::Json(serde_json::json!({"verwerkt": 0, "errors": [], "invoicesWithDivergentGbid": 1}))
+                        } else {
+                            sets_done.store(true, Ordering::SeqCst);
+                            axum::Json(serde_json::json!({"verwerkt": 1, "errors": [], "invoicesWithDivergentGbid": 0}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/api/mutatie/gridtable",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "colMetadata": [{"name": "id"}, {"name": "mutatieNr"}, {"name": "soortValue"}, {"name": "factuur"}, {"name": "factId"}],
+                        "data": [[4791797785u64, 10344, 2, "F00073", 73]],
+                        "rowCount": 1, "offset": 0, "limit": 50
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!(
+            "http://127.0.0.1:{}/v1/api/",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let jar = Arc::new(crate::state::testing::FakeJar::default());
+        let state = Arc::new(crate::state::testing::state_with(jar.clone(), &api));
+        let account = state
+            .accounts
+            .add(AccountInput {
+                label: "Studio Noord".into(),
+                username: "lisa@studionoord.example".into(),
+                store: Store::System,
+                op_ref: None,
+                op_title: None,
+                op_vault: None,
+                rights: Rights::ASK,
+            })
+            .unwrap();
+        state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
+        state.add_session(account.id, &account.label, "sessie");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mcp = router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
+        tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{PATH}");
+        let post = |body: serde_json::Value, session: Option<String>| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&body);
+            if let Some(s) = session {
+                request = request.header("mcp-session-id", s);
+            }
+            request.send()
+        };
+        let init = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "title": "Claude", "version": "1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        let process = |call: u32, id: u64| {
+            let sent = post(
+                serde_json::json!({"jsonrpc": "2.0", "id": call, "method": "tools/call", "params": {"name": "factuur_verwerken", "arguments": {"id": id}}}),
+                session.clone(),
+            );
+            async move { answer_of(sent.await.unwrap().text().await.unwrap()) }
+        };
+
+        // Processed already, or not an invoice of this administration: refused before the user is asked.
+        let (is_error, text) = process(2, 74).await;
+        assert!(
+            is_error && text.contains("Factuur F00074 is al verwerkt op 20-11-2026"),
+            "{text}"
+        );
+        let (is_error, text) = process(3, 99).await;
+        assert!(
+            is_error && text.contains("Factuur 99 staat niet bij de verkoopfacturen"),
+            "{text}"
+        );
+        assert!(
+            state.approvals.history(None).is_empty(),
+            "nothing was asked"
+        );
+
+        // One proposal; after Goedkeuren the one call, unconfirmed, and the mutatienummer in the answer.
+        let (_, text) = process(4, 73).await;
+        let id = waiting_id(&text);
+        let proposal = state.approvals.list().into_iter().next().unwrap();
+        assert_eq!(proposal.title, "Factuur F00073 verwerken");
+        assert!(
+            proposal
+                .lines
+                .iter()
+                .any(|l| l.label == "Debiteurenrekening" && l.value == "1300 Debiteuren"),
+            "{:?}",
+            proposal.lines
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing goes out before Goedkeuren"
+        );
+        assert!(state.approvals.decide(id, true, crate::state::now_ms()));
+        assert_eq!(
+            settled(&state, id).await.status,
+            crate::approvals::Status::Done
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![serde_json::json!({"factuurIds": [73], "gbId": 13, "confirmedAction": false})]
+        );
+        let result = state.approvals.get(id).unwrap().result.unwrap();
+        assert_eq!(
+            result["data"],
+            serde_json::json!({"id": 73, "nummer": "F00073", "verwerkt": true, "mutNr": 10344})
+        );
+        let (is_error, text) = process(5, 73).await;
+        assert!(
+            is_error && text.contains("Factuur F00073 is al verwerkt"),
+            "{text}"
+        );
+
+        // e-Boekhouden says a mutatie that exists would change: EB MCP does not confirm that.
+        seen.lock().unwrap().clear();
+        let (_, text) = process(6, 75).await;
+        let id = waiting_id(&text);
+        assert!(state.approvals.decide(id, true, crate::state::now_ms()));
+        assert_eq!(
+            settled(&state, id).await.status,
+            crate::approvals::Status::Failed
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![serde_json::json!({"factuurIds": [75], "gbId": 13, "confirmedAction": false})]
+        );
+
+        // Processed elsewhere while the proposal waited: nothing goes out.
+        seen.lock().unwrap().clear();
+        let (_, text) = process(7, 76).await;
+        let id = waiting_id(&text);
+        elsewhere.store(true, Ordering::SeqCst);
+        assert!(state.approvals.decide(id, true, crate::state::now_ms()));
+        assert_eq!(
+            settled(&state, id).await.status,
+            crate::approvals::Status::Failed
+        );
+        assert!(seen.lock().unwrap().is_empty(), "nothing went out");
+    }
+
     fn waiting_id(text: &str) -> u64 {
         let value: serde_json::Value =
             serde_json::from_str(text).unwrap_or_else(|_| panic!("not JSON: {text}"));
