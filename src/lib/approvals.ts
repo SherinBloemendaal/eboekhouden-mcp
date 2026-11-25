@@ -19,6 +19,29 @@ export interface Proposal {
   /** Cannot be undone: asked even for an account that needs no approval otherwise. */
   danger: boolean
   askedAt: number
+  /** The file the change sends along (an upload to the digitaal archief), shown before Goedkeuren. */
+  file?: Attachment
+}
+
+/** A file from this computer that a change sends to e-Boekhouden (approvals.rs, `Attachment`). */
+export interface Attachment {
+  path: string
+  name: string
+  size: number
+  /** 'application/pdf' or an image type when the preview can show it, told from the file's bytes; null: no preview. */
+  kind: string | null
+  /** Openen may hand the file to its own app: only a PDF or an image. Anything else is only shown in its folder. */
+  openable: boolean
+}
+
+/** The file as the proposal read it (`approval_file`), which is what goes out; `changed`: the file on disk is no longer that, or is gone. */
+export interface FilePreview {
+  name: string
+  kind: string | null
+  size: number
+  changed: boolean
+  /** Base64. */
+  data: string
 }
 
 export type ApprovalStatus = 'waiting' | 'running' | 'done' | 'failed' | 'refused' | 'lapsed' | 'withdrawn'
@@ -276,4 +299,15 @@ export function stamp(ms: number, full = false): string {
   return full
     ? new Date(ms).toLocaleString('nl-NL', { dateStyle: 'long', timeStyle: 'medium' })
     : new Date(ms).toLocaleString('nl-NL', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+}
+
+/** The file of a proposal that still waits, for its preview. Rejects with a Dutch sentence. */
+export const approvalFile = (id: number): Promise<FilePreview> => invoke<FilePreview>('approval_file', { id })
+/** Opens the file of a waiting proposal in its own app, or shows it in Finder or Explorer with `reveal`. */
+export const openApprovalFile = (id: number, reveal = false): Promise<void> => invoke<void>('approval_file_open', { id, reveal })
+
+/** What the preview can show of a file: an image, a PDF, or nothing. */
+export function previewKind(kind: string | null | undefined): 'image' | 'pdf' | null {
+  if (kind === 'application/pdf') return 'pdf'
+  return kind?.startsWith('image/') ? 'image' : null
 }

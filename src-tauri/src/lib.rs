@@ -378,6 +378,52 @@ fn approvals_history(
 }
 
 /// One proposal with its technical data: the tool's arguments, the request body and the result.
+/// Akkoord: the file a waiting proposal sends along, for its preview: the bytes the tool read, which are what
+/// goes out after Goedkeuren. Only the file of a proposal that still waits; any other id is refused.
+#[tauri::command]
+fn approval_file(
+    app_state: Shared<'_, AppState>,
+    id: u64,
+) -> Result<approvals::FilePreview, String> {
+    let (file, sent) = app_state
+        .approvals
+        .waiting_file(id)
+        .ok_or_else(|| "Dit voorstel wacht niet meer of heeft geen bestand.".to_owned())?;
+    Ok(file.preview(&sent))
+}
+
+/// Akkoord: opens the file of a waiting proposal in its own app (Voorvertoning, the PDF reader), or shows it in
+/// Finder or Explorer with `reveal`. Only the file of a proposal that still waits, and opening only a PDF or
+/// an image: the AI client named the file, and opening anything else could run it.
+#[tauri::command]
+fn approval_file_open(
+    app: AppHandle,
+    app_state: Shared<'_, AppState>,
+    id: u64,
+    reveal: bool,
+) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let (file, _) = app_state
+        .approvals
+        .waiting_file(id)
+        .ok_or_else(|| "Dit voorstel wacht niet meer of heeft geen bestand.".to_owned())?;
+    if !std::path::Path::new(&file.path).is_file() {
+        return Err(format!("{} staat niet meer op {}.", file.name, file.path));
+    }
+    if !reveal && !file.openable {
+        return Err(format!(
+            "{} is geen pdf of afbeelding: zo'n bestand opent EB MCP niet zelf. Bekijk het in zijn map.",
+            file.name
+        ));
+    }
+    if reveal {
+        app.opener().reveal_item_in_dir(&file.path)
+    } else {
+        app.opener().open_path(&file.path, None::<&str>)
+    }
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn approval_get(app_state: Shared<'_, AppState>, id: u64) -> Result<approvals::Detail, String> {
     app_state
@@ -1454,6 +1500,8 @@ pub fn run() {
             approvals_decide_all,
             approvals_history,
             approval_get,
+            approval_file,
+            approval_file_open,
             approvals_export,
             open_log_dir,
             open_op_install,
@@ -1763,6 +1811,7 @@ mod tests {
             lines: Vec::new(),
             danger: false,
             asked_at: 1,
+            file: None,
         }
     }
 
