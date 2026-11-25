@@ -3,7 +3,7 @@
 //! `auth-token` among them (signin.rs, SessionJar).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -94,6 +94,9 @@ pub struct AppState {
     pub signins: Arc<crate::signin::Signins>,
     /// Starts a sign-in the way the app's own button does. Set once the app runs (lib.rs).
     sign_in: OnceLock<Box<dyn Fn(Uuid) + Send + Sync>>,
+    /// How long a tool call waits for the user's approval, in seconds; 0 when it answers at once with status
+    /// wacht (Instellingen, Wacht op akkoord in de aanroep). Set by lib.rs from the settings.
+    approval_wait_secs: AtomicU64,
 }
 
 pub fn now_ms() -> u64 {
@@ -117,7 +120,22 @@ impl AppState {
             updating: AtomicBool::new(false),
             signins: Arc::default(),
             sign_in: OnceLock::new(),
+            approval_wait_secs: AtomicU64::new(0),
         }
+    }
+
+    /// How long a tool call waits for the user's approval; `None`: it does not wait.
+    pub fn approval_wait(&self) -> Option<Duration> {
+        match self.approval_wait_secs.load(Ordering::Relaxed) {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        }
+    }
+
+    /// Sets how long a tool call waits for the user's approval; `None` or zero: not at all.
+    pub fn set_approval_wait(&self, wait: Option<Duration>) {
+        self.approval_wait_secs
+            .store(wait.map_or(0, |w| w.as_secs()), Ordering::Relaxed);
     }
 
     /// How a sign-in is started from outside the app's own windows (the `inloggen` tool). Set once.

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// Instellingen (Cmd+,): appearance and when sessions end. Changes save at once, as in macOS settings.
+// Instellingen (Cmd+,): appearance, when sessions end and how a change that needs approval reaches the AI client. Changes save at once, as in macOS settings.
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import Icon from '../components/Icon.vue'
 import TraceView from '../components/TraceView.vue'
@@ -130,6 +130,19 @@ const appearances: { value: Appearance; label: string }[] = [
       <div class="row">
         <span class="text"><strong>Melding bij een nieuw voorstel</strong><small>Een melding van {{ isMac ? 'macOS' : 'Windows' }} met de wijziging en het account, als EB MCP niet voorop staat. Klik erop om het voorstel te openen.</small></span>
         <button type="button" role="switch" class="switch" :aria-checked="settings.notifyApprovals" aria-label="Melding bij een nieuw voorstel" @click="save({ notifyApprovals: !settings.notifyApprovals }, 'approval')"><span /></button>
+      </div>
+      <div class="row">
+        <span class="text"><strong>Wacht op akkoord in de aanroep</strong><small>De AI-client wacht op je antwoord en gaat daarna zelf verder. Uit: hij hoort meteen dat de wijziging wacht en vraagt de uitkomst later op.</small></span>
+        <button type="button" role="switch" class="switch" :aria-checked="settings.waitForApproval" aria-label="Wacht op akkoord in de aanroep" @click="save({ waitForApproval: !settings.waitForApproval }, 'approval')"><span /></button>
+      </div>
+      <div class="row" :class="{ muted: !settings.waitForApproval }">
+        <span class="text"><strong>Hoogstens wachten</strong><small>{{ settings.waitForApproval ? 'Daarna wacht de wijziging gewoon verder op Akkoord. Claude Desktop wacht hooguit 50 seconden.' : 'Staat uit zolang Wacht op akkoord in de aanroep uit staat.' }}</small></span>
+        <select class="select" :value="settings.waitMinutes" :disabled="!settings.waitForApproval" aria-label="Hoogstens wachten" @change="save({ waitMinutes: Number(($event.target as HTMLSelectElement).value) }, 'approval')">
+          <option :value="1">1 minuut</option>
+          <option :value="2">2 minuten</option>
+          <option :value="5">5 minuten</option>
+          <option :value="10">10 minuten</option>
+        </select>
       </div>
       <Transition name="accordion">
         <div v-if="errors.approval" class="accordion"><div><p class="error" role="alert">{{ errors.approval }}</p></div></div>

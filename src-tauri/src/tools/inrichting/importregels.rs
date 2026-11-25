@@ -715,7 +715,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een automatische importregel aanmaken: bankregels waarvan de omschrijving een tekst bevat en/of waarvan het bedrag binnen grenzen valt, worden bij het importeren zelf geboekt als Geld ontvangen of Geld uitgegeven op de gekozen tegenrekening met de gekozen btw-code. Minstens één criterium is nodig (omschrijving, bedrag_van of bedrag_tot). Bestaande bankregels worden pas geboekt bij een nieuwe import of met importregels_verwerken. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de regel eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een automatische importregel aanmaken: bankregels waarvan de omschrijving een tekst bevat en/of waarvan het bedrag binnen grenzen valt, worden bij het importeren zelf geboekt als Geld ontvangen of Geld uitgegeven op de gekozen tegenrekening met de gekozen btw-code. Minstens één criterium is nodig (omschrijving, bedrag_van of bedrag_tot). Bestaande bankregels worden pas geboekt bij een nieuwe import of met importregels_verwerken. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de regel eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Importregel toevoegen",
             read_only_hint = false,
@@ -748,7 +748,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een automatische importregel wijzigen, op id (uit importregels). Wat je niet noemt blijft zoals het is; met wissen maak je omschrijving, omschrijving2, bedrag_van of bedrag_tot leeg. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een automatische importregel wijzigen, op id (uit importregels). Wat je niet noemt blijft zoals het is; met wissen maak je omschrijving, omschrijving2, bedrag_van of bedrag_tot leeg. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Importregel wijzigen",
             read_only_hint = false,
@@ -790,7 +790,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een automatische importregel verwijderen, op id (uit importregels). Mutaties die de regel al geboekt heeft blijven staan. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Een automatische importregel verwijderen, op id (uit importregels). Mutaties die de regel al geboekt heeft blijven staan. Dit is niet terug te draaien. De gebruiker keurt dit goed in EB MCP, tenzij verwijderen voor het account zonder akkoord staat. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Importregel verwijderen",
             read_only_hint = false,
@@ -832,7 +832,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Alle niet verwerkte bankregels opnieuw automatisch verwerken, zoals de link Alle regels opnieuw automatisch verwerken in e-Boekhouden: e-Boekhouden verwerkt alle niet verwerkte bankregels opnieuw automatisch, met onder meer de automatische importregels, en boekt wat het zo kan verwerken meteen als mutatie, allemaal in één keer. Eén regel kiezen kan niet, en EB MCP kan vooraf niet laten zien welke mutaties het worden; het resultaat zegt hoeveel er geboekt zijn. Bekijk eerst bankregels en importregels. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "Alle niet verwerkte bankregels opnieuw automatisch verwerken, zoals de link Alle regels opnieuw automatisch verwerken in e-Boekhouden: e-Boekhouden verwerkt alle niet verwerkte bankregels opnieuw automatisch, met onder meer de automatische importregels, en boekt wat het zo kan verwerken meteen als mutatie, allemaal in één keer. Eén regel kiezen kan niet, en EB MCP kan vooraf niet laten zien welke mutaties het worden; het resultaat zegt hoeveel er geboekt zijn. Bekijk eerst bankregels en importregels. De gebruiker moet dit altijd goedkeuren in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Importregels opnieuw verwerken",
             read_only_hint = false,
@@ -878,7 +878,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "De opmerking bij één onverwerkte bankregel zetten, wijzigen of wissen, zoals het opmerkingicoon in de lijst van Boekhouden > Importeren in e-Boekhouden, bijvoorbeeld \"wacht op factuur\". De bankregel zelf blijft onverwerkt staan; bankregels toont de opmerking daarna in het veld opmerking. Een lege opmerking wist hem. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt het antwoord meteen terug met status wacht en een voorstel_id: de wijziging gaat pas door als de gebruiker goedkeurt, en akkoord_status geeft later de uitkomst. Ga intussen gerust verder met ander werk.",
+        description = "De opmerking bij één onverwerkte bankregel zetten, wijzigen of wissen, zoals het opmerkingicoon in de lijst van Boekhouden > Importeren in e-Boekhouden, bijvoorbeeld \"wacht op factuur\". De bankregel zelf blijft onverwerkt staan; bankregels toont de opmerking daarna in het veld opmerking. Een lege opmerking wist hem. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt het eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Opmerking bij bankregel",
             read_only_hint = false,

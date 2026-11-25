@@ -268,7 +268,7 @@ describe('instellingen', () => {
   it('offers Openen bij inloggen and Toon in Dock as switches', async () => {
     const wrapper = await mountAt('/instellingen')
     const switches = wrapper.findAll('[role="switch"]').map((s) => s.attributes('aria-label'))
-    expect(switches).toEqual(['Openen bij inloggen', 'Toon in Dock', 'Blijf ingelogd', 'Melding bij een nieuw voorstel'])
+    expect(switches).toEqual(['Openen bij inloggen', 'Toon in Dock', 'Blijf ingelogd', 'Melding bij een nieuw voorstel', 'Wacht op akkoord in de aanroep'])
     // On by default (Sherin, 2026-11-10).
     expect(wrapper.find('[aria-label="Toon in Dock"]').attributes('aria-checked')).toBe('true')
     wrapper.unmount()
@@ -286,6 +286,17 @@ describe('instellingen', () => {
     const wrapper = await mountAt('/instellingen')
     expect(wrapper.find('[aria-label="Melding bij een nieuw voorstel"]').attributes('aria-checked')).toBe('true')
     expect(wrapper.text()).toContain('met de wijziging en het account')
+    wrapper.unmount()
+  })
+
+  it('has Wacht op akkoord in de aanroep off, with five minutes ready for when it is turned on', async () => {
+    const wrapper = await mountAt('/instellingen')
+    expect(wrapper.find('[aria-label="Wacht op akkoord in de aanroep"]').attributes('aria-checked')).toBe('false')
+    const wait = wrapper.find('select[aria-label="Hoogstens wachten"]')
+    expect(wait.attributes('disabled')).toBeDefined()
+    expect(wrapper.text()).toContain('Staat uit zolang Wacht op akkoord in de aanroep uit staat.')
+    expect((wait.element as HTMLSelectElement).value).toBe('5')
+    expect(wait.findAll('option').map((o) => o.text())).toEqual(['1 minuut', '2 minuten', '5 minuten', '10 minuten'])
     wrapper.unmount()
   })
 

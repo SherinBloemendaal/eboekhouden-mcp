@@ -1,7 +1,8 @@
 //! Changes AI clients asked for: the ones that wait for the user's word, and the history of all of them.
 //!
-//! A tool that would change an account's books puts its proposal here (`ask`) and its MCP call answers at
-//! once that the change waits (tools.rs, `write_tool`). The change itself waits in a background task on the
+//! A tool that would change an account's books puts its proposal here (`ask`) and its MCP call answers that
+//! the change waits (tools.rs, `write_tool`): at once, or, with Wacht op akkoord in de aanroep on, only when the
+//! user did not answer within the set time; an answer before that gives the call the outcome itself. The change itself waits in a background task on the
 //! receiver `ask` returns, and only "Goedkeuren" lets its requests go to e-Boekhouden. A proposal waits until
 //! the user answers, the account is removed or set to read-only (refused), the account's sign-in details
 //! change or EB MCP stops (lapsed). There is no time limit.
@@ -766,6 +767,25 @@ impl Approvals {
         detail.finished_at = Some(now);
         drop(inner);
         self.changed();
+    }
+
+    /// The waiting proposal that asks the very same as a new call would: the same tool with the same arguments
+    /// for the same account. A client that gave up on a call that waited in it (Wacht op akkoord in de aanroep)
+    /// has no voorstel_id and may send the call again; that would put the same change in the queue twice.
+    pub fn waiting_same(&self, account_id: Uuid, tool: &str, args: &Value) -> Option<u64> {
+        let args = kept(args);
+        let inner = self.lock();
+        inner
+            .records
+            .iter()
+            .find(|d| {
+                let proposal = &d.record.proposal;
+                inner.pending.contains_key(&proposal.id)
+                    && proposal.account_id == account_id
+                    && proposal.tool == tool
+                    && d.args == args
+            })
+            .map(|d| d.record.proposal.id)
     }
 
     /// The waiting proposals, oldest first.
