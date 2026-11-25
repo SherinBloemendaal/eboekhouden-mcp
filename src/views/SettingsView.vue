@@ -8,11 +8,11 @@ import {
 } from '../lib/accounts'
 import { autostartGet, autostartSet, isMac, openLogDir } from '../lib/server'
 
-type Card = 'general' | 'view'
+type Card = 'general' | 'view' | 'approval'
 
 const settings = ref<Settings | null>(null)
 /** Each card shows its own errors. */
-const errors = ref<Record<Card, string | null>>({ general: null, view: null })
+const errors = ref<Record<Card, string | null>>({ general: null, view: null, approval: null })
 const autostart = ref(false)
 
 const traces = ref<Trace[]>([])
@@ -123,6 +123,16 @@ const appearances: { value: Appearance; label: string }[] = [
       <p class="hint">Afsluiten vergeet altijd alle sessies; EB MCP bewaart ze nergens. Na een update log je zelf opnieuw in{{ settings.keepSignedIn ? ', en ook als e-Boekhouden een sessie toch beëindigt' : '' }}.</p>
       <Transition name="accordion">
         <div v-if="errors.view" class="accordion"><div><p class="error" role="alert">{{ errors.view }}</p></div></div>
+      </Transition>
+    </section>
+    <h2 class="section">Akkoord</h2>
+    <section class="group card">
+      <div class="row">
+        <span class="text"><strong>Melding bij een nieuw voorstel</strong><small>Een melding van {{ isMac ? 'macOS' : 'Windows' }} met de wijziging en het account, als EB MCP niet voorop staat. Klik erop om het voorstel te openen.</small></span>
+        <button type="button" role="switch" class="switch" :aria-checked="settings.notifyApprovals" aria-label="Melding bij een nieuw voorstel" @click="save({ notifyApprovals: !settings.notifyApprovals }, 'approval')"><span /></button>
+      </div>
+      <Transition name="accordion">
+        <div v-if="errors.approval" class="accordion"><div><p class="error" role="alert">{{ errors.approval }}</p></div></div>
       </Transition>
     </section>
     <h2 class="section">Diagnose</h2>

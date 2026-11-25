@@ -76,7 +76,7 @@ beforeEach(() => {
       case 'log_export_reveal': return onReveal(args!.path as string)
       case 'approval_file': return onFile(args!.id as number)
       case 'accounts_list': return []
-      case 'settings_get': return { idleMinutes: 30, appearance: 'system', showInDock: true }
+      case 'settings_get': return { idleMinutes: 30, appearance: 'system', showInDock: true, notifyApprovals: true }
       case 'log_list': return []
       default: return undefined
     }

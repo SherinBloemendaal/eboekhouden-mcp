@@ -1,5 +1,5 @@
-//! Small app settings on disk (no secrets): the idle sign-out time, staying signed in, the appearance and the
-//! Dock icon.
+//! Small app settings on disk (no secrets): the idle sign-out time, staying signed in, the appearance, the
+//! Dock icon and the notification of a new proposal.
 //! Opening at login is not kept here: the system's own login item is the truth (lib.rs, autostart).
 
 use std::fs;
@@ -32,6 +32,9 @@ pub struct Settings {
     pub appearance: Appearance,
     /// macOS: an icon in the Dock as well as in the menu bar. On by default (Sherin, 2026-11-10).
     pub show_in_dock: bool,
+    /// Melding bij een nieuw voorstel: a system notification when a change comes up for approval while no EB MCP
+    /// window has the focus (lib.rs). On by default.
+    pub notify_approvals: bool,
 }
 
 impl Default for Settings {
@@ -41,6 +44,7 @@ impl Default for Settings {
             keep_signed_in: false,
             appearance: Appearance::System,
             show_in_dock: true,
+            notify_approvals: true,
         }
     }
 }
@@ -104,8 +108,10 @@ mod tests {
                 keep_signed_in: true,
                 appearance: Appearance::Dark,
                 show_in_dock: true,
+                notify_approvals: false,
             })
             .unwrap();
+        assert!(!SettingsStore::open(&dir).get().notify_approvals);
         assert!(SettingsStore::open(&dir).get().keep_signed_in);
         assert_eq!(SettingsStore::open(&dir).get().idle_minutes, 60);
         assert_eq!(SettingsStore::open(&dir).get().appearance, Appearance::Dark);
@@ -128,6 +134,8 @@ mod older_files {
                 keep_signed_in: false,
                 appearance: Appearance::System,
                 show_in_dock: true,
+                // The notification was there before its setting: a file from before it keeps it.
+                notify_approvals: true,
             }
         );
         let kept: Settings = serde_json::from_str(r#"{"keepSignedIn": true}"#).unwrap();
