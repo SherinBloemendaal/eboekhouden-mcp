@@ -2843,7 +2843,7 @@ fn withdrawal_reason(client: &str, reason: Option<&str>) -> String {
 }
 
 /// What the states of `akkoord_status` mean, for the AI client.
-const STATUS_WORDS: &str = "wacht: de gebruiker heeft nog niet geantwoord; bezig: goedgekeurd en de wijziging loopt; uitgevoerd: gedaan, resultaat geeft het antwoord van de tool; mislukt: goedgekeurd maar e-Boekhouden of EB MCP gaf een fout, zie fout; geweigerd: de gebruiker weigerde, of het account ging uit of werd alleen-lezen, er is niets gewijzigd; vervallen: EB MCP startte opnieuw of de inloggegevens van het account veranderden voor er een antwoord was, er is niets gewijzigd. ingetrokken: een AI-client trok het voorstel zelf in met akkoord_intrekken voordat de gebruiker antwoordde, er is niets gewijzigd.";
+const STATUS_WORDS: &str = "wacht: de gebruiker heeft nog niet geantwoord; bezig: goedgekeurd en de wijziging loopt; uitgevoerd: gedaan, resultaat geeft het antwoord van de tool; mislukt: goedgekeurd maar e-Boekhouden of EB MCP gaf een fout, zie fout; geweigerd: de gebruiker weigerde, of het account ging uit of werd alleen-lezen, er is niets gewijzigd; vervallen: EB MCP startte opnieuw of de inloggegevens van het account veranderden voor er een antwoord was, er is niets gewijzigd. ingetrokken: een AI-client trok het voorstel zelf in met akkoord_intrekken voordat de gebruiker antwoordde, er is niets gewijzigd. teruggestuurd: de gebruiker stuurde het voorstel terug met een opmerking (opmerking_van_de_gebruiker), er is niets gewijzigd; pas het voorstel aan en doe de aanroep opnieuw.";
 
 /// How many tools the server offers, counted on its tool router.
 pub fn tool_count() -> usize {
@@ -2982,7 +2982,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Hoe het staat met wijzigingen die op het akkoord van de gebruiker in EB MCP wachten of wachtten. Met voorstel_id (uit het antwoord van een tool die iets wijzigt): dat ene voorstel met zijn status, wat er gevraagd is en, zodra het is uitgevoerd, het resultaat of de fout. Zonder voorstel_id: alle voorstellen van de laatste 24 uur met hun status, ook wijzigingen die zonder akkoord zijn doorgevoerd. Statussen: wacht, bezig, uitgevoerd, mislukt, geweigerd, vervallen. Leest alleen; vraag niet telkens opnieuw als de status wacht is, de gebruiker beslist in zijn eigen tempo.",
+        description = "Hoe het staat met wijzigingen die op het akkoord van de gebruiker in EB MCP wachten of wachtten. Met voorstel_id (uit het antwoord van een tool die iets wijzigt): dat ene voorstel met zijn status, wat er gevraagd is en, zodra het is uitgevoerd, het resultaat of de fout. Zonder voorstel_id: alle voorstellen van de laatste 24 uur met hun status, ook wijzigingen die zonder akkoord zijn doorgevoerd. Statussen: wacht, bezig, uitgevoerd, mislukt, geweigerd, vervallen, ingetrokken, teruggestuurd (de gebruiker stuurde het terug met een opmerking). Leest alleen; vraag niet telkens opnieuw als de status wacht is, de gebruiker beslist in zijn eigen tempo.",
         annotations(
             title = "Akkoord status",
             read_only_hint = true,

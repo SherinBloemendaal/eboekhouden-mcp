@@ -114,6 +114,8 @@ describe('a statement on Akkoord', () => {
     expect(detail().querySelector('.statement-note')?.textContent).toContain('Wat meegaat kies jij hier, niet de AI-client')
     expect(button(detail(), 'Inlezen (2)')).toBeTruthy()
     expect(button(detail(), 'Goedkeuren')).toBeUndefined()
+    // Reading in is not shown as something that cannot be put right: the lines can be removed again.
+    expect(button(detail(), 'Inlezen (2)')!.classList.contains('primary')).toBe(true)
     expect(sheet()).toBeNull()
     expect(proposalKind(proposal())).toEqual({ icon: 'list-checks', tone: 'danger' })
   })

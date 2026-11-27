@@ -174,13 +174,13 @@ const period = computed(() => {
         <p v-else-if="!view" key="loading" class="state loading" aria-busy="true">Afschrift laden…</p>
         <div v-else key="body" class="body">
           <aside class="side" aria-label="Instellingen van het inlezen">
-            <div class="group">
+            <div class="block">
               <label class="section-label" for="st-ledger">Rekening in e-Boekhouden</label>
               <select id="st-ledger" class="select" :value="view.ledger" :disabled="saving" @change="edit({ kind: 'ledger', index: Number(($event.target as HTMLSelectElement).value) })">
                 <option v-for="(ledger, i) in view.ledgers" :key="ledger.id" :value="i">{{ ledger.code }} {{ ledger.name }}</option>
               </select>
             </div>
-            <div class="group">
+            <div class="block">
               <span class="section-label">Kolommen uit het bestand</span>
               <div class="map">
                 <label for="st-date">Datum</label>
@@ -204,7 +204,7 @@ const period = computed(() => {
               <span class="toggle-text"><strong>Ontdubbelen</strong><small>e-Boekhouden slaat over wat er al staat</small></span>
             </div>
 
-            <div class="group rules">
+            <div class="block rules">
               <span class="section-label">Overslaan</span>
               <TransitionGroup name="accordion" tag="ul" class="rule-list">
                 <li v-for="(rule, i) in view.rules" :key="rule.label" class="accordion">
@@ -352,7 +352,8 @@ const period = computed(() => {
 .sheet {
   width: 1260px; max-width: calc(100% - 32px); height: calc(100% - 44px - 20px); box-sizing: border-box; border-radius: 20px; overflow: hidden;
   display: flex; flex-direction: column; outline: none; container: sheet / inline-size;
-  background: var(--glass-pop); -webkit-backdrop-filter: blur(40px) saturate(190%); backdrop-filter: blur(40px) saturate(190%);
+  /* Nearly solid: a table this wide has to stay readable over whatever page lies behind it. */
+  background: var(--sheet-solid); -webkit-backdrop-filter: blur(40px) saturate(190%); backdrop-filter: blur(40px) saturate(190%);
   box-shadow: var(--pop-shadow); animation: drop 260ms var(--ease) both; transform-origin: 50% 0;
 }
 .head { flex: none; display: flex; align-items: center; gap: 10px; padding: 14px 16px 14px 20px; border-bottom: 0.5px solid var(--line-soft); }
@@ -370,7 +371,7 @@ h2 { margin: 0; font-size: 15px; font-weight: 700; }
 
 .body { flex: 1; min-height: 0; display: flex; }
 .side { position: relative; width: 332px; flex: none; box-sizing: border-box; padding: 16px 20px; border-right: 0.5px solid var(--line-soft); display: flex; flex-direction: column; gap: 16px; overflow-y: auto; }
-.group { display: flex; flex-direction: column; gap: 6px; }
+.block { display: flex; flex-direction: column; gap: 6px; }
 .map { display: grid; grid-template-columns: 108px minmax(0, 1fr); align-items: center; gap: 6px 8px; }
 .map label { font-size: 12px; color: var(--muted); }
 .select {
@@ -410,7 +411,7 @@ h2 { margin: 0; font-size: 15px; font-weight: 700; }
 
 .adder {
   position: sticky; bottom: 0; margin: 0 -8px; padding: 14px; border-radius: 14px; display: flex; flex-direction: column; gap: 10px;
-  background: var(--glass-pop); -webkit-backdrop-filter: blur(40px) saturate(190%); backdrop-filter: blur(40px) saturate(190%); box-shadow: var(--pop-shadow);
+  background: var(--sheet-solid); box-shadow: var(--pop-shadow);
 }
 .adder-hits { margin: 0; font-size: 12px; line-height: 17px; color: var(--label); }
 .adder-buttons { display: flex; justify-content: flex-end; gap: 8px; }

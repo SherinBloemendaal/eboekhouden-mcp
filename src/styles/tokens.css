@@ -110,6 +110,7 @@
 
 :root {
   --glass-pop: rgba(246, 246, 248, 0.72);
+  --sheet-solid: rgba(246, 246, 248, 0.97);
   --seg-on: #ffffff;
   --seg-on-shadow: 0 1px 3px rgba(0, 0, 0, 0.14), 0 0 0 0.5px rgba(0, 0, 0, 0.06);
   --pop-shadow: 0 14px 44px rgba(0, 0, 0, 0.18), 0 0 0 0.5px rgba(0, 0, 0, 0.12), inset 0 0.5px 0 rgba(255, 255, 255, 0.85);
@@ -117,6 +118,7 @@
 @media (prefers-color-scheme: dark) {
   :root {
     --glass-pop: rgba(40, 40, 44, 0.72);
+    --sheet-solid: rgba(38, 38, 42, 0.97);
     --seg-on: rgba(255, 255, 255, 0.2);
     --seg-on-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), inset 0 0.5px 0 rgba(255, 255, 255, 0.2);
     --pop-shadow: 0 14px 44px rgba(0, 0, 0, 0.55), 0 0 0 0.5px rgba(255, 255, 255, 0.14), inset 0 0.5px 0 rgba(255, 255, 255, 0.2);

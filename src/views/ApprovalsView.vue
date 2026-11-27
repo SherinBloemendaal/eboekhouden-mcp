@@ -507,7 +507,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'warn' | 'bad' | 'info'
                         <Icon name="reply" :size="14" />Terug naar {{ chosen.client }}
                       </button>
                       <button
-                        type="button" class="btn approve" :class="chosen.danger ? 'danger-fill' : 'primary'" :disabled="busy.has(chosen.id) || !!bulk"
+                        type="button" class="btn approve" :class="chosen.danger && !chosen.statement ? 'danger-fill' : 'primary'" :disabled="busy.has(chosen.id) || !!bulk"
                         :aria-busy="busy.get(chosen.id) === 'approve'" @click="decide(chosen, true)"
                       ><span class="btn-label">{{ chosen.statement ? `Inlezen (${chosen.statement.included})` : 'Goedkeuren' }}</span></button>
                     </span>
