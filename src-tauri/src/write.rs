@@ -482,7 +482,9 @@ impl InEx {
     }
 }
 
+// An unknown key is refused: a line with `btw` for `btw_code` was once booked without btw, unnoticed.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RegelArg {
     /// Code van de tegenrekening in het rekeningschema, bijvoorbeeld "4550".
     pub tegenrekening: String,
@@ -498,6 +500,7 @@ pub struct RegelArg {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BetalingArg {
     /// Id van de relatie van de factuur.
     pub relatie_id: u64,
@@ -4116,6 +4119,20 @@ mod tests {
                 .unwrap_err()
                 .contains("betalingen nodig")
         );
+    }
+
+    #[test]
+    fn a_line_with_an_unknown_key_is_refused() {
+        let line = json!({"tegenrekening": "4550", "bedrag": 2, "btw": "HOOG_INK_21"});
+        let error = serde_json::from_value::<RegelArg>(line)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unknown field `btw`") && error.contains("btw_code"),
+            "{error}"
+        );
+        let payment = json!({"relatie_id": 1, "factuur": "F1", "bedrag": 2, "nummer": "F1"});
+        assert!(serde_json::from_value::<BetalingArg>(payment).is_err());
     }
 
     #[test]
