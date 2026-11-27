@@ -411,6 +411,43 @@ impl Soort {
             Self::FactuurbetalingOntvangen | Self::FactuurbetalingVerstuurd
         )
     }
+
+    /// Booked on a bank or cash account: the payments and geld ontvangen or uitgegeven.
+    fn is_geld(self) -> bool {
+        self.is_betaling() || matches!(self, Self::GeldOntvangen | Self::GeldUitgegeven)
+    }
+
+    /// The category of ledger account this kind is booked on, as e-Boekhouden's own form picks it
+    /// (`getCategoryBySoort`). Memoriaal takes any account.
+    fn categorie(self) -> Option<&'static str> {
+        match self {
+            Self::FactuurOntvangen => Some("Crediteuren"),
+            Self::FactuurVerstuurd => Some("Debiteuren"),
+            Self::Memoriaal => None,
+            _ => Some("Betalingsmiddelen"),
+        }
+    }
+
+    /// A line's btw code as it reads under this kind. e-Boekhouden's form does the same when the kind changes
+    /// (`onMutSoortChange`): purchase codes for money that goes out, sales codes for money that comes in, none
+    /// on a memoriaal.
+    fn btw_code(self, code: &str) -> String {
+        match self {
+            Self::FactuurOntvangen | Self::GeldUitgegeven => {
+                code.replace("AFW_VERK", "AFW").replace("VERK", "INK")
+            }
+            Self::FactuurVerstuurd | Self::GeldOntvangen => {
+                let code = code.replace("INK", "VERK");
+                if code == "AFW" {
+                    "AFW_VERK".into()
+                } else {
+                    code
+                }
+            }
+            Self::Memoriaal => "GEEN".into(),
+            _ => code.to_owned(),
+        }
+    }
 }
 
 /// Whether the amounts of the lines include btw.
@@ -508,6 +545,8 @@ pub struct MutatieToevoegenArgs {
 pub struct MutatieWijzigenArgs {
     /// Mutatienummer.
     pub nr: u64,
+    /// Nieuwe soort: factuur_ontvangen, factuur_verstuurd, factuurbetaling_ontvangen, factuurbetaling_verstuurd, geld_ontvangen, geld_uitgegeven of memoriaal. Het mutatienummer en de bijlagen blijven. Naar een factuur: geef relatie_id en factuur; de rekening wordt de crediteuren- of debiteurenrekening. Naar of tussen factuurbetalingen: geef betalingen. Van een factuurbetaling naar iets anders: geef regels.
+    pub soort: Option<Soort>,
     /// Nieuwe datum, JJJJ-MM-DD.
     pub datum: Option<String>,
     /// Nieuwe rekening (code).
@@ -918,6 +957,103 @@ impl Mutatie {
         warnings
     }
 
+    /// Turns this mutatie into another kind, before the other changes of the call are applied. e-Boekhouden has
+    /// no request of its own for this: its edit screen sends the same `PUT mutatie` with another `soort` and the
+    /// fields that kind needs, and answers a bare 500 when one of them is missing. Hence the checks here.
+    fn turn_into(
+        &mut self,
+        to: Soort,
+        args: &MutatieWijzigenArgs,
+        books: &Books,
+    ) -> Result<(), String> {
+        let was = self.soort;
+        self.soort = to;
+        if args.rekening.is_none() {
+            let fits = books.by_id(self.rekening).is_some_and(|r| {
+                to.categorie()
+                    .is_some_and(|c| r.categorie.eq_ignore_ascii_case(c))
+            });
+            match to {
+                Soort::FactuurOntvangen => self.rekening = books.crediteuren()?.id,
+                Soort::FactuurVerstuurd => self.rekening = books.debiteuren()?.id,
+                Soort::Memoriaal => {}
+                _ if fits => {}
+                _ => {
+                    return Err(format!(
+                        "{} heeft een rekening nodig (de code van de bank- of kasrekening)",
+                        to.naam()
+                    ));
+                }
+            }
+        }
+        if !to.is_factuur() && to != Soort::Memoriaal {
+            self.relatie_id = None;
+            self.factuur = None;
+            self.termijn = None;
+        }
+        if to.is_betaling() {
+            if args.betalingen.is_none() {
+                return Err(format!(
+                    "{} heeft betalingen nodig: geef welke facturen deze betaling betaalt",
+                    to.naam()
+                ));
+            }
+            self.regels.clear();
+        } else if was.is_betaling() {
+            if args.regels.is_none() {
+                return Err(format!(
+                    "{} heeft regels nodig: een factuurbetaling heeft er geen om over te nemen",
+                    to.naam()
+                ));
+            }
+            self.betalingen.clear();
+            self.in_ex = InEx::Incl;
+        } else if args.regels.is_none() {
+            for regel in &mut self.regels {
+                let code = to.btw_code(&regel.btw);
+                regel.btw = books
+                    .btw(&code)
+                    .map_err(|_| {
+                        format!(
+                            "Btw-code {} past niet bij {}: geef de regels opnieuw mee met de juiste btw-code",
+                            regel.btw,
+                            to.naam()
+                        )
+                    })?
+                    .code
+                    .clone();
+            }
+        }
+        if to == Soort::Memoriaal {
+            self.in_ex = InEx::Excl;
+        }
+        Ok(())
+    }
+
+    /// What changing the kind of this mutatie leaves behind in the books, for the user to read in the proposal.
+    /// e-Boekhouden itself says none of it and refuses none of it.
+    fn soort_warnings(&self, to: Soort, books: &Books) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.soort.is_geld() && !to.is_geld() {
+            warnings.push(format!(
+                "de boeking gaat van {} af. e-Boekhouden boekt zelf geen betaling, en een bankregel waaruit deze mutatie gemaakt is komt niet terug bij de onverwerkte bankregels: boek de betaling daarna los",
+                books.label(self.rekening)
+            ));
+        }
+        if self.soort.is_factuur() {
+            warnings.push(format!(
+                "factuur {} bestaat hierna niet meer. Een betaling die er al op geboekt is blijft staan zonder factuur: kijk dat eerst na",
+                self.factuur.as_deref().unwrap_or("zonder nummer")
+            ));
+        }
+        if self.soort.is_betaling() {
+            warnings.push(
+                "de facturen die deze betaling betaalde staan hierna weer open, tenzij de nieuwe betalingen ze noemen".into(),
+            );
+        }
+        warnings
+    }
+
     /// The mutatie as `GET mutatie/nr/{nr}/model` gives it.
     fn from_model(model: &Value) -> Result<Self, String> {
         let bad = || "e-Boekhouden gaf deze mutatie in een onbekende vorm terug".to_owned();
@@ -1082,6 +1218,10 @@ pub fn mutatie_gewijzigd(
 ) -> Result<Built, String> {
     let mut mutatie = Mutatie::from_model(model)?;
     let before = mutatie.clone();
+    let becomes = args.soort.filter(|to| *to != before.soort);
+    if let Some(to) = becomes {
+        mutatie.turn_into(to, args, books)?;
+    }
     if let Some(datum) = &args.datum {
         mutatie.datum = parse_date(datum)?;
     }
@@ -1132,11 +1272,29 @@ pub fn mutatie_gewijzigd(
         mutatie.betalingen = betalingen_from(betalingen)?;
     }
     mutatie.check()?;
+    if let Some(categorie) = becomes.and_then(Soort::categorie) {
+        let rekening = books.by_id(mutatie.rekening);
+        if rekening.is_none_or(|r| !r.categorie.eq_ignore_ascii_case(categorie)) {
+            return Err(format!(
+                "{} wordt geboekt op een rekening van de categorie {categorie}, en {} is dat niet",
+                mutatie.soort.naam(),
+                books.label(mutatie.rekening)
+            ));
+        }
+    }
     if mutatie == before {
         return Err("Er is niets gewijzigd: geef aan wat er anders moet".into());
     }
     let mut lines = vec![line("Mutatie", format!("nr {}", args.nr))];
+    if becomes.is_some() {
+        lines.push(line("Soort was", before.soort.naam()));
+    }
     lines.extend(mutatie.lines(books, None));
+    if let Some(to) = becomes {
+        for warning in before.soort_warnings(to, books) {
+            lines.push(line("Let op", warning));
+        }
+    }
     // New lines replace the old ones: a kostenplaats an old line had and no new line carries lapses, said aloud.
     let mut vervalt: Vec<u64> = Vec::new();
     for id in before.regels.iter().filter_map(|r| r.kostenplaats) {
@@ -1152,7 +1310,15 @@ pub fn mutatie_gewijzigd(
     }
     Ok(Built {
         body: mutatie.body(Some(args.nr), None),
-        title: format!("Mutatie {} wijzigen ({})", args.nr, mutatie.soort.naam()),
+        title: match becomes {
+            Some(to) => format!(
+                "Mutatie {} wijzigen ({} naar {})",
+                args.nr,
+                before.soort.naam(),
+                to.naam()
+            ),
+            None => format!("Mutatie {} wijzigen ({})", args.nr, mutatie.soort.naam()),
+        },
         lines,
     })
 }
@@ -3722,6 +3888,7 @@ mod tests {
     fn wijzigen(nr: u64) -> MutatieWijzigenArgs {
         MutatieWijzigenArgs {
             nr,
+            soort: None,
             datum: None,
             rekening: None,
             omschrijving: None,
@@ -3770,6 +3937,185 @@ mod tests {
         );
         args.betalingen = Some(vec![]);
         assert!(mutatie_gewijzigd(&args, &model(), &books()).is_err());
+    }
+
+    /// What e-Boekhouden's edit screen sent for mutatie 27 of the test administration on 2026-11-27, and took.
+    #[test]
+    fn money_spent_becomes_an_invoice_received_under_the_same_number() {
+        let mut spent = model();
+        spent["mutatieRegels"][0]["btwCode"] = json!("HOOG_INK_21");
+        let mut args = wijzigen(3908);
+        args.soort = Some(Soort::FactuurOntvangen);
+        // e-Boekhouden answers a bare 500 without these; EB MCP says which one is missing.
+        assert!(
+            mutatie_gewijzigd(&args, &spent, &books())
+                .unwrap_err()
+                .contains("relatie_id")
+        );
+        args.relatie_id = Some(46484769);
+        assert!(
+            mutatie_gewijzigd(&args, &spent, &books())
+                .unwrap_err()
+                .contains("factuurnummer")
+        );
+        args.factuur = Some("INK-7".into());
+        let built = mutatie_gewijzigd(&args, &spent, &books()).unwrap();
+        assert_eq!(
+            built.body,
+            json!({
+                "mutatie": {"rekening": 26852140, "datum": "2026-11-06", "soort": 1, "inEx": "IN", "omschrijving": "Parkeergarage",
+                            "relatieId": 46484769, "factuur": "INK-7", "termijn": 0, "nr": 3908},
+                "mutatieRegels": [{"index": 0, "tegenRekening": 26852167, "btwCode": "HOOG_INK_21", "bedrag": 2.0, "omschrijving": "Parkeergarage"}],
+                "folderKoppelId": 3908
+            })
+        );
+        assert_eq!(
+            built.title,
+            "Mutatie 3908 wijzigen (Geld uitgegeven naar Factuur ontvangen)"
+        );
+        let shown = |label: &str| -> Vec<&str> {
+            built
+                .lines
+                .iter()
+                .filter(|l| l.label == label)
+                .map(|l| l.value.as_str())
+                .collect()
+        };
+        assert_eq!(shown("Soort was"), ["Geld uitgegeven"]);
+        assert_eq!(shown("Soort"), ["Factuur ontvangen"]);
+        assert_eq!(shown("Rekening"), ["1700 Crediteuren"]);
+        // The bank no longer has the payment, and nothing books it again by itself.
+        assert!(shown("Let op")[0].starts_with("de boeking gaat van 1010 Bank af"));
+        // The same kind again is no change.
+        let mut same = wijzigen(3908);
+        same.soort = Some(Soort::GeldUitgegeven);
+        assert!(
+            mutatie_gewijzigd(&same, &spent, &books())
+                .unwrap_err()
+                .contains("niets gewijzigd")
+        );
+        // An invoice is not booked on the bank.
+        args.rekening = Some("1010".into());
+        assert!(
+            mutatie_gewijzigd(&args, &spent, &books())
+                .unwrap_err()
+                .contains("categorie Crediteuren")
+        );
+    }
+
+    #[test]
+    fn a_changed_kind_takes_the_account_and_btw_codes_that_fit_it() {
+        let invoice = json!({
+            "mutatie": {"datum": "2026-11-06T00:00:00", "factuur": "INK-7", "inEx": "EX", "nr": 12, "omschrijving": "Papier",
+                        "rekening": 26852140, "relatieId": 46484769, "soort": 1, "termijn": 30},
+            "mutatieRegels": [{"bedrag": 10, "btw": 0, "btwCode": "HOOG_INK_21", "index": 0, "kostenplaats": 0, "omschrijving": "Papier", "tegenRekening": 26852160}]
+        });
+        // Back to money spent: the bank has to be named, the relation and invoice number go.
+        let mut args = wijzigen(12);
+        args.soort = Some(Soort::GeldUitgegeven);
+        assert!(
+            mutatie_gewijzigd(&args, &invoice, &books())
+                .unwrap_err()
+                .contains("rekening nodig")
+        );
+        args.rekening = Some("1010".into());
+        let built = mutatie_gewijzigd(&args, &invoice, &books()).unwrap();
+        assert_eq!(
+            built.body["mutatie"],
+            json!({"rekening": 26852133, "datum": "2026-11-06", "soort": 6, "inEx": "EX", "omschrijving": "Papier", "nr": 12})
+        );
+        assert!(built.lines.iter().any(|l| {
+            l.label == "Let op"
+                && l.value
+                    .starts_with("factuur INK-7 bestaat hierna niet meer")
+        }));
+        // To a sales invoice: debiteuren, and the purchase code becomes its sales twin.
+        let mut args = wijzigen(12);
+        args.soort = Some(Soort::FactuurVerstuurd);
+        let body = mutatie_gewijzigd(&args, &invoice, &books()).unwrap().body;
+        assert_eq!(body["mutatie"]["rekening"], 26852134);
+        assert_eq!(body["mutatieRegels"][0]["btwCode"], "HOOG_VERK_21");
+        // A code without a twin is not guessed.
+        let mut sales = invoice.clone();
+        sales["mutatie"]["soort"] = json!(2);
+        sales["mutatie"]["rekening"] = json!(26852134);
+        sales["mutatieRegels"][0]["btwCode"] = json!("LAAG_VERK_9");
+        let mut args = wijzigen(12);
+        args.soort = Some(Soort::FactuurOntvangen);
+        assert!(
+            mutatie_gewijzigd(&args, &sales, &books())
+                .unwrap_err()
+                .contains("LAAG_VERK_9 past niet")
+        );
+        args.regels = Some(vec![regel("4700", 10.0, Some("HOOG_INK_21"))]);
+        assert!(mutatie_gewijzigd(&args, &sales, &books()).is_ok());
+        // Memoriaal: no btw, always excl.
+        let mut args = wijzigen(12);
+        args.soort = Some(Soort::Memoriaal);
+        let body = mutatie_gewijzigd(&args, &invoice, &books()).unwrap().body;
+        assert_eq!(body["mutatie"]["inEx"], "EX");
+        assert_eq!(body["mutatieRegels"][0]["btwCode"], "GEEN");
+    }
+
+    #[test]
+    fn money_spent_becomes_a_payment_and_a_payment_needs_lines_to_become_anything_else() {
+        let mut args = wijzigen(3908);
+        args.soort = Some(Soort::FactuurbetalingVerstuurd);
+        assert!(
+            mutatie_gewijzigd(&args, &model(), &books())
+                .unwrap_err()
+                .contains("betalingen nodig")
+        );
+        args.betalingen = Some(vec![BetalingArg {
+            relatie_id: 46484769,
+            factuur: "INK-7".into(),
+            bedrag: 2.0,
+        }]);
+        let body = mutatie_gewijzigd(&args, &model(), &books()).unwrap().body;
+        assert_eq!(
+            body["mutatie"],
+            json!({"rekening": 26852133, "datum": "2026-11-06", "soort": 4, "omschrijving": "Parkeergarage", "nr": 3908})
+        );
+        assert_eq!(
+            body["mutatieRegels"],
+            json!([{"index": 0, "bedrag": 2.0, "btw": 0, "btwCode": "GEEN", "relatieId": 46484769, "factuur": "INK-7"}])
+        );
+        let payment = json!({
+            "mutatie": {"datum": "2026-11-11T00:00:00", "factuur": "INK-7", "inEx": "EX", "nr": 11, "omschrijving": "Betaling", "rekening": 26852133, "relatieId": 46484769, "soort": 4, "termijn": 0},
+            "mutatieRegels": [{"bedrag": 2, "btw": 0, "btwCode": "GEEN", "index": 0, "kostenplaats": 0, "omschrijving": "Betaling",
+                               "openPostModel": {"bedrag": 2, "factuurNummer": "INK-7", "relatieId": 46484769}, "tegenRekening": 26852140}]
+        });
+        let mut args = wijzigen(11);
+        args.soort = Some(Soort::GeldUitgegeven);
+        assert!(
+            mutatie_gewijzigd(&args, &payment, &books())
+                .unwrap_err()
+                .contains("regels nodig")
+        );
+        args.regels = Some(vec![regel("4550", 2.0, None)]);
+        let built = mutatie_gewijzigd(&args, &payment, &books()).unwrap();
+        assert_eq!(
+            built.body["mutatie"],
+            json!({"rekening": 26852133, "datum": "2026-11-11", "soort": 6, "inEx": "IN", "omschrijving": "Betaling", "nr": 11})
+        );
+        assert_eq!(
+            built.body["mutatieRegels"],
+            json!([{"index": 0, "tegenRekening": 26852167, "btwCode": "GEEN", "bedrag": 2.0}])
+        );
+        assert!(
+            built
+                .lines
+                .iter()
+                .any(|l| l.label == "Let op" && l.value.contains("staan hierna weer open"))
+        );
+        // Between the two kinds of payment the invoices are named anew.
+        let mut args = wijzigen(11);
+        args.soort = Some(Soort::FactuurbetalingOntvangen);
+        assert!(
+            mutatie_gewijzigd(&args, &payment, &books())
+                .unwrap_err()
+                .contains("betalingen nodig")
+        );
     }
 
     #[test]
