@@ -1621,6 +1621,48 @@ impl EbMcp {
             .ok_or_else(|| Halt::Error("e-Boekhouden heeft het bestand niet opgeslagen".into()))
     }
 
+    /// The open invoices of the relations a mutatie is about to pay, when `mutatie_wijzigen` turns it into a
+    /// payment (`write::betalingen_na_te_kijken`); `None` for every other edit. Read page by page: a relation
+    /// can have more open invoices than one page holds.
+    async fn open_posten_van(
+        &self,
+        run: &Run,
+        args: &write::MutatieWijzigenArgs,
+        model: &Value,
+    ) -> Result<Option<Vec<write::OpenPost>>, Halt> {
+        const PAGES: u32 = 25;
+        let Some((to, relaties)) = write::betalingen_na_te_kijken(args, model) else {
+            return Ok(None);
+        };
+        let soort = if to == write::Soort::FactuurbetalingVerstuurd {
+            "Crediteur"
+        } else {
+            "Debiteur"
+        };
+        let mut open = Vec::new();
+        for relatie in relaties {
+            for page in 0..PAGES {
+                let mut query = grid(Some(MAX_ROWS), Some(page * MAX_ROWS)).map_err(Halt::Error)?;
+                query.push(("soort".into(), soort.into()));
+                query.push(("zoeken".into(), "true".into()));
+                query.push(("relatieId".into(), relatie.to_string()));
+                let rows = named_rows(
+                    self.fetch(run, "openpost/gridtable/openpost", query)
+                        .await?,
+                );
+                let count = rows
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                open.extend(write::OpenPost::from_page(&rows));
+                if count < MAX_ROWS as usize {
+                    break;
+                }
+            }
+        }
+        Ok(Some(open))
+    }
+
     /// Links a file in the archive to mutatie `nr`, after the approval.
     async fn link_file(&self, run: &Run, id: u64, nr: u64) -> Result<Value, Halt> {
         let link =
@@ -3731,7 +3773,7 @@ impl EbMcp {
     }
 
     #[tool(
-        description = "Een bestaande mutatie wijzigen, op mutatienummer. Wat je niet noemt blijft zoals het is; regels of betalingen die je meegeeft vervangen alle bestaande. Met soort wordt de mutatie een andere soort, zoals in e-Boekhoudens eigen wijzigscherm: het mutatienummer en de bijlagen blijven. Van geld_uitgegeven naar factuur_ontvangen (of geld_ontvangen naar factuur_verstuurd): geef relatie_id en factuur; de rekening wordt de crediteuren- of debiteurenrekening en de regels blijven. De boeking gaat daarmee van de bankrekening af: e-Boekhouden boekt zelf geen betaling, en een bankregel waaruit de mutatie gemaakt was komt niet terug bij de onverwerkte bankregels, dus boek de betaling daarna los met mutatie_toevoegen (factuurbetaling, zonder bankregel_id). Naar een factuurbetaling: geef betalingen. Van een factuur of factuurbetaling af: e-Boekhouden weigert niet als er al een betaling op de factuur staat, kijk dat dus eerst na; het voorstel zegt wat er achterblijft. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
+        description = "Een bestaande mutatie wijzigen, op mutatienummer. Wat je niet noemt blijft zoals het is; regels of betalingen die je meegeeft vervangen alle bestaande. Met soort wordt de mutatie een andere soort, zoals in e-Boekhoudens eigen wijzigscherm: het mutatienummer en de bijlagen blijven. Van geld_uitgegeven naar factuur_ontvangen (of geld_ontvangen naar factuur_verstuurd): geef relatie_id en factuur; de rekening wordt de crediteuren- of debiteurenrekening en de regels blijven. De boeking gaat daarmee van de bankrekening af: e-Boekhouden boekt zelf geen betaling, en een bankregel waaruit de mutatie gemaakt was komt niet terug bij de onverwerkte bankregels, dus boek de betaling daarna los met mutatie_toevoegen (factuurbetaling, zonder bankregel_id). Naar een factuurbetaling (zo blijft een boeking uit een bankregel de betaling, op dezelfde bankrekening, en komt de factuur er als eigen mutatie naast): geef betalingen; EB MCP kijkt eerst bij de open posten of elke factuur bij die relatie open staat en weigert een betaling van meer dan er open staat. Van een factuur of factuurbetaling af: e-Boekhouden weigert niet als er al een betaling op de factuur staat, kijk dat dus eerst na; het voorstel zegt wat er achterblijft. Werkt alleen als de gebruiker schrijven voor het account heeft aangezet; de gebruiker keurt de wijziging eerst goed in EB MCP. Vraagt de wijziging akkoord, dan komt er status wacht met een voorstel_id terug: de wijziging gaat door zodra de gebruiker in EB MCP goedkeurt, akkoord_status geeft later de uitkomst, en je kunt intussen verder met ander werk. Doe de aanroep dan niet opnieuw. Heeft de gebruiker wachten in de aanroep aangezet, dan blijft de aanroep eerst hooguit een paar minuten open en geeft hij de uitkomst zelf als de gebruiker in die tijd beslist.",
         annotations(
             title = "Mutatie wijzigen",
             read_only_hint = false,
@@ -3764,8 +3806,12 @@ impl EbMcp {
                         write::model_has_kostenplaats(&model),
                     )
                     .await?;
-                let built = write::mutatie_gewijzigd(&args, &model, &books)?;
+                let open = this.open_posten_van(&run, &args, &model).await?;
+                let built = write::mutatie_gewijzigd(&args, &model, &books, open.as_deref())?;
                 this.approve(&run, TOOL, &built, false).await?;
+                // The invoices may have been paid or changed while the proposal waited.
+                let open = this.open_posten_van(&run, &args, &model).await?;
+                write::mutatie_gewijzigd(&args, &model, &books, open.as_deref())?;
                 this.change(&run, "PUT", "mutatie", Some(&built.body)).await
             },
         )
