@@ -11,10 +11,12 @@ import ExportNotice from '../components/ExportNotice.vue'
 import FilePreview from '../components/FilePreview.vue'
 import Icon from '../components/Icon.vue'
 import JsonView from '../components/JsonView.vue'
+import ReturnBox from '../components/ReturnBox.vue'
+import StatementSheet from '../components/StatementSheet.vue'
 import { store } from '../lib/accounts'
 import {
   ago, approvalDetail, approvalState, connectApprovals, decideAll, decideApproval, decisionLabel, exportApprovals, filterHistory,
-  followSelection, nameList, proposalKind, refreshApprovals, refreshHistory, splitTitle, stamp, recordStatus, STATUSES, watchHistory,
+  followSelection, nameList, proposalKind, refreshApprovals, refreshHistory, returnApproval, splitTitle, stamp, recordStatus, STATUSES, watchHistory,
   type ApprovalDetail, type ApprovalRecord, type ApprovalStatus, type DecideAllResult, type Proposal,
 } from '../lib/approvals'
 import { useExport } from '../lib/exporting'
@@ -50,7 +52,7 @@ function onTabKey(event: KeyboardEvent) {
 const queue = computed(() => store.approvals)
 /** Accounts that are not signed in now: a change approved for one of them fails, so the page says so first. */
 const signedOut = computed(() => new Set(store.loaded ? store.accounts.filter((a) => !a.session || a.session.expired).map((a) => a.id) : []))
-const busy = reactive(new Map<number, 'approve' | 'refuse'>())
+const busy = reactive(new Map<number, 'approve' | 'refuse' | 'return'>())
 const bulk = ref<'approve' | 'refuse' | null>(null)
 const feedback = ref<{ tone: 'ok' | 'warn' | 'bad'; text: string } | null>(null)
 
@@ -129,6 +131,39 @@ async function decide(proposal: Proposal, approve: boolean) {
   // The last one answered: the queue's tab keeps the focus while the empty state takes the detail's place.
   if (current.value === null) document.getElementById('tab-queue')?.focus()
   else focusRow(current.value)
+}
+
+/** The proposal whose field "Terug naar de AI-client" is open, and the one whose statement is on its sheet. */
+const returning = ref<number | null>(null)
+const checking = ref<number | null>(null)
+const checked = computed(() => queue.value.find((p) => p.id === checking.value) ?? null)
+// Another proposal chosen, or this one answered elsewhere: the field closes, and the sheet with its proposal.
+watch(current, () => (returning.value = null))
+watch(checked, (proposal) => {
+  if (!proposal) checking.value = null
+})
+
+/** Sends a proposal back to the AI client with what the user wrote: nothing goes to e-Boekhouden. */
+async function giveBack(proposal: Proposal, remark: string) {
+  if (busy.has(proposal.id) || bulk.value) return
+  busy.set(proposal.id, 'return')
+  feedback.value = null
+  try {
+    await returnApproval(proposal.id, remark)
+    returning.value = null
+    checking.value = null
+    feedback.value = { tone: 'ok', text: `Voorstel ${proposal.id} is teruggestuurd naar ${proposal.client} met je opmerking. Er is niets gewijzigd in e-Boekhouden.` }
+  } catch (error) {
+    feedback.value = { tone: 'bad', text: `${proposal.title}: ${String(error)}` }
+  } finally {
+    busy.delete(proposal.id)
+  }
+}
+
+/** The answer from the sheet: the same as the detail's buttons, and the sheet closes with its proposal. */
+async function decideFromSheet(proposal: Proposal, approve: boolean) {
+  await decide(proposal, approve)
+  if (!queue.value.some((p) => p.id === proposal.id)) checking.value = null
 }
 
 /** What Alles goedkeuren asks about: the proposals on screen when it was clicked, and only those. */
@@ -322,7 +357,7 @@ function showInQueue(id: number) {
 }
 
 /** The outcome in words, for the detail. */
-function outcome(record: ApprovalRecord): { tone: 'ok' | 'warn' | 'bad' | 'info' | 'off'; text: string } {
+function outcome(record: ApprovalRecord): { tone: 'ok' | 'warn' | 'bad' | 'info' | 'off' | 'back'; text: string } {
   switch (record.status) {
     case 'waiting': return { tone: 'info', text: 'Wacht op je akkoord.' }
     case 'running': return { tone: 'info', text: 'EB MCP voert deze wijziging nu uit in e-Boekhouden.' }
@@ -333,6 +368,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'warn' | 'bad' | 'info'
     case 'refused': return { tone: 'off', text: record.error ?? 'Geweigerd. Er is niets gewijzigd in e-Boekhouden.' }
     // The reason names the client and what it gave as its reason.
     case 'withdrawn': return { tone: 'off', text: record.error ?? 'Ingetrokken door de AI-client. Er is niets gewijzigd in e-Boekhouden.' }
+    case 'returned': return { tone: 'back', text: `Teruggestuurd naar ${record.client}. Er is niets gewijzigd in e-Boekhouden.` }
     case 'lapsed':
       return record.decision === 'lapsed' || record.decision === null
         ? { tone: 'off', text: record.error ?? 'Vervallen zonder antwoord. Er is niets gewijzigd in e-Boekhouden.' }
@@ -445,21 +481,35 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'warn' | 'bad' | 'info'
                         </div>
                       </dl>
                     </div>
+                    <div v-if="chosen.statement" class="note info statement-note" role="note">
+                      <Icon name="list-checks" :size="14" class="note-icon" />
+                      <p>Er is nog niets ingelezen. Wat meegaat kies jij hier, niet de AI-client: {{ chosen.client }} deed alleen een voorstel voor wat eruit kan.</p>
+                      <button type="button" class="btn small primary check-lines" @click="checking = chosen.id">Regels controleren</button>
+                    </div>
                     <div v-if="chosen.file" class="q-file">
                       <h3 class="section-label">Bestand</h3>
                       <FilePreview :id="chosen.id" :file="chosen.file" />
                     </div>
                   </div>
                   <footer class="q-foot">
+                    <Transition name="accordion">
+                      <ReturnBox
+                        v-if="returning === chosen.id && checking === null" class="q-return" :client="chosen.client" :busy="busy.get(chosen.id) === 'return'"
+                        @send="giveBack(chosen, $event)" @cancel="returning = null"
+                      />
+                    </Transition>
                     <span class="q-pos">Voorstel #{{ chosen.id }}, {{ position }} van {{ queue.length }} in de wachtrij</span>
                     <span class="q-actions">
                       <button type="button" class="btn refuse" :disabled="busy.has(chosen.id) || !!bulk" :aria-busy="busy.get(chosen.id) === 'refuse'" @click="decide(chosen, false)">
                         <span class="btn-label">Weigeren</span>
                       </button>
+                      <button type="button" class="btn give-back" :disabled="busy.has(chosen.id) || !!bulk || returning === chosen.id" @click="returning = chosen.id">
+                        <Icon name="reply" :size="14" />Terug naar {{ chosen.client }}
+                      </button>
                       <button
                         type="button" class="btn approve" :class="chosen.danger ? 'danger-fill' : 'primary'" :disabled="busy.has(chosen.id) || !!bulk"
                         :aria-busy="busy.get(chosen.id) === 'approve'" @click="decide(chosen, true)"
-                      ><span class="btn-label">Goedkeuren</span></button>
+                      ><span class="btn-label">{{ chosen.statement ? `Inlezen (${chosen.statement.included})` : 'Goedkeuren' }}</span></button>
                     </span>
                   </footer>
                 </div>
@@ -523,6 +573,10 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'warn' | 'bad' | 'info'
                         <p class="selectable">{{ outcome(selected).text }}</p>
                         <button v-if="selected.status === 'waiting'" type="button" class="btn small" @click="showInQueue(selected.id)">Naar de wachtrij</button>
                       </div>
+                      <section v-if="selected.remark">
+                        <h3 class="section-label">Je opmerking</h3>
+                        <p class="remark selectable">{{ selected.remark }}</p>
+                      </section>
                       <section>
                         <h3 class="section-label">Wat</h3>
                         <dl class="lines selectable">
@@ -596,6 +650,12 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'warn' | 'bad' | 'info'
       </template>
     </Alert>
   </Transition>
+  <Transition name="modal">
+    <StatementSheet
+      v-if="checked" :key="checked.id" :proposal="checked" :busy="busy.get(checked.id) ?? null"
+      @close="checking = null" @decide="decideFromSheet(checked, $event)" @give-back="giveBack(checked, $event)"
+    />
+  </Transition>
 </template>
 
 <style scoped>
@@ -620,6 +680,14 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'warn' | 'bad' | 'info'
 .note.warn { background: var(--warn-soft); color: var(--warn); }
 .note.info { background: var(--info-soft); color: var(--info); }
 .note.off { background: var(--subtle); color: var(--label); }
+.note.back { background: var(--back-soft); color: var(--back); }
+.statement-note { display: flex; align-items: flex-start; gap: 8px; color: var(--text); }
+.statement-note p { flex: 1; min-width: 0; margin: 0; }
+.statement-note .note-icon { color: var(--info); }
+.statement-note .btn { flex: none; }
+.remark { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 17px; }
+.q-return { flex-basis: 100%; }
+.give-back { gap: 6px; }
 .note-icon { flex: none; margin-top: 1px; }
 .feedback-slot { padding: 0 16px 10px; }
 .note.feedback { display: flex; align-items: flex-start; gap: 8px; padding: 5px 6px 5px 11px; }
@@ -713,6 +781,7 @@ function outcome(record: ApprovalRecord): { tone: 'ok' | 'warn' | 'bad' | 'info'
 .chip.warn { background: var(--warn-soft); color: var(--warn); }
 .chip.run { background: var(--info-soft); color: var(--info); }
 .chip.off { background: var(--subtle); color: var(--muted); }
+.chip.back { background: var(--back-soft); color: var(--back); }
 .chip.auto { background: transparent; color: var(--muted); box-shadow: inset 0 0 0 0.5px var(--line); }
 
 .split { flex: 1; min-height: 0; display: flex; }

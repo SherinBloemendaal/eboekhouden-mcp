@@ -13,6 +13,7 @@ mod secrets;
 mod settings;
 mod signin;
 mod state;
+mod statement;
 mod tools;
 mod updates;
 mod write;
@@ -351,6 +352,85 @@ fn approval_decide(app_state: Shared<'_, AppState>, id: u64, approve: bool) -> R
     } else {
         Err("Dit voorstel wacht niet meer: het is al beantwoord of vervallen".into())
     }
+}
+
+/// Akkoord, "Terug naar de AI-client": the user sends a waiting proposal back with a remark instead of approving
+/// or refusing it. Nothing goes to e-Boekhouden. The AI client gets the remark as the answer to its call (or
+/// through `akkoord_status`), with the sheet as the user left it when the proposal is a statement, so it can
+/// make a new proposal from there.
+#[tauri::command]
+fn approval_return(app_state: Shared<'_, AppState>, id: u64, remark: String) -> Result<(), String> {
+    let remark = returned_remark(&remark)?;
+    let answered = app_state
+        .approvals
+        .give_back(id, &remark, returned_message, state::now_ms());
+    let _ = app_state.events.send(state::AppEvent::ApprovalsChanged);
+    match answered {
+        Some(true) => Ok(()),
+        _ => Err("Dit voorstel wacht niet meer: het is al beantwoord of vervallen".into()),
+    }
+}
+
+/// The remark of a proposal that goes back, as one tidy text. It has to say something: without a remark the
+/// AI client would not know what to change.
+fn returned_remark(remark: &str) -> Result<String, String> {
+    const MAX: usize = 2000;
+    let remark = remark
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if remark.is_empty() {
+        return Err("Schrijf wat er anders moet: zonder opmerking weet de AI-client niet wat hij moet aanpassen".into());
+    }
+    if remark.chars().count() > MAX {
+        return Err(format!("De opmerking is langer dan {MAX} tekens"));
+    }
+    Ok(remark)
+}
+
+/// What the AI client hears of a proposal the user sent back.
+fn returned_message(remark: &str, statement: Option<&statement::Statement>) -> String {
+    let mut message = format!(
+        "De gebruiker heeft dit voorstel in EB MCP teruggestuurd met een opmerking; er is niets gewijzigd in \
+         e-Boekhouden. De opmerking van de gebruiker: {remark:?}. Pas het voorstel daarop aan en doe de aanroep \
+         opnieuw; vraag het de gebruiker als de opmerking niet duidelijk is."
+    );
+    if let Some(statement) = statement {
+        message.push_str(&format!(
+            " Zo stond het controlescherm toen de gebruiker het terugstuurde, in de parameters van \
+             afschrift_inlezen (neem over wat de gebruiker zelf heeft ingesteld): {}",
+            statement.as_args()
+        ));
+    }
+    message
+}
+
+/// Akkoord, the sheet "Afschrift controleren": the lines of the statement a waiting proposal reads in, with
+/// what goes along and why not.
+#[tauri::command]
+fn approval_statement(app_state: Shared<'_, AppState>, id: u64) -> Result<statement::View, String> {
+    app_state
+        .approvals
+        .statement(id)
+        .ok_or_else(|| "Dit voorstel wacht niet meer of heeft geen afschrift.".to_owned())
+}
+
+/// One change on that sheet: the columns, the start line, the account, a rule, a tick. The proposal follows, so
+/// what is approved is what the sheet shows.
+#[tauri::command]
+fn approval_statement_edit(
+    app_state: Shared<'_, AppState>,
+    id: u64,
+    edit: statement::Edit,
+) -> Result<statement::View, String> {
+    let view = app_state
+        .approvals
+        .statement_edit(id, edit)
+        .ok_or_else(|| "Dit voorstel wacht niet meer of heeft geen afschrift.".to_owned())??;
+    let _ = app_state.events.send(state::AppEvent::ApprovalsChanged);
+    Ok(view)
 }
 
 /// One answer for several proposals: exactly the ids the user saw, so one that came up meanwhile is never
@@ -1551,6 +1631,9 @@ pub fn run() {
             signin_all,
             approvals_list,
             approval_decide,
+            approval_return,
+            approval_statement,
+            approval_statement_edit,
             approvals_decide_all,
             approvals_history,
             approval_get,
@@ -1883,7 +1966,45 @@ mod tests {
             danger: false,
             asked_at: 1,
             file: None,
+            statement: None,
         }
+    }
+
+    #[test]
+    fn a_remark_that_goes_back_is_tidied_and_has_to_say_something() {
+        assert_eq!(
+            returned_remark("  De bakker   is privé \n\n  doe die apart ").unwrap(),
+            "De bakker is privé\ndoe die apart"
+        );
+        assert!(
+            returned_remark(" \n ")
+                .unwrap_err()
+                .contains("zonder opmerking")
+        );
+        assert!(
+            returned_remark(&"a".repeat(2001))
+                .unwrap_err()
+                .contains("2000")
+        );
+        let plain = returned_message("Fout bedrag", None);
+        assert!(
+            plain.contains("\"Fout bedrag\"") && plain.contains("er is niets gewijzigd"),
+            "{plain}"
+        );
+        assert!(!plain.contains("afschrift_inlezen"));
+        let mut read =
+            statement::Statement::new("k.csv", b"Datum;Omschrijving;Bedrag\n01-02-2026;A;-1,50")
+                .unwrap();
+        read.ledgers = vec![statement::Ledger {
+            id: 1,
+            code: "1820".into(),
+            name: "Credit card".into(),
+        }];
+        let with = returned_message("Fout bedrag", Some(&read));
+        assert!(
+            with.contains("afschrift_inlezen") && with.contains("\"rekening\":\"1820\""),
+            "{with}"
+        );
     }
 
     #[cfg(target_os = "macos")]

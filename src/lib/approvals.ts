@@ -21,6 +21,15 @@ export interface Proposal {
   askedAt: number
   /** The file the change sends along (an upload to the digitaal archief), shown before Goedkeuren. */
   file?: Attachment
+  /** The statement the change reads in (afschrift_inlezen): checked line by line on its own sheet before Goedkeuren. */
+  statement?: StatementInfo
+}
+
+/** What a proposal says of its statement without the lines (statement.rs, `Info`). */
+export interface StatementInfo {
+  fileName: string
+  lines: number
+  included: number
 }
 
 /** A file from this computer that a change sends to e-Boekhouden (approvals.rs, `Attachment`). */
@@ -44,9 +53,9 @@ export interface FilePreview {
   data: string
 }
 
-export type ApprovalStatus = 'waiting' | 'running' | 'done' | 'failed' | 'refused' | 'lapsed' | 'withdrawn'
+export type ApprovalStatus = 'waiting' | 'running' | 'done' | 'failed' | 'refused' | 'lapsed' | 'withdrawn' | 'returned'
 /** How the proposal was answered: by the user, without approval (the account books freely), or not in time. */
-export type ApprovalDecision = 'approved' | 'refused' | 'auto' | 'lapsed' | 'withdrawn'
+export type ApprovalDecision = 'approved' | 'refused' | 'auto' | 'lapsed' | 'withdrawn' | 'returned'
 
 /** A proposal in the history, waiting or answered, with what came of it. */
 export interface ApprovalRecord extends Proposal {
@@ -56,6 +65,8 @@ export interface ApprovalRecord extends Proposal {
   error: string | null
   /** What did not come of a change that is done: the change stands, a part that goes with it (an attachment) does not. */
   note?: string | null
+  /** What the user wrote when sending the proposal back to the AI client. */
+  remark?: string | null
   /** The EB MCP version that took the proposal in. */
   version: string
   /** Answered with Alles goedkeuren or Alles weigeren rather than on its own. */
@@ -157,6 +168,10 @@ export async function connectApprovals(): Promise<void> {
 export const decideApproval = (id: number, approve: boolean): Promise<void> =>
   invoke<void>('approval_decide', { id, approve }).finally(refreshApprovals)
 
+/** Sends a waiting proposal back to the AI client with a remark: nothing goes to e-Boekhouden. Rejects with a Dutch sentence. */
+export const returnApproval = (id: number, remark: string): Promise<void> =>
+  invoke<void>('approval_return', { id, remark }).finally(refreshApprovals)
+
 /** Answers exactly these proposals, and no others that came in meanwhile. */
 export const decideAll = (ids: number[], approve: boolean): Promise<DecideAllResult> =>
   invoke<DecideAllResult>('approvals_decide_all', { ids, approve }).finally(refreshApprovals)
@@ -166,7 +181,7 @@ export const approvalDetail = (id: number): Promise<ApprovalDetail> => invoke<Ap
 /** Writes the history to a .jsonl.gz file and gives its absolute path. */
 export const exportApprovals = (): Promise<string> => invoke<string>('approvals_export')
 
-export type StatusTone = 'ok' | 'bad' | 'warn' | 'run' | 'off'
+export type StatusTone = 'ok' | 'bad' | 'warn' | 'run' | 'off' | 'back'
 
 export const STATUSES: { value: ApprovalStatus; label: string; tone: StatusTone }[] = [
   { value: 'waiting', label: 'Wacht', tone: 'run' },
@@ -177,6 +192,8 @@ export const STATUSES: { value: ApprovalStatus; label: string; tone: StatusTone 
   { value: 'lapsed', label: 'Vervallen', tone: 'off' },
   // Taken back by the AI client itself (akkoord_intrekken) before the user answered.
   { value: 'withdrawn', label: 'Ingetrokken', tone: 'off' },
+  // Sent back to the AI client by the user, with a remark, instead of approved or refused.
+  { value: 'returned', label: 'Teruggestuurd', tone: 'back' },
 ]
 
 export function statusOf(status: ApprovalStatus): { label: string; tone: StatusTone } {
@@ -196,6 +213,7 @@ export function decisionLabel(decision: ApprovalDecision | null, bulk = false): 
     case 'auto': return 'Zonder akkoord: dit account boekt direct'
     case 'lapsed': return 'Niet beantwoord'
     case 'withdrawn': return 'Ingetrokken door de AI-client'
+    case 'returned': return 'Teruggestuurd naar de AI-client'
     default: return 'Nog niet beantwoord'
   }
 }
@@ -230,6 +248,7 @@ export function proposalKind(proposal: Pick<Proposal, 'tool' | 'danger'>): Propo
 }
 
 function kindOfTool(tool: string): ProposalKind {
+  if (tool.endsWith('_inlezen')) return { icon: 'list-checks', tone: 'accent' }
   // By what the name ends in, so a tool added later (offerte_mailen, archief_ontkoppelen) gets its icon by itself.
   if (tool.endsWith('_mailen') || tool.endsWith('_versturen')) return { icon: 'mail', tone: 'neutral' }
   if (tool.endsWith('_crediteren') || tool.endsWith('_factureren')) return { icon: 'file-text', tone: 'neutral' }
@@ -311,3 +330,150 @@ export function previewKind(kind: string | null | undefined): 'image' | 'pdf' | 
   if (kind === 'application/pdf') return 'pdf'
   return kind?.startsWith('image/') ? 'image' : null
 }
+
+// ---------------------------------------------------------------- the statement of a proposal (statement.rs)
+
+/** Year, month, day. */
+export type Ymd = [number, number, number]
+
+/** What a rule that leaves lines out looks at (statement.rs, `Test`). */
+export type StatementTest =
+  | { kind: 'contains'; text: string }
+  | { kind: 'column'; column: number; value: string }
+  | { kind: 'until'; date: Ymd }
+  | { kind: 'from'; date: Ymd }
+  | { kind: 'amount'; cents: number }
+  | { kind: 'incoming' }
+  | { kind: 'outgoing' }
+  | { kind: 'cancelling' }
+
+export type StatementRule = StatementTest & {
+  on: boolean
+  /** Who put it there: the AI client as a proposal, or the user. */
+  by: 'client' | 'user'
+  why?: string
+  label: string
+  /** The lines it leaves out now. */
+  count: number
+}
+
+export type StatementOut =
+  | { kind: 'beforeStart' }
+  | { kind: 'unreadable'; what: string }
+  | { kind: 'rule'; rule: number }
+  | { kind: 'user' }
+
+export interface StatementRow {
+  line: number
+  cells: string[]
+  /** ISO, or null when the chosen column holds no date. */
+  date: string | null
+  description: string
+  cents: number | null
+  included: boolean
+  out: StatementOut | null
+  /** The rule that would leave it out, when the user ticked it all the same. */
+  overruled: number | null
+}
+
+export interface StatementMapping {
+  date: number
+  description: number
+  amount: number
+  /** The first line that counts. */
+  start: number
+}
+
+export interface StatementView {
+  fileName: string
+  header: string[]
+  delimiter: string
+  empty: number
+  mapping: StatementMapping
+  rules: StatementRule[]
+  dedupe: boolean
+  ledgers: { id: number; code: string; name: string }[]
+  ledger: number
+  rows: StatementRow[]
+  totals: {
+    lines: number
+    included: number
+    skipped: number
+    unreadable: number
+    cents: number
+    first: string | null
+    last: string | null
+    perRule: number[]
+  }
+}
+
+export type StatementEdit =
+  | { kind: 'mapping'; mapping: StatementMapping }
+  | { kind: 'ledger'; index: number }
+  | { kind: 'dedupe'; on: boolean }
+  | { kind: 'addRule'; test: StatementTest }
+  | { kind: 'toggleRule'; index: number; on: boolean }
+  | { kind: 'removeRule'; index: number }
+  | { kind: 'tick'; lines: number[]; included: boolean }
+  | { kind: 'clearTicks' }
+
+/** The statement of a proposal that still waits. Rejects with a Dutch sentence. */
+export const approvalStatement = (id: number): Promise<StatementView> => invoke<StatementView>('approval_statement', { id })
+/** One change on the sheet; gives the statement as it is after it. */
+export const editStatement = (id: number, edit: StatementEdit): Promise<StatementView> =>
+  invoke<StatementView>('approval_statement_edit', { id, edit })
+
+/** Cents as "1.234,56" or "-24,00". */
+export function euroCents(cents: number): string {
+  const abs = Math.abs(cents)
+  const whole = Math.floor(abs / 100).toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.')
+  return `${cents < 0 ? '-' : ''}${whole},${String(abs % 100).padStart(2, '0')}`
+}
+
+/** "2026-11-06" as "06-11-2026". */
+export function dutchDate(iso: string | null): string {
+  if (!iso) return ''
+  const [y, m, d] = iso.split('-')
+  return `${d}-${m}-${y}`
+}
+
+/** Why a line does not go along, in a few words. */
+export function outReason(out: StatementOut | null, rules: StatementRule[]): string {
+  switch (out?.kind) {
+    case 'beforeStart': return 'Voor de startregel'
+    case 'unreadable': return `Niet te lezen: ${out.what}`
+    case 'rule': return rules[out.rule]?.label ?? 'Regel'
+    case 'user': return 'Zelf uitgezet'
+    default: return ''
+  }
+}
+
+/** The rows the sheet lists: by tab, and by the words typed in the search field. Lines before the start line are left out of every tab. */
+export function filterRows(rows: StatementRow[], tab: 'all' | 'in' | 'out', query: string): StatementRow[] {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean)
+  return rows.filter((row) => {
+    if (row.out?.kind === 'beforeStart') return false
+    if (tab === 'in' && !row.included) return false
+    if (tab === 'out' && row.included) return false
+    const text = row.cells.join(' ').toLowerCase()
+    return words.every((word) => text.includes(word))
+  })
+}
+
+/** Whether a line would be left out by this test: what the sheet highlights while a rule is being made. */
+export function testHits(test: StatementTest, row: StatementRow): boolean {
+  if (row.out?.kind === 'beforeStart' || row.out?.kind === 'unreadable') return false
+  switch (test.kind) {
+    case 'contains': return test.text.trim() !== '' && row.description.toLowerCase().includes(test.text.trim().toLowerCase())
+    case 'column': return test.value.trim() !== '' && (row.cells[test.column] ?? '').trim().toLowerCase() === test.value.trim().toLowerCase()
+    case 'until': return row.date !== null && row.date <= isoOf(test.date)
+    case 'from': return row.date !== null && row.date >= isoOf(test.date)
+    case 'amount': return row.cents === test.cents
+    case 'incoming': return (row.cents ?? 0) > 0
+    case 'outgoing': return (row.cents ?? 0) < 0
+    // Pairs are worked out by EB MCP itself; nothing to highlight before the rule is there.
+    case 'cancelling': return false
+  }
+}
+
+const isoOf = ([y, m, d]: Ymd) => `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`

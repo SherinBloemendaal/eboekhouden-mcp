@@ -1792,6 +1792,336 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty(), "nothing went out");
     }
 
+    /// afschrift_inlezen: the file is read by EB MCP and put up as one proposal with its statement, also on an
+    /// account that books without approval. The user changes it on the sheet; after Goedkeuren only the ticked
+    /// lines go to e-Boekhouden, as a csv of EB MCP's own, through the upload, the hub and the import rules.
+    /// A proposal that is sent back sends nothing and tells the client what the user wrote.
+    #[tokio::test]
+    async fn a_statement_is_read_in_as_the_user_left_it_on_the_sheet() {
+        use crate::accounts::{AccountInput, Rights, Store};
+        use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post as on_post};
+        use base64::Engine;
+        let seen = Arc::new(std::sync::Mutex::new(
+            Vec::<(String, serde_json::Value)>::new(),
+        ));
+        let (uploads, jobs, rules) = (seen.clone(), seen.clone(), seen.clone());
+        async fn hub(
+            mut socket: WebSocket,
+            jobs: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        ) {
+            let Some(Ok(WsMessage::Text(_))) = socket.recv().await else {
+                return;
+            };
+            socket
+                .send(WsMessage::Text("{}\u{1e}".into()))
+                .await
+                .unwrap();
+            let Some(Ok(WsMessage::Text(call))) = socket.recv().await else {
+                return;
+            };
+            let call: serde_json::Value =
+                serde_json::from_str(call.as_str().trim_end_matches('\u{1e}')).unwrap();
+            assert_eq!(call["target"], "import");
+            jobs.lock()
+                .unwrap()
+                .push(("hub/ImportFile".into(), call["arguments"][0].clone()));
+            let answer = format!(
+                "{}\u{1e}{}\u{1e}{}\u{1e}",
+                serde_json::json!({"type": 1, "target": "startImport", "arguments": [2]}),
+                serde_json::json!({"type": 1, "target": "rowProcessed", "arguments": [{"rowsProcessed": 2}]}),
+                serde_json::json!({"type": 1, "target": "done", "arguments": [{"dubbel": 1, "mogelijkDubbel": 0, "aangemaakt": 1, "createdImports": [468942710u64]}]})
+            );
+            socket.send(WsMessage::Text(answer.into())).await.unwrap();
+        }
+        let app = axum::Router::new()
+            .route(
+                "/v1/api/grootboekrekening/bankgiro",
+                get(|| async {
+                    axum::Json(serde_json::json!([
+                        {"id": 11, "code": "1010", "omschrijving": "Bank", "inactief": false},
+                        {"id": 18, "code": "1820", "omschrijving": "Credit card", "inactief": false}
+                    ]))
+                }),
+            )
+            .route(
+                "/v1/api/importfile/uploadfile",
+                on_post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let uploads = uploads.clone();
+                    async move {
+                        uploads.lock().unwrap().push(("importfile/uploadfile".into(), body));
+                        axum::Json(serde_json::json!({"fileId": 3148475, "fileFormat": "CSV_SEMIL", "customFileId": 1506486}))
+                    }
+                }),
+            )
+            .route(
+                "/v1/api/importfile/csv/response",
+                get(|axum::extract::RawQuery(query): axum::extract::RawQuery| async move {
+                    assert_eq!(query.as_deref(), Some("customImportId=1506486"));
+                    axum::Json(serde_json::json!({
+                        "request": {"step": 0, "importfile": {"data": "QUJD", "name": "eb-mcp-kaart.csv", "size": 3, "type": "text/csv"}, "fileGuid": "g.csv", "sheet": 1, "startFromRow": 0, "importType": "AFSCHRIFT", "forAcc": false},
+                        "response": {"requiredTargetColumns": ["Datum", "Omschrijving", "Bedrag"], "optionalTargetColumns": ["Credit/Debit", "Rekeningnummer"]}
+                    }))
+                }),
+            )
+            .route(
+                "/v1/api/hub/ImportFile/negotiate",
+                on_post(|| async { axum::Json(serde_json::json!({"negotiateVersion": 1, "connectionToken": "t1"})) }),
+            )
+            .route(
+                "/v1/api/hub/ImportFile",
+                get(move |upgrade: WebSocketUpgrade| {
+                    let jobs = jobs.clone();
+                    async move { upgrade.on_upgrade(move |socket| hub(socket, jobs)).into_response() }
+                }),
+            )
+            .route(
+                "/v1/api/import/verwerk",
+                on_post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let rules = rules.clone();
+                    async move {
+                        rules.lock().unwrap().push(("import/verwerk".into(), body));
+                        axum::Json(serde_json::json!({"countImport": 1, "countMutatie": 0, "countErrors": 0}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!(
+            "http://127.0.0.1:{}/v1/api/",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let jar = Arc::new(crate::state::testing::FakeJar::default());
+        let state = Arc::new(crate::state::testing::state_with(jar.clone(), &api));
+        // Booking goes without approval on this account: a statement asks all the same.
+        let account = state
+            .accounts
+            .add(AccountInput {
+                label: "Studio Noord".into(),
+                username: "lisa@studionoord.example".into(),
+                store: Store::System,
+                op_ref: None,
+                op_title: None,
+                op_vault: None,
+                rights: Rights::AUTO,
+            })
+            .unwrap();
+        state.jar_put("sessie", vec![("auth-token".into(), "jwt".into())]);
+        state.add_session(account.id, &account.label, "sessie");
+        let dir = std::env::temp_dir().join(format!("ebmcp-afschrift-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("kaart.csv");
+        std::fs::write(
+            &file,
+            "Kaart,Transactiedatum,Omschrijving,Bedrag in EUR\n1111,2026-10-27,KOSTEN TE LATE BETALING,\"-24,00\"\n1111,2026-10-26,BETALING ONTVANGEN - DANK U,\"2.000,04\"\n\n2222,2026-10-17,\"CURSOR; IDE\",\"-48,26\"\n1111,2026-06-07,LARAVEL FORGE,\"-17,42\"\n",
+        )
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mcp = router(state.clone(), Arc::new(RwLock::new(TOKEN.to_owned())));
+        tokio::spawn(async move { axum::serve(listener, mcp).await.unwrap() });
+        let http = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}{PATH}");
+        let post = |body: serde_json::Value, session: Option<String>| {
+            let mut request = http
+                .post(&url)
+                .bearer_auth(TOKEN)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .json(&body);
+            if let Some(s) = session {
+                request = request.header("mcp-session-id", s);
+            }
+            request.send()
+        };
+        let init = post(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "title": "Claude", "version": "1"}}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            session.clone(),
+        )
+        .await
+        .unwrap();
+        let read_in = |call: u32, rekening: &str| {
+            let sent = post(
+                serde_json::json!({"jsonrpc": "2.0", "id": call, "method": "tools/call", "params": {"name": "afschrift_inlezen", "arguments": {
+                    "pad": file.to_string_lossy(), "rekening": rekening,
+                    "overslaan": [{"datum_tot_en_met": "2026-06-07", "reden": "al geboekt"}, {"omschrijving_bevat": "BETALING ONTVANGEN"}]
+                }}}),
+                session.clone(),
+            );
+            async move { answer_of(sent.await.unwrap().text().await.unwrap()) }
+        };
+        let paths = || {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // An account e-Boekhouden does not offer for a statement: refused before the user is asked.
+        let (is_error, text) = read_in(2, "4550").await;
+        assert!(
+            is_error && text.contains("Het biedt aan: 1010 Bank, 1820 Credit card"),
+            "{text}"
+        );
+        assert!(
+            state.approvals.history(None).is_empty(),
+            "nothing was asked"
+        );
+
+        // One proposal with its statement; nothing went out.
+        let (_, text) = read_in(3, "1820").await;
+        let id = waiting_id(&text);
+        let proposal = state.approvals.list().into_iter().next().unwrap();
+        assert_eq!(proposal.title, "Afschrift inlezen: kaart.csv");
+        assert!(proposal.danger, "a statement is never a plain change");
+        assert_eq!(
+            proposal.statement,
+            Some(crate::statement::Info {
+                file_name: "kaart.csv".into(),
+                lines: 4,
+                included: 2
+            })
+        );
+        assert!(paths().is_empty(), "nothing goes out before Goedkeuren");
+        // The user unticks one of the two lines and brings back the one a rule left out.
+        let sheet = state
+            .approvals
+            .statement_edit(
+                id,
+                crate::statement::Edit::Tick {
+                    lines: vec![2],
+                    included: false,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(sheet.totals.included, 1);
+        state
+            .approvals
+            .statement_edit(
+                id,
+                crate::statement::Edit::Tick {
+                    lines: vec![3],
+                    included: true,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(state.approvals.decide(id, true, crate::state::now_ms()));
+        assert_eq!(
+            settled(&state, id).await.status,
+            crate::approvals::Status::Done
+        );
+        assert_eq!(
+            paths(),
+            vec!["importfile/uploadfile", "hub/ImportFile", "import/verwerk"]
+        );
+        {
+            let seen = seen.lock().unwrap();
+            let upload = &seen[0].1;
+            let csv = String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(upload["fileData"].as_str().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            // Only the lines the user left ticked, in the order of the file.
+            assert_eq!(
+                csv,
+                "Datum;Omschrijving;Bedrag\r\n26-10-2026;\"BETALING ONTVANGEN - DANK U\";2000,04\r\n17-10-2026;\"CURSOR; IDE\";-48,26\r\n"
+            );
+            assert_eq!(upload["fileName"], "eb-mcp-kaart.csv");
+            assert_eq!(upload["fileSize"], csv.len());
+            assert_eq!(upload["fileType"], "text/csv");
+            assert_eq!(
+                seen[1].1,
+                serde_json::json!({
+                    "step": 0, "importfile": {"name": "eb-mcp-kaart.csv", "type": "text/csv"}, "fileGuid": "g.csv", "sheet": 1, "startFromRow": 2,
+                    "importType": "AFSCHRIFT", "forAcc": false, "customImportFileId": 1506486,
+                    "importFileRequest": {"importFileId": 3148475, "ontdubbelen": true, "selectedGb": 18},
+                    "mappedColumns": ["Datum", "Omschrijving", "Bedrag"]
+                })
+            );
+            assert_eq!(seen[2].1, serde_json::json!({"importIds": [468942710u64]}));
+        }
+        let detail = state.approvals.get(id).unwrap();
+        let data = &detail.result.as_ref().unwrap()["data"];
+        assert_eq!(
+            (
+                &data["regels_gestuurd"],
+                &data["ingelezen"],
+                &data["dubbel_overgeslagen"],
+                &data["onverwerkt"]
+            ),
+            (
+                &serde_json::json!(2),
+                &serde_json::json!(1),
+                &serde_json::json!(1),
+                &serde_json::json!(1)
+            )
+        );
+        // One line was there already: the history says so, as the client hears it.
+        assert!(
+            detail
+                .record
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("herkende 1 regel als al aanwezig")
+        );
+        // The history shows what the user approved, not what the client proposed.
+        assert!(
+            detail
+                .record
+                .proposal
+                .lines
+                .iter()
+                .any(|l| l.label == "Gaat mee" && l.value.starts_with("2 regels")),
+            "{:?}",
+            detail.record.proposal.lines
+        );
+
+        // Sent back with a remark: nothing goes out, and the record says what the user wrote.
+        seen.lock().unwrap().clear();
+        let (_, text) = read_in(4, "1010").await;
+        let id = waiting_id(&text);
+        let said = state.approvals.give_back(
+            id,
+            "Dit hoort op 1820",
+            |remark, statement| {
+                format!(
+                    "terug: {remark}; rekening {}",
+                    statement.unwrap().as_args()["rekening"]
+                )
+            },
+            crate::state::now_ms(),
+        );
+        assert_eq!(said, Some(true));
+        let record = settled(&state, id).await;
+        assert_eq!(record.status, crate::approvals::Status::Returned);
+        assert_eq!(record.remark.as_deref(), Some("Dit hoort op 1820"));
+        assert_eq!(
+            record.error.as_deref(),
+            Some("terug: Dit hoort op 1820; rekening \"1010\"")
+        );
+        assert!(paths().is_empty(), "nothing went out");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn waiting_id(text: &str) -> u64 {
         let value: serde_json::Value =
             serde_json::from_str(text).unwrap_or_else(|_| panic!("not JSON: {text}"));

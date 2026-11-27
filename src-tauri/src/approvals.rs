@@ -29,6 +29,7 @@ use uuid::Uuid;
 use crate::logstore;
 use crate::reqlog::{APP_VERSION, MASK, shorten, without_pay_links};
 use crate::state::now_ms;
+use crate::statement::Statement;
 
 /// How many records the history keeps. Older answered ones go first; waiting and running ones stay.
 pub const CAPACITY: usize = 2000;
@@ -101,6 +102,10 @@ pub struct Proposal {
     /// The file the change sends along (an upload to the digitaal archief), for its preview on Akkoord.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<Attachment>,
+    /// The statement the change reads in (`afschrift_inlezen`): its name and how many lines go along. The
+    /// lines themselves the sheet asks for (`Approvals::statement`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement: Option<crate::statement::Info>,
 }
 
 /// What a tool hands in; the registry adds the id and the time.
@@ -113,6 +118,8 @@ pub struct Ask {
     pub lines: Vec<Line>,
     pub danger: bool,
     pub file: Option<Attachment>,
+    /// A statement the user checks line by line before it goes out.
+    pub statement: Option<Statement>,
 }
 
 /// A file from this computer that a change sends to e-Boekhouden. The tool read it when the proposal came up, and
@@ -255,6 +262,8 @@ pub enum Decision {
     Lapsed,
     /// The AI client took its own request back before the user answered (`akkoord_intrekken`).
     Withdrawn,
+    /// The user sent it back to the AI client with a remark instead of approving or refusing.
+    Returned,
 }
 
 /// Where a proposal is now.
@@ -269,6 +278,8 @@ pub enum Status {
     Lapsed,
     /// Taken back by an AI client while it waited. Nothing went to e-Boekhouden.
     Withdrawn,
+    /// Sent back to the AI client by the user, with a remark. Nothing went to e-Boekhouden.
+    Returned,
 }
 
 impl Status {
@@ -287,6 +298,7 @@ impl Status {
             Status::Refused => "geweigerd",
             Status::Lapsed => "vervallen",
             Status::Withdrawn => "ingetrokken",
+            Status::Returned => "teruggestuurd",
         }
     }
 }
@@ -300,6 +312,7 @@ impl Decision {
             Decision::Auto => "zonder akkoord",
             Decision::Lapsed => "vervallen",
             Decision::Withdrawn => "ingetrokken",
+            Decision::Returned => "teruggestuurd",
         }
     }
 }
@@ -319,6 +332,9 @@ pub struct Record {
     /// not only the AI client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// What the user wrote when sending the proposal back to the AI client (`Status::Returned`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remark: Option<String>,
     /// The app version that asked.
     pub version: String,
     /// The user answered it with Alles goedkeuren or Alles weigeren (`decide_all`), not on its own.
@@ -363,6 +379,13 @@ pub enum Answer {
     Lapsed(String),
     /// An AI client took the request back; the text says who and why.
     Withdrawn(String),
+    /// The user sent it back: the remark, and the whole answer for the AI client.
+    Returned {
+        remark: String,
+        message: String,
+    },
+    /// Approved, with the statement as the user left it on the sheet: that is what goes out.
+    ApprovedStatement(Box<Statement>),
 }
 
 /// Why `withdraw` did nothing.
@@ -403,6 +426,8 @@ struct Inner {
     pending: BTreeMap<u64, oneshot::Sender<Answer>>,
     /// The bytes of the file a waiting proposal sends along, for its preview. Gone once it is answered.
     files: BTreeMap<u64, Arc<[u8]>>,
+    /// The statement a waiting proposal reads in, as the user has it on the sheet. Gone once it is answered.
+    statements: BTreeMap<u64, Statement>,
     /// Oldest first.
     records: VecDeque<Detail>,
 }
@@ -443,6 +468,7 @@ impl Default for Approvals {
                 next: 1,
                 pending: BTreeMap::new(),
                 files: BTreeMap::new(),
+                statements: BTreeMap::new(),
                 records: VecDeque::new(),
             }),
             changes: AtomicU64::new(0),
@@ -532,6 +558,7 @@ impl Approvals {
                     danger: ask.danger,
                     asked_at: now,
                     file: ask.file,
+                    statement: ask.statement.as_ref().map(Statement::info),
                 },
                 decided_at: auto.then_some(now),
                 decision: auto.then_some(Decision::Auto),
@@ -542,6 +569,7 @@ impl Approvals {
                 },
                 error: None,
                 note: None,
+                remark: None,
                 version: APP_VERSION.to_owned(),
                 bulk: false,
             },
@@ -563,7 +591,10 @@ impl Approvals {
         let (sender, receiver) = oneshot::channel();
         let proposal = {
             let mut inner = self.lock();
+            let mut ask = ask;
+            let statement = ask.statement.take();
             let mut detail = Self::new_detail(&mut inner, ask, technical, now, false);
+            detail.record.proposal.statement = statement.as_ref().map(Statement::info);
             // The bytes stay apart from the record: the history and the windows get the proposal without them.
             let sent = detail
                 .record
@@ -576,6 +607,9 @@ impl Approvals {
             inner.pending.insert(proposal.id, sender);
             if let Some(sent) = sent {
                 inner.files.insert(proposal.id, sent);
+            }
+            if let Some(statement) = statement {
+                inner.statements.insert(proposal.id, statement);
             }
             proposal
         };
@@ -608,15 +642,26 @@ impl Approvals {
             return false;
         };
         inner.files.remove(&id);
+        // What goes out of a statement is what the sheet shows at this moment, so the answer carries it.
+        let answer = match (answer, inner.statements.remove(&id)) {
+            (Answer::Approved, Some(statement)) => Answer::ApprovedStatement(Box::new(statement)),
+            (answer, _) => answer,
+        };
         let delivered = sender.send(answer.clone()).is_ok();
         if let Some(detail) = inner.record_mut(id) {
             let record = &mut detail.record;
             record.decided_at = Some(now);
             record.bulk = bulk && delivered;
             match (&answer, delivered) {
-                (Answer::Approved, true) => {
+                (Answer::Approved | Answer::ApprovedStatement(_), true) => {
                     record.decision = Some(Decision::Approved);
                     record.status = Status::Running;
+                }
+                (Answer::Returned { remark, message }, true) => {
+                    record.decision = Some(Decision::Returned);
+                    record.status = Status::Returned;
+                    record.remark = Some(remark.clone());
+                    record.error = Some(message.clone());
                 }
                 (Answer::Refused(message), true) => {
                     record.decision = Some(Decision::Refused);
@@ -694,6 +739,62 @@ impl Approvals {
             // Nobody waited for the answer any more: `close` wrote it down as lapsed.
             Err(NotWithdrawn::NotWaiting(Status::Lapsed))
         }
+    }
+
+    /// The user sends a waiting proposal back to the AI client with `remark`. `answer` makes the text the
+    /// client gets from the remark and, for a statement, the sheet as it stands. `None` when the proposal is
+    /// not waiting any more.
+    pub fn give_back(
+        &self,
+        id: u64,
+        remark: &str,
+        answer: impl FnOnce(&str, Option<&Statement>) -> String,
+        now: u64,
+    ) -> Option<bool> {
+        let mut inner = self.lock();
+        if !inner.pending.contains_key(&id) {
+            return None;
+        }
+        let message = answer(remark, inner.statements.get(&id));
+        let returned = Answer::Returned {
+            remark: remark.to_owned(),
+            message,
+        };
+        Some(self.close(&mut inner, id, returned, now, false))
+    }
+
+    /// The statement of a proposal that still waits, as the sheet shows it.
+    pub fn statement(&self, id: u64) -> Option<crate::statement::View> {
+        let inner = self.lock();
+        if !inner.pending.contains_key(&id) {
+            return None;
+        }
+        inner.statements.get(&id).map(Statement::view)
+    }
+
+    /// One change from the sheet to the statement of a waiting proposal. The proposal's lines follow, so the
+    /// queue and the history say what the user approved. `None` when it does not wait any more.
+    pub fn statement_edit(
+        &self,
+        id: u64,
+        edit: crate::statement::Edit,
+    ) -> Option<Result<crate::statement::View, String>> {
+        let mut inner = self.lock();
+        if !inner.pending.contains_key(&id) {
+            return None;
+        }
+        let statement = inner.statements.get_mut(&id)?;
+        if let Err(message) = statement.apply(edit) {
+            return Some(Err(message));
+        }
+        let (view, lines, info) = (statement.view(), statement.lines(), statement.info());
+        if let Some(detail) = inner.record_mut(id) {
+            detail.record.proposal.lines = lines;
+            detail.record.proposal.statement = Some(info);
+        }
+        drop(inner);
+        self.changed();
+        Some(Ok(view))
     }
 
     /// Ends one waiting proposal without the user's answer: refused (`Answer::Refused`) or lapsed.
@@ -896,6 +997,7 @@ impl Approvals {
         let mut inner = self.lock();
         inner.pending.clear();
         inner.files.clear();
+        inner.statements.clear();
         inner.records.clear();
         let mut highest = 0;
         for mut detail in snapshot.records {
@@ -920,7 +1022,8 @@ impl Approvals {
                 | Status::Failed
                 | Status::Refused
                 | Status::Lapsed
-                | Status::Withdrawn => {}
+                | Status::Withdrawn
+                | Status::Returned => {}
             }
             inner.push(detail);
         }
@@ -1019,6 +1122,7 @@ mod tests {
             lines: vec![line("Bedrag", "2,00")],
             danger: false,
             file: None,
+            statement: None,
         }
     }
 
@@ -1271,12 +1375,14 @@ mod tests {
                     danger: false,
                     asked_at: 1,
                     file: None,
+                    statement: None,
                 },
                 decided_at: Some(2),
                 decision: Some(Decision::Approved),
                 status: Status::Done,
                 error: None,
                 note: None,
+                remark: None,
                 version: "0.4.0".into(),
                 bulk: true,
             },
@@ -1662,5 +1768,162 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    fn statement() -> Statement {
+        let mut statement = Statement::new(
+            "kaart.csv",
+            b"Datum;Omschrijving;Bedrag\n01-02-2026;Bakker;-1,50\n02-02-2026;BETALING ONTVANGEN;10,00\n03-02-2026;Slager;-2,00",
+        )
+        .unwrap();
+        statement.ledgers = vec![crate::statement::Ledger {
+            id: 18,
+            code: "1820".into(),
+            name: "Credit card".into(),
+        }];
+        statement
+    }
+
+    /// A statement waits with its proposal: the sheet reads and edits it, the proposal's lines follow, and
+    /// the answer to Goedkeuren carries the statement as the user left it. That is what goes out.
+    #[tokio::test]
+    async fn a_statement_is_edited_while_it_waits_and_goes_out_as_the_user_left_it() {
+        use crate::statement::{Edit, Test};
+        let approvals = Approvals::default();
+        let (proposal, answer) = approvals.ask(
+            Ask {
+                statement: Some(statement()),
+                ..ask(Uuid::nil(), "Afschrift inlezen: kaart.csv")
+            },
+            technical(),
+            1,
+        );
+        let (plain, _other) = approvals.ask(ask(Uuid::nil(), "Mutatie"), technical(), 1);
+        assert_eq!(
+            proposal.statement,
+            Some(crate::statement::Info {
+                file_name: "kaart.csv".into(),
+                lines: 3,
+                included: 3
+            })
+        );
+        assert_eq!(approvals.statement(plain.id), None);
+        assert_eq!(approvals.statement(proposal.id).unwrap().totals.included, 3);
+
+        let edited = approvals
+            .statement_edit(
+                proposal.id,
+                Edit::AddRule {
+                    test: Test::Contains {
+                        text: "betaling".into(),
+                    },
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!((edited.totals.included, edited.totals.skipped), (2, 1));
+        // The queue and the history say what the sheet says.
+        let listed = &approvals.list()[0];
+        assert_eq!(listed.statement.as_ref().unwrap().included, 2);
+        assert!(
+            listed
+                .lines
+                .iter()
+                .any(|l| l.label == "Gaat mee" && l.value.starts_with("2 regels")),
+            "{:?}",
+            listed.lines
+        );
+        // An edit that is refused changes nothing.
+        let refused = approvals
+            .statement_edit(proposal.id, Edit::Ledger { index: 5 })
+            .unwrap();
+        assert!(refused.is_err());
+        assert_eq!(approvals.statement_edit(plain.id, Edit::ClearTicks), None);
+
+        assert!(approvals.decide(proposal.id, true, 2));
+        let Ok(Answer::ApprovedStatement(sent)) = answer.await else {
+            panic!("the answer carries the statement");
+        };
+        assert_eq!(
+            sent.chosen().iter().map(|c| c.line).collect::<Vec<_>>(),
+            [2, 4]
+        );
+        // Answered: the sheet has nothing to show or change any more.
+        assert_eq!(approvals.statement(proposal.id), None);
+        assert_eq!(
+            approvals.statement_edit(proposal.id, Edit::ClearTicks),
+            None
+        );
+        assert_eq!(
+            approvals.get(proposal.id).unwrap().record.status,
+            Status::Running
+        );
+    }
+
+    /// Terug naar de AI-client: the proposal leaves the queue as Teruggestuurd with the user's remark, the
+    /// change that waited hears the whole answer, and nothing runs.
+    #[tokio::test]
+    async fn a_proposal_goes_back_to_the_client_with_the_users_remark() {
+        let approvals = Approvals::default();
+        let (proposal, answer) = approvals.ask(
+            Ask {
+                statement: Some(statement()),
+                ..ask(Uuid::nil(), "Afschrift inlezen: kaart.csv")
+            },
+            technical(),
+            1,
+        );
+        let said = approvals.give_back(
+            proposal.id,
+            "De bakker is privé",
+            |remark, statement| {
+                format!(
+                    "terug: {remark}; rekening {}",
+                    statement.unwrap().as_args()["rekening"]
+                )
+            },
+            5,
+        );
+        assert_eq!(said, Some(true));
+        assert_eq!(
+            answer.await,
+            Ok(Answer::Returned {
+                remark: "De bakker is privé".into(),
+                message: "terug: De bakker is privé; rekening \"1820\"".into()
+            })
+        );
+        let record = approvals.get(proposal.id).unwrap().record;
+        assert_eq!(
+            (record.status, record.decision, record.decided_at),
+            (Status::Returned, Some(Decision::Returned), Some(5))
+        );
+        assert_eq!(record.remark.as_deref(), Some("De bakker is privé"));
+        assert_eq!(
+            record.error.as_deref(),
+            Some("terug: De bakker is privé; rekening \"1820\"")
+        );
+        assert_eq!(approvals.count(), 0);
+        assert_eq!(approvals.statement(proposal.id), None);
+        // It does not wait any more: not again, and not approved after all.
+        assert_eq!(
+            approvals.give_back(proposal.id, "nog eens", |_, _| String::new(), 6),
+            None
+        );
+        assert!(!approvals.decide(proposal.id, true, 7));
+        // `finish` leaves a record that went back alone.
+        approvals.finish(proposal.id, Err("later".into()), 8);
+        assert_eq!(
+            approvals.get(proposal.id).unwrap().record.status,
+            Status::Returned
+        );
+        assert_eq!(Status::Returned.dutch(), "teruggestuurd");
+        // A file from before this status still loads, and one with it is read back.
+        let saved = serde_json::to_string(&approvals.get(proposal.id).unwrap()).unwrap();
+        let read: Detail = serde_json::from_str(&saved).unwrap();
+        assert_eq!(read.record.remark.as_deref(), Some("De bakker is privé"));
+        assert_eq!(
+            read.record.proposal.statement.unwrap().file_name,
+            "kaart.csv"
+        );
     }
 }

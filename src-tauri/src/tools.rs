@@ -31,6 +31,7 @@ use crate::reqlog::Outcome;
 use crate::state::{AppEvent, AppState};
 use crate::write::{self, Books, Built};
 
+mod afschrift;
 mod artikelen;
 mod btw_aangifte;
 mod inrichting;
@@ -918,9 +919,26 @@ struct WriteRun {
     proposal: Mutex<Option<u64>>,
     /// The file the change sends along, set by the tool before `approve` (`Run::attach`), for the preview.
     file: Mutex<Option<approvals::Attachment>>,
+    /// The statement the change reads in: set by the tool before `approve` (`Run::attach_statement`), and
+    /// after it the statement as the user left it on the sheet (`Run::approved_statement`).
+    statement: Mutex<Option<crate::statement::Statement>>,
 }
 
 impl Run {
+    /// The statement this change reads in, so its proposal has the sheet to check it on.
+    fn attach_statement(&self, statement: crate::statement::Statement) {
+        if let Some(write) = &self.write {
+            *write.statement.lock().unwrap_or_else(|e| e.into_inner()) = Some(statement);
+        }
+    }
+
+    /// After `approve`: the statement as the user approved it. That is what goes out, not what the tool made.
+    fn approved_statement(&self) -> Option<crate::statement::Statement> {
+        self.write
+            .as_ref()
+            .and_then(|w| w.statement.lock().unwrap_or_else(|e| e.into_inner()).take())
+    }
+
     /// The file this change sends along, so its proposal can show it (Akkoord, preview).
     fn attach(&self, file: approvals::Attachment) {
         if let Some(write) = &self.write {
@@ -1453,6 +1471,7 @@ impl EbMcp {
             queued: Mutex::new(Some(queued)),
             proposal: Mutex::new(None),
             file: Mutex::new(None),
+            statement: Mutex::new(None),
         });
         let run = Arc::new(run);
         let mut task = tokio::spawn({
@@ -1739,6 +1758,11 @@ impl EbMcp {
             lines: built.lines.clone(),
             danger,
             file: write.file.lock().unwrap_or_else(|e| e.into_inner()).take(),
+            statement: write
+                .statement
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
         };
         let technical = Technical {
             args: write.args.clone(),
@@ -1799,9 +1823,18 @@ impl EbMcp {
                 let _ = self.state.events.send(AppEvent::LogChanged);
                 Ok(())
             }
-            Ok(Answer::Refused(message) | Answer::Lapsed(message) | Answer::Withdrawn(message)) => {
-                Err(Halt::Refused(message))
+            Ok(Answer::ApprovedStatement(statement)) => {
+                *write.statement.lock().unwrap_or_else(|e| e.into_inner()) = Some(*statement);
+                self.state.log.resume_mcp(run.id);
+                let _ = self.state.events.send(AppEvent::LogChanged);
+                Ok(())
             }
+            Ok(
+                Answer::Refused(message)
+                | Answer::Lapsed(message)
+                | Answer::Withdrawn(message)
+                | Answer::Returned { message, .. },
+            ) => Err(Halt::Refused(message)),
             Err(_) => Err(Halt::Refused(approvals::LAPSED_NOBODY_WAITS.into())),
         }
     }
@@ -1891,9 +1924,12 @@ impl EbMcp {
                     .log
                     .finish_mcp(run.id, Outcome::Ok, Some(&value), None);
                 if let Some(id) = proposal {
-                    self.state
-                        .approvals
-                        .finish_noted(id, Ok(&value), missed(&value["data"]), now);
+                    self.state.approvals.finish_noted(
+                        id,
+                        Ok(&value),
+                        missed(&value["data"]).or_else(|| afschrift::missed(&value["data"])),
+                        now,
+                    );
                 }
                 CallToolResult::success(vec![ContentBlock::text(value.to_string())])
             }
@@ -2775,6 +2811,9 @@ fn proposal_status(detail: &approvals::Detail, full: bool) -> Value {
         "besluit": record.decision.map(approvals::Decision::dutch),
         "fout": record.error,
     });
+    if let Some(remark) = &record.remark {
+        value["opmerking_van_de_gebruiker"] = json!(remark);
+    }
     if full {
         value["regels"] = json!(record.proposal.lines);
         value["klaar_op"] = json!(detail.finished_at.and_then(local_time));
@@ -2815,7 +2854,8 @@ pub fn tool_count() -> usize {
 /// change the books, and of those the ones that cannot be undone.
 #[cfg(test)]
 pub fn part_tools() -> [Vec<&'static str>; 3] {
-    let parts: [[&[&str]; 3]; 8] = [
+    let parts: [[&[&str]; 3]; 9] = [
+        [afschrift::READS, afschrift::WRITES, afschrift::DESTRUCTIVE],
         [
             mijn_gegevens::READS,
             mijn_gegevens::WRITES,
@@ -2861,6 +2901,7 @@ impl EbMcp {
     /// The router of tools.rs itself plus the one of every part.
     fn routers() -> ToolRouter<Self> {
         let mut all = Self::tool_router()
+            + Self::afschrift_router()
             + Self::mijn_gegevens_router()
             + Self::uren_beheer_router()
             + Self::artikelen_router()
@@ -5628,6 +5669,8 @@ impl ServerHandler for EbMcp {
                  Klopt een voorstel dat nog wacht niet, of is het niet meer nodig, trek het dan zelf in met akkoord_intrekken (met een korte reden) in plaats van de gebruiker te vragen het te weigeren; na goedkeuring kan dat niet meer. \
                  Een geïmporteerde bankregel verwerken kan: bankregels geeft de onverwerkte regels met hun id, en mutatie_toevoegen met bankregel_id boekt de mutatie en verwerkt de regel in één keer, bij elke soort, ook een factuurbetaling. \
                  Boek geld van een bankregel nooit zonder bankregel_id: dan blijft de regel open staan en dreigt een dubbele boeking. \
+                 Staan de regels van een bank- of creditcardafschrift nog niet bij bankregels en heeft de gebruiker het afschrift als csv, lees het dan in met afschrift_inlezen: de gebruiker kiest in EB MCP zelf welke regels meegaan. \
+                 Een voorstel kan ook terugkomen met status teruggestuurd: de gebruiker heeft er dan een opmerking bij gezet (opmerking_van_de_gebruiker) in plaats van goed te keuren of te weigeren. Er is dan niets gewijzigd; pas het voorstel daarop aan en doe de aanroep opnieuw. \
                  Een verkoopfactuur die gemaakt is maar nog niet verwerkt (verwerkt leeg bij facturen) heeft nog geen mutatie, dus een betaling kan er niet aan gekoppeld worden: verwerk hem eerst met factuur_verwerken. \
                  Kan een bankregel nog niet geboekt worden (bijvoorbeeld omdat de factuur nog ontbreekt), zet er dan een opmerking bij met bankregel_opmerking_wijzigen, zoals \"wacht op factuur\". \
                  Hoort er een factuur of bon bij die op deze computer staat, geef die dan mee als bijlage van mutatie_toevoegen: dan staat hij na hetzelfde akkoord in het archief en gekoppeld aan de mutatie. \

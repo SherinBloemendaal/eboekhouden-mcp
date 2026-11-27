@@ -565,7 +565,7 @@ describe('the history', () => {
   it('filters by status and searches the title and account', async () => {
     await openHistory()
     const select = document.querySelector<HTMLSelectElement>('select[aria-label="Status"]')!
-    expect([...select.options].map((o) => o.textContent)).toEqual(['Alle statussen', 'Wacht', 'Bezig', 'Uitgevoerd', 'Mislukt', 'Geweigerd', 'Vervallen', 'Ingetrokken'])
+    expect([...select.options].map((o) => o.textContent)).toEqual(['Alle statussen', 'Wacht', 'Bezig', 'Uitgevoerd', 'Mislukt', 'Geweigerd', 'Vervallen', 'Ingetrokken', 'Teruggestuurd'])
     select.value = 'refused'
     select.dispatchEvent(new Event('change'))
     await flushPromises()
